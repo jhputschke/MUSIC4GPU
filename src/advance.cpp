@@ -51,7 +51,8 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
         double       eps_max = eos.get_eps_max();
         if (eps_max <= 0.0) eps_max = 1.0e4;
         const double de = eps_max / static_cast<double>(N_EOS - 1);
-        std::vector<float> P_data(N_EOS), dPde_data(N_EOS), s_data(N_EOS);
+        std::vector<float> P_data(N_EOS), dPde_data(N_EOS);
+        std::vector<float> s_data(N_EOS), T_data(N_EOS);
         // P, dPde sampled linearly in e (typically near-linear in e so
         // linear interpolation is essentially exact for the ideal-gas EOS).
         for (int i = 0; i < N_EOS; i++) {
@@ -59,19 +60,21 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
             P_data[i]    = static_cast<float>(eos.get_pressure(e, 0.0));
             dPde_data[i] = static_cast<float>(eos.get_dpde(e, 0.0));
         }
-        // Entropy is sampled in LOG e because s ~ e^(3/4) — a linear table
-        // at the same e_max would lose all resolution in the dilute regime
-        // where most hydro cells live.
+        // Entropy s(e) ~ e^(3/4) and temperature T(e) ~ e^(1/4) are strongly
+        // non-linear in e, so they're sampled at LOG-spaced e to keep
+        // resolution in the dilute regime where most hydro cells live.
+        // Both share the same log grid (driven by GPUEosParams::log_*).
         constexpr double s_log_e_floor = 1.0e-6;  // 1/fm^4
         const double log_e_min = std::log(s_log_e_floor);
         const double log_e_max = std::log(std::max(eps_max, s_log_e_floor*1.01));
         const double dle = (log_e_max - log_e_min) / static_cast<double>(N_EOS - 1);
         for (int i = 0; i < N_EOS; i++) {
             const double e = std::exp(log_e_min + i * dle);
-            s_data[i] = static_cast<float>(eos.get_entropy(e, 0.0));
+            s_data[i] = static_cast<float>(eos.get_entropy    (e, 0.0));
+            T_data[i] = static_cast<float>(eos.get_temperature(e, 0.0));
         }
         if (!gpu_grid_.upload_eos(P_data.data(), dPde_data.data(),
-                                  s_data.data(),
+                                  s_data.data(), T_data.data(),
                                   N_EOS, 0.0f, static_cast<float>(eps_max))) {
             music_message << "[MUSIC-GPU] EOS table upload failed.";
             music_message.flush("warning");
@@ -111,6 +114,14 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     p.shear_to_s              = static_cast<float>(DATA.shear_to_s);
     p.shear_relax_time_factor = static_cast<float>(DATA.shear_relax_time_factor);
     p.turn_on_shear           = DATA.turn_on_shear;
+    p.T_dep_shear_mode        = DATA.T_dependent_shear_to_s;
+    p.shear_duke_min          = static_cast<float>(DATA.shear_2_min);
+    p.shear_duke_slope        = static_cast<float>(DATA.shear_2_slope);
+    p.shear_duke_curv         = static_cast<float>(DATA.shear_2_curv);
+    p.shear_sims_T_kink_GeV   = static_cast<float>(DATA.shear_3_T_kink_in_GeV);
+    p.shear_sims_low_slope    = static_cast<float>(DATA.shear_3_low_T_slope_in_GeV);
+    p.shear_sims_high_slope   = static_cast<float>(DATA.shear_3_high_T_slope_in_GeV);
+    p.shear_sims_at_kink      = static_cast<float>(DATA.shear_3_at_kink);
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -208,6 +219,12 @@ void Advance::AdvanceIt(const double tau,
         // (T- and muB-independent), no QuestRevert.  Anything outside that
         // matrix uses the existing CPU FirstRKStepW path (which still
         // benefits from the GPU uwrhs flux and theta/a/sigma buffers).
+        const bool T_dep_mode_supported =
+               (DATA.T_dependent_shear_to_s == 0)
+            || (DATA.T_dependent_shear_to_s == 1)
+            || (DATA.T_dependent_shear_to_s == 2)
+            || (DATA.T_dependent_shear_to_s == 3)
+            || (DATA.T_dependent_shear_to_s == 11);
         gpu_w_full_active =
                gpu_du_active                                  // already ensures vort=0, diff=0
             && gpu_finalize_active                            // ensures hydro_source path is off
@@ -215,7 +232,7 @@ void Advance::AdvanceIt(const double tau,
             && (DATA.turn_on_shear == 1)
             && (DATA.turn_on_bulk == 0)
             && (DATA.include_second_order_terms == 0)
-            && (DATA.T_dependent_shear_to_s == 0)
+            && T_dep_mode_supported
             && (DATA.muB_dependent_shear_to_s == 0)
             // QuestRevert is only invoked for Initial_profile != 0 && != 1.
             && (DATA.Initial_profile == 0 || DATA.Initial_profile == 1);

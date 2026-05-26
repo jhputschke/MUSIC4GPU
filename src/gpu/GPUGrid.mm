@@ -90,7 +90,7 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
 }
 
 bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
-                         const float* s_data,
+                         const float* s_data, const float* T_data,
                          int n_pts, float e_min, float e_max) {
     if (!g_metal_device || !allocated_) return false;
 
@@ -101,11 +101,14 @@ bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
                                 buf_handles_, n_handles_);
     eos_s    = alloc_metal_buf(g_metal_device, nc * sizeof(float),
                                 buf_handles_, n_handles_);
-    if (!eos_P || !eos_dPde || !eos_s) return false;
+    eos_T    = alloc_metal_buf(g_metal_device, nc * sizeof(float),
+                                buf_handles_, n_handles_);
+    if (!eos_P || !eos_dPde || !eos_s || !eos_T) return false;
 
     std::memcpy(eos_P,    P_data,    nc * sizeof(float));
     std::memcpy(eos_dPde, dPde_data, nc * sizeof(float));
     std::memcpy(eos_s,    s_data,    nc * sizeof(float));
+    std::memcpy(eos_T,    T_data,    nc * sizeof(float));
 
     eos_params.e_min   = e_min;
     eos_params.e_max   = e_max;
@@ -146,6 +149,7 @@ void GPUGrid::release() {
     eos_P     = nullptr;
     eos_dPde  = nullptr;
     eos_s     = nullptr;
+    eos_T     = nullptr;
     eos_params = {};
 }
 

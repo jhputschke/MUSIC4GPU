@@ -506,8 +506,9 @@ void MetalPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     [enc setBuffer:get_buf(gpu.snap_future.pi_b)    offset:0 atIndex:14];
     [enc setBuffer:get_buf(gpu.eos_P)               offset:0 atIndex:15];
     [enc setBuffer:get_buf(gpu.eos_s)               offset:0 atIndex:16];
-    [enc setBytes:&params          length:sizeof(params)          atIndex:17];
-    [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:18];
+    [enc setBuffer:get_buf(gpu.eos_T)               offset:0 atIndex:17];
+    [enc setBytes:&params          length:sizeof(params)          atIndex:18];
+    [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:19];
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(

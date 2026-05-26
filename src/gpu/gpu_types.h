@@ -36,14 +36,24 @@ struct MUSICGridParams {
     float tau_orig;       // tau at the start of this RK step (un-shifted)
 
     // Transport / config inputs for gpu_first_rk_step_w_full (Tier 3c Phase 2).
-    // Phase-2 v1 only supports the constant-shear branch
-    // (T_dependent_shear_to_s == 0, muB_dependent_shear_to_s == 0,
-    //  include_second_order_terms == 0, include_vorticity_terms == 0,
-    //  turn_on_diff == 0).  The host falls back to CPU FirstRKStepW for
-    //  any other configuration.
-    float shear_to_s;             // DATA.shear_to_s   (constant η/s)
+    // Supports zero net baryon (muB_dependent_shear_to_s == 0), no bulk,
+    // no vorticity, no second-order, no baryon diffusion.  T-dependent
+    // shear viscosity (T_dependent_shear_to_s ∈ {0, 1, 2, 3, 11}) is
+    // honored on the GPU via the eos_T(e) log-spaced table and inline
+    // profile evaluation; other modes fall back to CPU.
+    float shear_to_s;              // DATA.shear_to_s (constant or T-profile baseline)
     float shear_relax_time_factor; // DATA.shear_relax_time_factor
-    int   turn_on_shear;          // DATA.turn_on_shear flag
+    int   turn_on_shear;           // DATA.turn_on_shear flag
+    int   T_dep_shear_mode;        // DATA.T_dependent_shear_to_s
+    // Duke profile (mode 2) coefficients
+    float shear_duke_min;          // DATA.shear_2_min
+    float shear_duke_slope;        // DATA.shear_2_slope
+    float shear_duke_curv;         // DATA.shear_2_curv
+    // Sims profile (mode 3) coefficients
+    float shear_sims_T_kink_GeV;   // DATA.shear_3_T_kink_in_GeV
+    float shear_sims_low_slope;    // DATA.shear_3_low_T_slope_in_GeV
+    float shear_sims_high_slope;   // DATA.shear_3_high_T_slope_in_GeV
+    float shear_sims_at_kink;      // DATA.shear_3_at_kink
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.

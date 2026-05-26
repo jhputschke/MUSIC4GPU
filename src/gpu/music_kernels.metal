@@ -1340,52 +1340,154 @@ kernel void gpu_make_du(
 //  17  params
 //  18  eos_p
 
-// Helper: entropy lookup via log-spaced table.
-// Linear interpolation in log(e) — s(e) ~ e^(3/4) is locally linear in log(e)
-// so this gives ~1e-6 relative error across the physical range.
-inline float gpu_s(float e, device const float* s_tab,
-                   constant GPUEosParams& ep) {
+// Helper: log-spaced table lookup, used for both entropy s(e) ~ e^(3/4)
+// and temperature T(e) ~ e^(1/4).  Linear interpolation in log(e) gives
+// ~1e-6 relative error across the full physical range.
+inline float gpu_log_interp(float e, device const float* tab,
+                            constant GPUEosParams& ep) {
     if (e <= 0.f) return 0.f;
     float le = log(e);
     le = clamp(le, ep.log_e_min, ep.log_e_max);
     float fe   = (le - ep.log_e_min) / ep.log_delta_e;
     int   idx  = clamp((int)fe, 0, ep.n_pts - 2);
     float frac = fe - (float)idx;
-    return max(0.f, s_tab[idx] * (1.f - frac) + s_tab[idx + 1] * frac);
+    return max(0.f, tab[idx] * (1.f - frac) + tab[idx + 1] * frac);
 }
 
-// Algebraic Make_uWSource for the constant-shear branch.
+inline float gpu_s(float e, device const float* s_tab,
+                   constant GPUEosParams& ep) {
+    return gpu_log_interp(e, s_tab, ep);
+}
+
+inline float gpu_T_e(float e, device const float* T_tab,
+                     constant GPUEosParams& ep) {
+    return gpu_log_interp(e, T_tab, ep);
+}
+
+// ── η/s profile functions (MSL ports of transport_coeffs.cpp) ────────────────
+//
+// All inputs T in 1/fm.  Outputs the dimensionless η/s.  These mirror
+// TransportCoeffs::get_temperature_dependent_eta_over_s_{default,duke,sims}
+// and ::get_temperature_dependence_shear_profile.  The muB profile is NOT
+// ported here (muB_dependent_shear_to_s == 10 falls back to CPU).
+
+constant float GPU_HBARC = 0.197326980f;   // GeV · fm
+
+inline float gpu_eta_over_s_default(float T_in_fm, float shear_to_s_baseline) {
+    // T_in_fm is in 1/fm.  Transition Ttr = 0.18 GeV / hbarc.
+    const float Ttr   = 0.18f / GPU_HBARC;
+    float Tfrac = T_in_fm / Ttr;
+    if (Tfrac < 1.f) {
+        return shear_to_s_baseline
+             + 0.0594f  * (1.f - Tfrac)
+             + 0.544f   * (1.f - Tfrac * Tfrac);
+    } else {
+        return shear_to_s_baseline
+             + 0.288f   * (Tfrac - 1.f)
+             + 0.0818f  * (Tfrac * Tfrac - 1.f);
+    }
+}
+
+inline float gpu_eta_over_s_duke(float T_in_fm,
+                                 float shear_2_min, float shear_2_slope,
+                                 float shear_2_curv) {
+    float T_in_GeV   = T_in_fm * GPU_HBARC;
+    float Ttr_in_GeV = 0.154f;
+    float Tfrac      = T_in_GeV / Ttr_in_GeV;
+    return shear_2_min
+         + shear_2_slope * (T_in_GeV - Ttr_in_GeV) * pow(Tfrac, shear_2_curv);
+}
+
+inline float gpu_eta_over_s_sims(float T_in_fm,
+                                 float T_kink_GeV, float low_slope,
+                                 float high_slope, float at_kink) {
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    const float eta_over_s_min = 1.e-6f;
+    float eta_over_s;
+    if (T_in_GeV < T_kink_GeV) {
+        eta_over_s = at_kink + low_slope  * (T_in_GeV - T_kink_GeV);
+    } else {
+        eta_over_s = at_kink + high_slope * (T_in_GeV - T_kink_GeV);
+    }
+    return max(eta_over_s, eta_over_s_min);
+}
+
+// Profile-multiplier (mode 11): returns DATA.shear_to_s * f_T(T).
+// Mirrors TransportCoeffs::get_temperature_dependence_shear_profile.
+inline float gpu_eta_over_s_profile_mult(float T_in_fm, float shear_to_s_baseline) {
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    const float Tc = 0.165f;
+    float f_T = 1.f;
+    if (T_in_GeV < Tc) {
+        const float Tslope = 1.2f;
+        const float Tlow   = 0.1f;
+        f_T += Tslope * (Tc - T_in_GeV) / (Tc - Tlow);
+    } else {
+        const float Tslope2 = 0.0f;
+        const float Thigh   = 0.4f;
+        f_T += Tslope2 * (T_in_GeV - Tc) / (Thigh - Tc);
+    }
+    return shear_to_s_baseline * f_T;
+}
+
+// Dispatch on T_dependent_shear_to_s.  Mirrors get_eta_over_s() in
+// transport_coeffs.cpp; the muB-dependence branch (mode 10) is not handled
+// here (it falls back to CPU at the host gate).
+inline float gpu_eta_over_s(float T_in_fm, constant MUSICGridParams& params) {
+    switch (params.T_dep_shear_mode) {
+        case 0:
+            return params.shear_to_s;
+        case 1:
+            return gpu_eta_over_s_default(T_in_fm, params.shear_to_s);
+        case 2:
+            return gpu_eta_over_s_duke(T_in_fm,
+                                       params.shear_duke_min,
+                                       params.shear_duke_slope,
+                                       params.shear_duke_curv);
+        case 3:
+            return gpu_eta_over_s_sims(T_in_fm,
+                                       params.shear_sims_T_kink_GeV,
+                                       params.shear_sims_low_slope,
+                                       params.shear_sims_high_slope,
+                                       params.shear_sims_at_kink);
+        case 11:
+            return gpu_eta_over_s_profile_mult(T_in_fm, params.shear_to_s);
+        default:
+            // Unsupported mode: host gate should prevent this.  Fall back
+            // to the constant baseline rather than producing garbage.
+            return params.shear_to_s;
+    }
+}
+
+// Algebraic Make_uWSource (port of Diss::Make_uWSource).
 // Returns S^{μν} = (NS_term + relaxation_term) / tau_pi.
 //
-// Inputs:
-//   W_mn         : current cell W^{μν}      (component idx_1d)
-//   sigma_mn     : σ^{μν}                   (component idx_1d in VelocityShearVec)
-//   eps_src      : ε to use for transport coefficients (curr or prev based on rk_flag)
-//   shear_to_s   : DATA.shear_to_s          (constant η/s)
-//   shear_relax_factor : DATA.shear_relax_time_factor
-//   delta_tau    : DATA.delta_tau
-inline float gpu_uW_source_constant(
+// Supports T-dependent shear viscosity (T_dep_shear_mode ∈ {0,1,2,3,11}).
+// Assumes muB_dependent_shear_to_s == 0 (entropy-based shear), no vorticity,
+// no second-order terms, no bulk coupling — host gate enforces all of these.
+inline float gpu_uW_source(
         float W_mn, float sigma_mn, float theta,
         float eps_src,
         device const float* P_tab,
         device const float* s_tab,
+        device const float* T_tab,
         constant GPUEosParams& ep,
-        float shear_to_s_in, float shear_relax_factor,
+        constant MUSICGridParams& params,
         float delta_tau)
 {
     float P       = gpu_P(eps_src, P_tab, ep);
     float entropy = gpu_s(eps_src, s_tab, ep);
-    float shear   = shear_to_s_in * entropy;
+    float T_local = gpu_T_e(eps_src, T_tab, ep);
+    float shear_to_s_T = gpu_eta_over_s(T_local, params);
+    float shear   = shear_to_s_T * entropy;
 
     float epsP = max(eps_src + P, 1.e-20f);
-    float tau_pi = shear_relax_factor * shear / epsP;
+    float tau_pi = params.shear_relax_time_factor * shear / epsP;
     tau_pi = min(10.f, max(3.f * delta_tau, tau_pi));
 
-    // delta_pipi_coeff = 4/3 (second-order term); active even with
-    // include_second_order_terms == 0 since the (4/3) coefficient was
-    // historically applied unconditionally in CPU Make_uWSource.
-    // Wait — actually it IS unconditional in the CPU code; only the WW,
-    // Wsigma, Coupling_to_Bulk terms are gated.
+    // delta_pipi_coeff = 4/3 — unconditional in CPU Make_uWSource (only
+    // the WW / Wsigma / Coupling_to_Bulk terms are gated on
+    // include_second_order_terms).
     const float dpi_pi = 4.f / 3.f;
     float transport_coefficient2 = dpi_pi * tau_pi;
 
@@ -1449,8 +1551,9 @@ kernel void gpu_first_rk_step_w_full(
     device       float*       pi_b_future  [[buffer(14)]],
     device const float*       eos_P        [[buffer(15)]],
     device const float*       eos_s        [[buffer(16)]],
-    constant MUSICGridParams& params       [[buffer(17)]],
-    constant GPUEosParams&    eos_p        [[buffer(18)]],
+    device const float*       eos_T        [[buffer(17)]],
+    constant MUSICGridParams& params       [[buffer(18)]],
+    constant GPUEosParams&    eos_p        [[buffer(19)]],
     uint3 gid [[thread_position_in_grid]])
 {
     int ix   = (int)gid.x;
@@ -1525,10 +1628,9 @@ kernel void gpu_first_rk_step_w_full(
         float sigma_mn   = sigma_vec[sid];
         float uwrhs_flux = uwrhs_in[k * Ncells + c];
 
-        float SW = gpu_uW_source_constant(
+        float SW = gpu_uW_source(
                        W_mn, sigma_mn, theta, eps_src,
-                       eos_P, eos_s, eos_p,
-                       params.shear_to_s, params.shear_relax_time_factor, dt);
+                       eos_P, eos_s, eos_T, eos_p, params, dt);
 
         float w_rhs_geom = gpu_uWRHS_geom(W4, u_c, a_loc, mu, nu,
                                           theta, tau_now, dt);
