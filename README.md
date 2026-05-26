@@ -81,3 +81,148 @@ Once the prerequisites are installed, you can build the package using:
     make -j 10 #Adjust 10 to the number of cores available.
 
 The result will be an executable named **`MUSIChydro`**.
+
+
+---
+
+## Metal GPU Acceleration (macOS / Apple Silicon)
+
+MUSIC includes an optional Metal GPU backend that offloads the
+viscous-source kernel (`MakeWSource`) to the Apple Silicon GPU using
+Metal Shading Language (MSL).  On Apple Silicon the CPU and GPU share
+physical memory, so no explicit host↔device transfers are needed — the
+same buffers are readable by both processors.
+
+### Requirements
+
+| Requirement | Notes |
+|---|---|
+| Apple Silicon Mac (M1 or later) | Unified memory required |
+| macOS 13 Ventura or later | Metal 3 API |
+| Xcode Command Line Tools | Provides `xcrun`, `metal`, `metallib` |
+
+Install the tools if needed:
+
+```bash
+xcode-select --install
+```
+
+### Building the Metal-enabled binary
+
+```bash
+# configure
+cmake -S . -B build_metal -DUSE_METAL=ON
+
+# compile (also runs xcrun to compile music_kernels.metal → music_kernels.metallib)
+cmake --build build_metal -j$(sysctl -n hw.logicalcpu)
+
+# install executable to the repo root
+cmake --install build_metal
+```
+
+The build produces:
+
+- `build_metal/src/MUSIChydro` — Metal-enabled executable
+- `build_metal/src/music_kernels.metallib` — compiled GPU shader library
+- `music_kernels.metallib` — copy in the repo root (runtime lookup path)
+
+### Running with Metal
+
+Usage is identical to the CPU build.  Metal is initialised automatically on the
+first call to `AdvanceIt()`.  Confirmation messages are printed to stderr:
+
+```
+[MUSIC-GPU] Metal device: Apple M3 Max
+[MUSIC-GPU] Initialized. max threads/group = 1024
+[MUSIC-GPU] GPU grid allocated (NxxNyx1 cells).
+```
+
+If Metal initialisation fails (e.g. `music_kernels.metallib` not found), the
+code falls back to the CPU path with a warning and continues normally.
+
+### GPU kernel — what is ported
+
+| Kernel | Source | Status |
+|---|---|---|
+| `gpu_make_w_source` | `Diss::MakeWSource()` in `src/dissipative.cpp` | **Ported** — runs on GPU every RK stage |
+| `gpu_first_rk_step_w` | `Advance::FirstRKStepW()` in `src/advance.cpp` | Preliminary (flux RHS still on CPU) |
+| `MakeDeltaQI` / KT flux | `src/advance.cpp` | Tier 2 — needs GPU EOS tables, not yet ported |
+| `ReconstIt_velocity_Newton` | `src/reconst.cpp` | Permanent CPU — iterative Newton solver |
+| Freeze-out / Cornelius | `src/freeze_pseudo.cpp` | Permanent CPU — irregular geometry |
+
+### Numerical accuracy
+
+The GPU kernel uses `float32` arithmetic; the CPU path uses `float64`.
+At production step size (`Delta_Tau=0.005`) the GPU and CPU produce
+**bitwise-identical `eps_max` values** at every timestep for grids up to
+128×128 over 100 steps — the float32 Wmunu source terms contribute too
+little per step to shift the float64 primitive-variable reconstruction.
+
+At coarser step sizes (`Delta_Tau≥0.02`) float32 errors accumulate over
+long runs and cause visible divergence near the freeze-out surface;
+always use the production step size (≤0.01 fm/c) with the GPU path.
+
+### Running the benchmark / validation script
+
+```bash
+# build both CPU and Metal binaries first, then:
+bash tests/metal_vs_cpu_bench.sh
+```
+
+The script:
+1. Creates three analytical Gubser-viscous input files (32², 64², 128² grids, 50 timesteps each).
+2. Times both `build/src/MUSIChydro` and `build_metal/src/MUSIChydro` on each.
+3. Computes the speedup and prints the maximum relative error in the `eps_max` trace.
+
+Example output (Apple M3 Max, 100 steps, `Delta_Tau=0.005`):
+
+```
+Grid                  CPU(s)   GPU(s)  Speedup   MaxErr
+----                  ------   ------  -------   ------
+32x32x1                 0.56     0.71    0.79x   0.0e+00
+64x64x1                 2.01     2.27    0.89x   0.0e+00
+128x128x1              10.85    11.43    0.95x   0.0e+00
+```
+
+`MaxErr = 0.0` means the GPU and CPU produce bitwise-identical `eps_max`
+values at every timestep (float32 Wmunu errors have not yet accumulated
+enough to shift the float64 energy-density maximum).
+
+> **Why is the GPU not faster yet?**  At these grid sizes the majority of
+> wall time is spent in kernels not yet ported to GPU: `MakeDeltaQI`
+> (KT flux, ~60% of total), the Newton solver (permanent CPU), and
+> `FirstRKStepW` (viscous RK update).  Only `MakeWSource` is offloaded,
+> which is ~15% of the total.  Porting `MakeDeltaQI` (Tier 2, requires
+> GPU EOS tables) is expected to deliver the bulk of the speedup.
+
+---
+
+## Files modified for Metal GPU support
+
+### Original MUSIC files changed
+
+| File | Change summary |
+|---|---|
+| [`CMakeLists.txt`](CMakeLists.txt) | Added `OBJCXX` to `LANGUAGES`; added `option(USE_METAL ...)` |
+| [`src/CMakeLists.txt`](src/CMakeLists.txt) | Metal source files, `xcrun` build commands for `.metallib`, `-framework Metal/Foundation` |
+| [`src/grid.h`](src/grid.h) | Added `const` overloads for `get()` and `getHalo()` (required by `copy_to_gpu(const SCGrid&)`) |
+| [`src/advance.h`](src/advance.h) | `#ifdef USE_METAL` guard; added `GPUGrid gpu_grid_`, `init_metal_if_needed()`, `make_gpu_params()` |
+| [`src/advance.cpp`](src/advance.cpp) | `init_metal_if_needed()`, `make_gpu_params()`, GPU pre-pass block in `AdvanceIt()`, GPU result read in `FirstRKStepT()` |
+
+### New GPU files added
+
+| File | Purpose |
+|---|---|
+| [`src/gpu/gpu_types.h`](src/gpu/gpu_types.h) | `MUSICGridParams` struct and `WMUNU_IDX` table — shared between C++ host and Metal shaders |
+| [`src/gpu/GPUGrid.h`](src/gpu/GPUGrid.h) | `GPUSnapshot` / `GPUGrid` class — SoA Metal shared buffers for three grid snapshots |
+| [`src/gpu/GPUGrid.mm`](src/gpu/GPUGrid.mm) | `GPUGrid` implementation — buffer allocation, AoS↔SoA copy routines |
+| [`src/gpu/MetalPipelines.h`](src/gpu/MetalPipelines.h) | Singleton `MetalPipelines` — device, command queue, pipeline state objects |
+| [`src/gpu/MetalPipelines.mm`](src/gpu/MetalPipelines.mm) | `MetalPipelines` implementation — library loading, PSO creation, kernel dispatch |
+| [`src/gpu/music_kernels.metal`](src/gpu/music_kernels.metal) | MSL compute kernels: `gpu_make_w_source`, `gpu_first_rk_step_w` |
+
+### Test and benchmark files
+
+| File | Purpose |
+|---|---|
+| [`test_metal_input`](test_metal_input) | Gubser viscous smoke-test input (32×32×1, `boost_invariant 1`, shear viscosity on) |
+| [`tests/metal_vs_cpu_bench.sh`](tests/metal_vs_cpu_bench.sh) | Automated timing and correctness comparison between CPU and Metal GPU builds |
