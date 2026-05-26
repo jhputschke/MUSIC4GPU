@@ -430,6 +430,13 @@ validation, sequencing) intended to be picked up later, ideally with a discrete
 GPU on hand where its payoff is largest. It is the single highest-value
 remaining optimization.
 
+**Multiple GPUs.** Scaling to several discrete GPUs is feasible — the structured
+grid suits η-slab domain decomposition with a 2-cell halo exchange — but it is
+gated on the above: a single GPU must first be compute-bound (otherwise N GPUs
+sit idle), and for event-by-event production, one-event-per-GPU is simpler and
+scales better than decomposing a single grid. The design and prerequisite
+ordering are recorded in **[`Plan-multi-GPU.md`](Plan-multi-GPU.md)**.
+
 ---
 
 ## Running on a discrete GPU (A100 / RTX / H100)
