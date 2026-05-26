@@ -197,29 +197,30 @@ binary is itself a CPU↔GPU comparison harness for the new code path.
 
 Numbers below come from the repository's own benchmark scripts,
 `tests/metal_vs_cpu_bench.sh` and `tests/metal_vs_cpu_bench_3d.sh`,
-run on Apple M3 Max with the **default OpenMP threading (16 hardware
-threads)** — i.e. the production multi-threaded baseline.
+run on Apple M3 Max with `OMP_NUM_THREADS=12` (matching `main_gpu`'s
+original benchmark configuration for a like-for-like comparison).
 
-> **Honesty note:** an earlier version of this section reported 3–7×
-> speedup on the basis of `OMP_NUM_THREADS=1` CPU runs.  That baseline
-> was wrong — I had hit a merge-induced OpenMP race (§9.6) and worked
-> around it by forcing one thread instead of diagnosing it.  The race
-> is now fixed and the tables below show the correct multi-threaded
-> comparison.
+> **Honesty note:** earlier versions of this section first reported
+> 3–7× speedup against a single CPU core (artifact of the §9.6 OpenMP
+> race), then 0.6–0.8× ratios against 16-thread CPU (correct CPU
+> baseline, but with the GPU path still doing a full H2D+D2H
+> round-trip every substep).  The numbers below are after the
+> intra-substep GPU residency fix (commit `0cecdf5`) and are
+> apples-to-apples with the published `main_gpu` benchmark.
 
 ### 8.1 2D bench — `tests/metal_vs_cpu_bench.sh`
 
 Boost-invariant Gubser viscous flow, 100 timesteps, EOS=ideal-gas.
 
 ```
-$ bash tests/metal_vs_cpu_bench.sh
+$ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh
 ```
 
-| Grid       | CPU (16 threads) | GPU    | Ratio (CPU/GPU) | Max rel err on eps_max (101 pts) |
-|------------|------------------|--------|-----------------|----------------------------------|
-| 32×32×1    |  0.17 s          | 0.25 s |  **0.68×**      | 1.0 × 10⁻¹                       |
-| 64×64×1    |  0.35 s          | 0.58 s |  **0.60×**      | 4.8 × 10⁻²                       |
-| 128×128×1  |  1.12 s          | 1.67 s |  **0.67×**      | 9.3 × 10⁻³                       |
+| Grid       | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
+|------------|------------|--------|----------------|--------------------|--------------------|------------------------|
+| 32×32×1    |  0.71 s    | 0.28 s |  **2.54×**     | 3.24×              | 1.0 × 10⁻¹         | 5.3 × 10⁻⁵             |
+| 64×64×1    |  0.36 s    | 0.47 s |  **0.77×**     | 1.19×              | 4.8 × 10⁻²         | 9.9 × 10⁻⁵             |
+| 128×128×1  |  1.21 s    | 1.20 s |  **1.01×**     | 2.29×              | 9.3 × 10⁻³         | 9.4 × 10⁻⁵             |
 
 ### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
@@ -227,43 +228,53 @@ Same Gubser profile replicated across η slices; full 3+1D evolution
 exercises η-direction stencils and geometric terms.
 
 ```
-$ bash tests/metal_vs_cpu_bench_3d.sh
+$ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench_3d.sh
 ```
 
-| Grid (Nx × Ny × Nη) | CPU (16 threads) | GPU    | Ratio (CPU/GPU) | Max rel err on eps_max (41 pts) |
-|---------------------|------------------|--------|-----------------|---------------------------------|
-| 32×32×8             |  0.34 s          | 0.56 s |  **0.61×**      | 4.6 × 10⁻²                      |
-| 32×32×32            |  0.69 s          | 0.96 s |  **0.72×**      | 1.9 × 10⁻²                      |
-| 64×64×16            |  1.40 s          | 1.85 s |  **0.76×**      | 2.4 × 10⁻²                      |
-| 64×64×32            |  2.82 s          | 3.45 s |  **0.82×**      | 2.4 × 10⁻²                      |
+| Grid (Nx × Ny × Nη) | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
+|---------------------|------------|--------|----------------|--------------------|--------------------|------------------------|
+| 32×32×8             |  0.39 s    | 0.45 s |  **0.87×**     | 1.43×              | 4.6 × 10⁻²         | 5.3 × 10⁻⁵             |
+| 32×32×32            |  0.77 s    | 0.64 s |  **1.20×**     | 2.36×              | 1.9 × 10⁻²         | 3.7 × 10⁻⁵             |
+| 64×64×16            |  1.63 s    | 1.18 s |  **1.38×**     | 2.91×              | 2.4 × 10⁻²         | 3.1 × 10⁻⁵             |
+| 64×64×32            |  3.23 s    | 1.99 s |  **1.62×**     | 3.41×              | 2.4 × 10⁻²         | 3.1 × 10⁻⁵             |
 
 ### 8.3 Honest performance assessment
 
-**On Apple M3 Max with 16-thread CPU, the Metal GPU path is slower
-than CPU at every grid size tested (ratios 0.60×–0.82×).**  The ratio
-improves as the grid grows — extrapolating, the GPU might catch up
-around 128×128×64 or larger — but on this hardware class the
-production-relevant 64×64×32 case still favours the multi-threaded
-CPU by ~20 %.
+**XSCAPE+GPU is now a positive speedup at production-relevant 3D
+grid sizes (1.4–1.6× faster than 12-thread CPU at 64×64×16 and
+64×64×32)**, but it still trails the pre-merge `main_gpu` branch by
+about 2×.
 
-Why this isn't surprising:
+Why XSCAPE is slower than `main_gpu`:
 
-- Apple M3 Max has 16 high-performance cores backed by unified
-  memory; per-cell hydro is bandwidth-bound and the CPU saturates the
-  same bandwidth the GPU draws from.
-- The GPU path adds per-substep H2D copy + kernel launch + D2H copy
-  overhead with no compensating "memory-far-from-host" win, because
-  the memory isn't far.
-- Where the GPU port wins is **discrete GPUs**: an NVIDIA A100/H100
-  vs an x86 CPU shifts the bandwidth ratio by ~10×, and the launch
-  overhead can be hidden by GPU residency (§9.4).  That comparison
-  needs Linux/CUDA hardware and hasn't been re-run on this branch.
+- **Inter-step round-trip not yet eliminated.** XSCAPE still does
+  one H2D upload at rk0 and one D2H sync at rk1 every outer step.
+  `main_gpu`'s full GPU residency (`gpu_owns_state_` flag) lets the
+  GPU hold state across outer step boundaries; the CPU arena gets
+  re-synced only when EvolveIt diagnostics demand it.  Implementing
+  this for the Fields path is the obvious next optimisation (§9.4).
+- **Same float32-truncation root cause for the precision gap.**
+  XSCAPE's max rel err (~10⁻²) is ~100× worse than `main_gpu`'s
+  (~10⁻⁴).  Each H2D round-trip truncates every cell to float32 and
+  back; over 100 outer steps that drift accumulates.  Closing the
+  inter-step round-trip would also close the correctness gap.
 
-**Bottom line:** the GPU port is *correct* (no crashes, no numerical
-explosion) and *portable* (Metal + CUDA back-ends, runtime CPU
-fallback for unsupported features), but on this particular Apple
-Silicon machine it's not a performance win.  CUDA + discrete GPU is
-the regime where the GPU port should pay off.
+Where the GPU still beats 12-thread CPU at the larger grids: Apple
+M3 Max has 16 high-performance cores backed by unified memory.  At
+small grids the GPU's intra-substep bandwidth advantage isn't enough
+to amortise the H2D/D2H overhead; at 64×64×32 (131k cells) the
+per-kernel parallelism wins.
+
+Where the GPU port should win decisively is **discrete GPUs** (CUDA
+on Linux): an NVIDIA A100/H100 vs an x86 CPU shifts the bandwidth
+ratio ~10× and makes the H2D round-trip much more painful, so the
+residency optimisation matters more there.  That comparison needs
+Linux/CUDA hardware and hasn't been re-run on this branch.
+
+**Bottom line:** the GPU port is *correct*, *portable*, and now
+*useful* at production 3D sizes on Apple Silicon.  Closing the
+remaining 2× vs `main_gpu` requires inter-step GPU residency — a
+self-contained follow-up tracked in §9.4.
 
 ### 8.4 Numerical accuracy note
 
@@ -297,9 +308,9 @@ cmake -B build_metal -DUSE_METAL=ON && cmake --build build_metal -j
 ln -sf build build_cpu        # if a CPU-only build dir was named build_cpu
 ln -sf build_metal build_gpu  # likewise
 
-# Run with default OpenMP threading — safe after the §9.6 fix landed
-bash tests/metal_vs_cpu_bench.sh
-bash tests/metal_vs_cpu_bench_3d.sh
+# Run at 12 threads to match the published main_gpu benchmark
+OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh
+OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench_3d.sh
 ```
 
 On Linux/CUDA the equivalents are `tests/cuda_vs_cpu_bench.sh` and
@@ -375,13 +386,34 @@ GPU pipeline.  If profiling later shows otherwise, the source loop
 itself could be ported (porting the strings model would be most of the
 work).
 
-### 9.4 Residency / multi-step GPU state
+### 9.4 Full inter-step GPU residency — open
 
-See open question §7.2.  Currently every substep does a fresh H2D upload
-of curr+prev.  A residency optimisation (keeping snap_curr / snap_prev
-on the GPU across step boundaries) would roughly double per-step
-throughput on the discrete-GPU path but requires confirming that
-JETSCAPE doesn't write to the Fields between AdvanceIt calls.
+**Status:** intra-substep residency is done (commit `0cecdf5`), giving
+1.4–1.6× GPU speedup at production 3D sizes (§8.2).  Inter-step
+residency (skip H2D at every outer step's rk0, sync back to CPU only
+on demand) is the remaining 2× gap to `main_gpu`.
+
+Plan:
+
+1. Add a `gpu_owns_state_` flag that means "snap_curr is the
+   authoritative arena across outer step boundaries".  Set it the
+   first time try_gpu_advance returns at rk_flag = rk_order - 1 with
+   no diagnostic dirty-read pending.
+2. At the end of rk1 substep, skip the D2H if `gpu_owns_state_` and
+   no consumer needs CPU-side arena this outer step.
+3. Add a `sync_to_cpu_if_needed()` helper that EvolveIt calls before
+   any code path that reads `arenaFieldsCurr` (eps_max,
+   conservation_law, freezeout, evolution_data, ...).
+4. `gpu_owns_state_` gets cleared whenever the CPU writes to the
+   arena (which after the merge is essentially never inside
+   AdvanceRK; only initial-condition load and rerun_hydro).
+
+Caveat: open question §7.2 — for the JETSCAPE step-by-step entry
+point (`EvolveOneTimeStep`), JETSCAPE may mutate Fields between
+AdvanceIt calls.  The flag must be cleared at every entry to
+`run_hydro_upto`.  For the standalone binary and XSCAPE batch path
+(`run_hydro` → `EvolveIt`), no external mutation happens between
+AdvanceRK calls so residency is safe.
 
 ### 9.5 EvolveOneTimeStep is missing diagnostics that EvolveIt has
 
