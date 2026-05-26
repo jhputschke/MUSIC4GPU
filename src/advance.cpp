@@ -21,6 +21,63 @@ using Util::map_2d_idx_to_1d;
 using Util::map_1d_idx_to_2d;
 using Util::hbarc;
 
+// ── Metal helpers (compiled only when USE_METAL is defined) ───────────────────
+#ifdef USE_METAL
+void Advance::init_metal_if_needed(SCGrid &arena_current) {
+    if (metal_initialized_) return;
+    metal_initialized_ = true;
+
+    auto& mp = MetalPipelines::instance();
+    if (!mp.initialize()) {
+        music_message << "[MUSIC-GPU] Metal init failed, falling back to CPU.";
+        music_message.flush("warning");
+        gpu_ready_ = false;
+        return;
+    }
+    if (!gpu_grid_.allocate(arena_current.nX(),
+                            arena_current.nY(),
+                            arena_current.nEta())) {
+        music_message << "[MUSIC-GPU] GPU buffer allocation failed.";
+        music_message.flush("warning");
+        gpu_ready_ = false;
+        return;
+    }
+    gpu_ready_ = true;
+    music_message << "[MUSIC-GPU] GPU grid allocated ("
+                  << arena_current.nX() << "x"
+                  << arena_current.nY() << "x"
+                  << arena_current.nEta() << " cells).";
+    music_message.flush("info");
+}
+
+void Advance::make_gpu_params(double tau_rk, MUSICGridParams &p) const {
+    p.Nx     = DATA.nx;
+    p.Ny     = DATA.ny;
+    p.Neta   = DATA.neta;
+    p.Ncells = DATA.nx * DATA.ny * DATA.neta;
+    p.delta_x   = static_cast<float>(DATA.delta_x);
+    p.delta_y   = static_cast<float>(DATA.delta_y);
+    p.delta_eta = static_cast<float>(DATA.delta_eta);
+    p.delta_tau = static_cast<float>(DATA.delta_tau);
+    p.tau       = static_cast<float>(tau_rk);
+    p.boost_invariant = DATA.boost_invariant ? 1 : 0;
+    p.turn_on_bulk    = DATA.turn_on_bulk;
+    p.turn_on_diff    = DATA.turn_on_diff;
+
+    // Precompute geometric factors for the longitudinal flux term
+    double de = DATA.delta_eta;
+    if (DATA.boost_invariant) {
+        p.cosh_deta = 0.f;
+        p.sinh_deta = 0.5f;
+    } else {
+        double cd = (de > 1e-10) ? cosh(de/2.) / de : 0.5;
+        double sd = (de > 1e-10) ? sinh(de/2.) / de : 0.5;
+        p.cosh_deta = static_cast<float>(cd);
+        p.sinh_deta = static_cast<float>(std::max(0.5, sd));
+    }
+}
+#endif  // USE_METAL
+
 Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
                  std::shared_ptr<HydroSourceBase> hydro_source_ptr_in) :
     DATA(DATA_in), eos(eosIn),
@@ -49,6 +106,32 @@ void Advance::AdvanceIt(const double tau,
     const int grid_nx   = arena_current.nX();
     const int grid_ny   = arena_current.nY();
 
+#ifdef USE_METAL
+    // ── Metal pre-pass: compute MakeWSource for all cells on GPU ─────────────
+    // This runs gpu_make_w_source asynchronously, producing dwmn[5*Ncells]
+    // in gpu_grid_.dwmn.  The GPU writes; CPU reads after wait().
+    init_metal_if_needed(arena_current);
+
+    const float* gpu_dwmn = nullptr;
+    if (gpu_ready_) {
+        const double tau_rk = tau + rk_flag * DATA.delta_tau;
+
+        // Copy arena_current and arena_prev into GPU SoA buffers (AoS→SoA).
+        gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
+        gpu_grid_.copy_to_gpu(arena_prev,    gpu_grid_.snap_prev);
+
+        MUSICGridParams gp;
+        make_gpu_params(tau_rk, gp);
+
+        auto& mp = MetalPipelines::instance();
+        mp.dispatch_w_source(gpu_grid_, gp);
+        mp.wait();   // synchronize – on Apple Silicon this is near-zero cost
+
+        gpu_dwmn = gpu_grid_.dwmn;   // CPU-readable (unified memory)
+    }
+#endif  // USE_METAL
+
+    // ── CPU triple loop: ideal evolution + Newton solve ───────────────────────
     #pragma omp parallel for collapse(3) schedule(guided)
     for (int ieta = 0; ieta < grid_neta; ieta++)
     for (int ix   = 0; ix   < grid_nx;   ix++  )
@@ -57,9 +140,22 @@ void Advance::AdvanceIt(const double tau,
         double x_local     = - DATA.x_size  /2. +   ix*DATA.delta_x;
         double y_local     = - DATA.y_size  /2. +   iy*DATA.delta_y;
 
+#ifdef USE_METAL
+        // Pass the GPU-computed dwmn pointer (null → CPU fallback inside
+        // FirstRKStepT) and cell index.
+        const int cell = grid_nx * (grid_ny * ieta + iy) + ix;
+        const float* cell_dwmn = gpu_ready_
+                                 ? gpu_dwmn + cell  // base ptr; stride = Ncells
+                                 : nullptr;
+        FirstRKStepT(tau, x_local, y_local, eta_s_local,
+                     arena_current, arena_future, arena_prev,
+                     ix, iy, ieta, rk_flag,
+                     cell_dwmn, grid_nx * grid_ny * grid_neta);
+#else
         FirstRKStepT(tau, x_local, y_local, eta_s_local,
                      arena_current, arena_future, arena_prev,
                      ix, iy, ieta, rk_flag);
+#endif
 
         if (DATA.viscosity_flag == 1) {
             U_derivative u_derivative_helper(DATA, eos);
@@ -95,18 +191,11 @@ void Advance::FirstRKStepT(
         const double tau, const double x_local, const double y_local,
         const double eta_s_local,
         SCGrid &arena_current, SCGrid &arena_future, SCGrid &arena_prev,
-        const int ix, const int iy, const int ieta, const int rk_flag) {
+        const int ix, const int iy, const int ieta, const int rk_flag,
+        const float* gpu_dwmn_base, int Ncells) {
     // this advances the ideal part
     double tau_rk = tau + rk_flag*(DATA.delta_tau);
 
-    // Solve partial_a T^{a mu} = -partial_a W^{a mu}
-    // Update T^{mu nu}
-    // MakeDelatQI gets
-    //   qi = q0 if rk_flag = 0 or
-    //   qi = q0 + k1 if rk_flag = 1
-    // rhs[alpha] is what MakeDeltaQI outputs. 
-    // It is the spatial derivative part of partial_a T^{a mu}
-    // (including geometric terms)
     TJbVec qi = {0};
     MakeDeltaQI(tau_rk, arena_current, ix, iy, ieta, qi, rk_flag);
 
@@ -134,11 +223,24 @@ void Advance::FirstRKStepT(
         }
     }
 
-    // now MakeWSource returns partial_a W^{a mu}
-    // (including geometric terms)
-    TJbVec dwmn ={0.0};
-    diss_helper.MakeWSource(tau_rk, arena_current, arena_prev, ix, iy, ieta,
-                            dwmn);
+    // dwmn = partial_a W^{a mu} (including geometric terms).
+    // Use GPU result when available (gpu_dwmn_base != nullptr), otherwise
+    // fall back to the CPU MakeWSource implementation.
+    TJbVec dwmn = {0.0};
+#ifdef USE_METAL
+    if (gpu_dwmn_base && Ncells > 0) {
+        // Component-major layout: dwmn[alpha * Ncells + cell]
+        // gpu_dwmn_base points to dwmn[0 * Ncells + cell]; stride = Ncells.
+        for (int alpha = 0; alpha < 5; alpha++)
+            dwmn[alpha] = static_cast<double>(gpu_dwmn_base[alpha * Ncells]);
+    } else {
+#endif
+        diss_helper.MakeWSource(tau_rk, arena_current, arena_prev, ix, iy, ieta,
+                                dwmn);
+#ifdef USE_METAL
+    }
+#endif
+
     for (int alpha = 0; alpha < 5; alpha++) {
         /* dwmn is the only one with the minus sign */
         qi[alpha] -= dwmn[alpha]*(DATA.delta_tau);

@@ -18,6 +18,9 @@ class GridT {
     T& get(int x, int y, int eta) {
         return grid[Nx*(Ny*eta+y)+x];
     }
+    const T& get(int x, int y, int eta) const {
+        return grid[Nx*(Ny*eta+y)+x];
+    }
 
  public:
     GridT() = default;
@@ -44,7 +47,10 @@ class GridT {
     }
 
     const T& getHalo(int x, int y, int eta) const {
-        return getHalo(x, y, eta);
+        if(x  <0)   x  =0;  else if(x  >=Nx)   x  = Nx   - 1;
+        if(y  <0)   y  =0;  else if(y  >=Ny)   y  = Ny   - 1;
+        if(eta<0)   eta=0;  else if(eta>=Neta) eta= Neta - 1;
+        return get(x,y,eta);
     }
 
     T& operator()(const int x, const int y, const int eta) {

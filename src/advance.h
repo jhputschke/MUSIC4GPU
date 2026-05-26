@@ -13,6 +13,12 @@
 #include "hydro_source_base.h"
 #include "pretty_ostream.h"
 
+#ifdef USE_METAL
+#include "gpu/GPUGrid.h"
+#include "gpu/MetalPipelines.h"
+#include "gpu/gpu_types.h"
+#endif
+
 class Advance {
  private:
     const InitData &DATA;
@@ -26,6 +32,14 @@ class Advance {
 
     bool flag_add_hydro_source;
 
+#ifdef USE_METAL
+    GPUGrid    gpu_grid_;
+    bool       gpu_ready_ = false;
+    bool       metal_initialized_ = false;
+    void       init_metal_if_needed(SCGrid &arena_current);
+    void       make_gpu_params(double tau_rk, MUSICGridParams &p) const;
+#endif
+
  public:
     Advance(const EOS &eosIn, const InitData &DATA_in,
             std::shared_ptr<HydroSourceBase> hydro_source_ptr_in);
@@ -34,11 +48,16 @@ class Advance {
                    SCGrid &arena_prev, SCGrid &arena_current,
                    SCGrid &arena_future, const int rk_flag);
 
+    // gpu_dwmn_base: pointer to the first alpha-component of the GPU-computed
+    // dwmn buffer (component-major, stride = Ncells).  Pass nullptr to run
+    // the CPU MakeWSource fallback.
     void FirstRKStepT(const double tau, const double x_local,
                       const double y_local, const double eta_s_local,
                       SCGrid &arena_current, SCGrid &arena_future,
                       SCGrid &arena_prev, const int ix, const int iy,
-                      const int ieta, const int rk_flag);
+                      const int ieta, const int rk_flag,
+                      const float* gpu_dwmn_base = nullptr,
+                      int Ncells = 0);
 
     void FirstRKStepW(const double tau_it, SCGrid &arena_prev,
                       SCGrid &arena_current, SCGrid &arena_future,
