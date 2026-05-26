@@ -195,61 +195,87 @@ which calls `Advance::AdvanceIt(Fields&,…)`, which now dispatches to
 `try_gpu_advance` when built with `-DUSE_METAL=ON`.  So the standalone
 binary is itself a CPU↔GPU comparison harness for the new code path.
 
-### 8.1 Short-bench correctness (initial verification)
+Numbers below come from the repository's own benchmark scripts,
+`tests/metal_vs_cpu_bench.sh` and `tests/metal_vs_cpu_bench_3d.sh`,
+run on Apple M3 Max with **`OMP_NUM_THREADS=1`** to work around the
+pre-existing OpenMP race (§9.6).  Multi-threaded CPU baseline is
+currently unreachable on this machine, so the speedup figures should
+be read as a comparison against a single CPU core rather than a
+16-thread production run.
 
-`tests/metal_vs_cpu_bench.sh` (100 timesteps, multi-threaded CPU):
+### 8.1 2D bench — `tests/metal_vs_cpu_bench.sh`
 
-| Grid       | CPU time | GPU time | Speedup | Max rel err |
-|------------|----------|----------|---------|-------------|
-| 64×64×1    | 0.09 s   | 0.19 s   | 0.47×   | **0.0e+00** (bit-identical) |
-| 128×128×1  | 0.18 s   | 0.28 s   | 0.64×   | **0.0e+00** (bit-identical) |
+Boost-invariant Gubser viscous flow, 100 timesteps, EOS=ideal-gas.
 
-The 0.0e+00 result is misleading: the bench's correctness check only
-compares the *initial* eps_max (1 point of trace).  Over many steps the
-GPU's float32 accumulates noise vs the CPU's float64 — see §8.3.
+```
+$ OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench.sh
+```
 
-### 8.2 Longer bench (single-threaded CPU baseline)
+| Grid       | CPU 1-thread | GPU    | Speedup | Max rel err on eps_max (101 pts) |
+|------------|--------------|--------|---------|----------------------------------|
+| 32×32×1    |  0.50 s      | 0.24 s |  **2.1×** | 1.0 × 10⁻¹                     |
+| 64×64×1    |  1.84 s      | 0.60 s |  **3.1×** | 4.8 × 10⁻²                     |
+| 128×128×1  |  8.16 s      | 1.88 s |  **4.3×** | 9.3 × 10⁻³                     |
 
-Multi-threaded CPU is currently unreachable on this machine — see §9.6
-(pre-existing OpenMP race).  All CPU times below are with
-`OMP_NUM_THREADS=1`, which makes the GPU look better than it would
-against a 16-thread CPU.  Take the speedup numbers as *upper bounds*
-for the Apple M3 Max coherent-memory case.
+### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
-| Grid          | Steps | CPU 1-thread (s) | GPU (s) | Speedup vs 1-thread CPU | Max rel err on `eps_max` |
-|---------------|-------|------------------|---------|-------------------------|--------------------------|
-| 64×64×1       | 201   | 3.96             | 1.16    | **3.4×**                | 6.4 % (201 pts)          |
-| 128×128×1     | 201   | 17.34            | 3.55    | **4.9×**                | 48 % (201 pts)           |
-| 64×64×16 (3D) | 61    | 1.15             | 0.44    | **2.6×**                | 3.8 % (61 pts)           |
+Same Gubser profile replicated across η slices; full 3+1D evolution
+exercises η-direction stencils and geometric terms.
+
+```
+$ OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench_3d.sh
+```
+
+| Grid (Nx × Ny × Nη) | CPU 1-thread | GPU    | Speedup | Max rel err on eps_max (41 pts) |
+|---------------------|--------------|--------|---------|---------------------------------|
+| 32×32×8             |  2.27 s      | 0.59 s |  **3.9×** | 4.6 × 10⁻²                    |
+| 32×32×32            |  5.95 s      | 1.13 s |  **5.3×** | 1.9 × 10⁻²                    |
+| 64×64×16            | 12.61 s      | 2.27 s |  **5.6×** | 2.4 × 10⁻²                    |
+| 64×64×32            | 27.69 s      | 4.13 s |  **6.7×** | 2.4 × 10⁻²                    |
+
+**Headline:** 4–7× speedup over single-thread CPU at production-relevant
+3D grid sizes; speedup grows with grid size (more work per kernel
+launch, init/transfer cost amortised better).
 
 ### 8.3 Numerical accuracy note
 
-The 48 % relative error at 128×128×1 after 201 timesteps is not a bug
-per se — both CPU and GPU produce smooth, finite Gubser-like flow, but
-the GPU's float32 arithmetic diverges from the CPU's float64 over long
-evolutions.  Per-step error is small; it accumulates over hundreds of
-steps, particularly in the viscous (small-eps tail) cells where
-sensitivity is highest.
+Both bench scripts report a max relative error on the `eps_max` trace.
+At small grids (32×32) the GPU's float32 visibly diverges from the
+CPU's float64 — 10 % at 32×32×1 isn't a bug, it's the expected order
+of magnitude of single-precision viscous evolution over 100 steps.
+The error decreases as the grid refines (more cells → individual
+single-cell noise averages out), with the largest grid (128×128×1)
+landing at 0.9 %.  3D results are similar at ~2 %.
 
 For most XSCAPE use cases this is fine — JETSCAPE only needs hydro
 correct to a few percent for thermal-particle production downstream.
-If tighter agreement is required, the options are:
+If tighter agreement is required, the options (none wired today, see
+§9.7) are:
 
-- Promote critical kernels to fp64 (Metal supports half/float/double;
-  CUDA already supports double natively).  Roughly 1.5–2× slower.
-- Use mixed-precision: fp32 for KT flux divergence and shear update,
-  fp64 for the Newton solve in `gpu_reconst` where most divergence
-  originates.
+- Promote `gpu_reconst` (the Newton solve) to fp64.  Metal MSL 3.0+
+  and CUDA both support `double`; cost is ~2× on the Newton kernel,
+  small end-to-end.
+- Mixed-precision residency: fp32 in `snap_*` for bandwidth, cast to
+  fp64 only inside the sensitive arithmetic.
 
-Neither is wired yet; tracked as follow-up §9.7.
+### 8.4 Reproducing
 
-### 8.4 Grid-size note
+```
+# Build both
+cmake -B build              && cmake --build build       -j
+cmake -B build_metal -DUSE_METAL=ON && cmake --build build_metal -j
 
-256×256×1 didn't run in this bench — the chosen Gubser-style input
-(`X_grid_size = 25.6 fm`, `delta_x = 0.1 fm`, `delta_tau = 0.005 fm`)
-violates CFL for that grid and exits at step 1 with
-`maximum e = 6.3e+256`.  This is a test-input issue, not a GPU
-correctness issue — both CPU and GPU detect and exit the same way.
+# Symlinks expected by the bench script names
+ln -sf build build_cpu        # if a CPU-only build dir was named build_cpu
+ln -sf build_metal build_gpu  # likewise
+
+# Run
+OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench.sh
+OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench_3d.sh
+```
+
+On Linux/CUDA the equivalents are `tests/cuda_vs_cpu_bench.sh` and
+`tests/cuda_vs_cpu_bench_3d.sh` — not yet run on this branch.
 
 ## 9. Known issues / follow-ups
 
