@@ -17,6 +17,7 @@
 #include "u_derivative.h"
 #include "emoji.h"
 #include "util.h"
+#include "bench_timer.h"
 
 #ifndef _OPENMP
   #define omp_get_thread_num() 0
@@ -94,6 +95,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
     double tau = tau0;
     const int NtauBlock = 200;
     while (tau < tauMax) {
+        bench::Timer _bt_step("evolve.step_total");
         if (DATA.beastMode == 2 && it > 0 && (it % NtauBlock == 0)) {
             DATA.delta_tau = std::min(0.04, 2*DATA.delta_tau);
             DATA.facTau = std::max(1, static_cast<int>(DATA.facTau/2));
@@ -213,8 +215,11 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             double emax_loc = 0.;
             double Tmax_curr = 0.;
             double nB_max_curr = 0.;
+            {
+            bench::Timer _bt_max("evolve.max_energy_density");
             grid_info.get_maximum_energy_density(*fpCurr, emax_loc,
                                                  nB_max_curr, Tmax_curr);
+            }   // close evolve.max_energy_density timer scope
             if (tau > source_tau_max + dt && it > iFreezeStart) {
                 if (eps_max_cur < 0.) {
                     eps_max_cur = emax_loc;
@@ -264,7 +269,10 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 
         /* execute rk steps */
         // all the evolution are at here !!!
+        {
+        bench::Timer _bt_rk("evolve.AdvanceRK");
         AdvanceRK(tau, fpPrev, fpCurr, fpNext);
+        }
 
         if (DATA.JSecho > 0) {
             music_message << emoji::clock()
@@ -319,6 +327,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
     } else {
         music_message.warning("Maximum allowed time reached.");
     }
+    bench::dump();   // no-op unless MUSIC_PROFILE=1
     return 1;
 }
 
@@ -497,10 +506,18 @@ void Evolve::AdvanceRK(double tau, Fields* &fpPrev, Fields* &fpCurr,
             fpPrev = fpCurr;
             fpCurr = fpNext;
             fpNext = temp2;
+            // GPU: rotate_snapshots() is called at the START of the next
+            // AdvanceIt call (when gpu_state_authoritative_ is set), so no
+            // explicit mirror is needed here for the rk0 3-cycle.
         } else {
             Fields* temp = fpCurr;
             fpCurr = fpNext;
             fpNext = temp;
+#ifdef MUSIC_USE_GPU
+            // Mirror the host swap in GPU snapshot space so snap_curr stays
+            // aligned with arena_current across the timestep boundary.
+            advance.swap_curr_future_gpu();
+#endif
         }
     }  /* loop over rk_flag */
 }

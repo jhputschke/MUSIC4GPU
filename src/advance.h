@@ -13,6 +13,24 @@
 #include "hydro_source_base.h"
 #include "pretty_ostream.h"
 
+#ifdef USE_METAL
+#include "gpu/GPUGrid.h"
+#include "gpu/MetalPipelines.h"
+#include "gpu/gpu_types.h"
+// Shared alias so the GPU dispatch logic in advance.cpp is back-end agnostic.
+using GPUPipelines = MetalPipelines;
+#elif defined(USE_CUDA)
+#include "gpu/GPUGrid.h"
+#include "gpu/CUDAPipelines.h"
+#include "gpu/gpu_types.h"
+using GPUPipelines = CUDAPipelines;
+#endif
+
+// Single switch covering either GPU back-end.
+#if defined(USE_METAL) || defined(USE_CUDA)
+#define MUSIC_USE_GPU 1
+#endif
+
 class Advance {
  private:
     const InitData &DATA;
@@ -26,6 +44,25 @@ class Advance {
 
     bool flag_add_hydro_source;
 
+#ifdef MUSIC_USE_GPU
+    GPUGrid    gpu_grid_;
+    bool       gpu_ready_ = false;
+    bool       metal_initialized_ = false;
+    // True when the previous AdvanceIt substep wrote a complete fresh state
+    // into gpu_grid_.snap_future and skipped the CPU copy-back.  The next
+    // AdvanceIt entry rotates GPU snapshots and skips the AoS→SoA upload
+    // instead of going through the CPU arena.
+    bool       gpu_state_authoritative_ = false;
+    // Run-level flag: GPU holds the evolving state across timestep boundaries.
+    // When true, AdvanceIt skips the H2D upload at the start of rk0 because
+    // snap_curr/snap_prev are already current (maintained by swap_curr_future +
+    // lockstep rotations).  Set on the first complete full-GPU step.
+    bool       gpu_owns_state_ = false;
+    void       init_metal_if_needed(SCGrid &arena_current);
+    void       make_gpu_params(double tau, int rk_flag,
+                               MUSICGridParams &p) const;
+#endif
+
  public:
     Advance(const EOS &eosIn, const InitData &DATA_in,
             std::shared_ptr<HydroSourceBase> hydro_source_ptr_in);
@@ -34,6 +71,28 @@ class Advance {
                    Fields &arenaFieldsCurr, Fields &arenaFieldsNext,
                    const int rk_flag);
 
+#ifdef MUSIC_USE_GPU
+    // Mirror the rk1 host arena swap in GPU snapshot space (snap_curr ↔
+    // snap_future).  Called from Evolve::AdvanceRK immediately after the
+    // std::swap so the GPU and host pointer roles stay in lockstep.
+    void swap_curr_future_gpu();
+
+    // True when the GPU holds the authoritative evolving state across timestep
+    // boundaries (H2D upload at rk0 is skipped).
+    bool gpu_owns_state() const { return gpu_owns_state_; }
+
+    // GPU max-reduction over snap_curr.epsilon / .rhob.  Returns results in
+    // 1/fm^4 units (same as Cell_small::epsilon).  Synchronizes before return.
+    // No-op if GPU residency is not active.
+    void reduce_max_gpu(double& eps_max, double& rhob_max);
+#endif
+
+    // gpu_dwmn_base: pointer to the first alpha-component of the GPU-computed
+    // dwmn buffer (component-major, stride = Ncells).  Pass nullptr to run
+    // the CPU MakeWSource fallback.
+    // gpu_qi_base: pointer to the first alpha-component of the GPU-computed
+    // qi_out buffer (component-major, stride = Ncells).  Pass nullptr to run
+    // the CPU MakeDeltaQI fallback.
     void FirstRKStepT(const double tau, const double x_local,
                       const double y_local, const double eta_s_local,
                       const int ix, const int iy,

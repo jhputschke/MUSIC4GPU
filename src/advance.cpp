@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cmath>
 #include <memory>
+#include <vector>
 
 #include "util.h"
 #include "data.h"
@@ -15,10 +16,157 @@
 #include "eos.h"
 #include "evolve.h"
 #include "advance.h"
+#include "bench_timer.h"
 
 using Util::map_2d_idx_to_1d;
 using Util::map_1d_idx_to_2d;
 using Util::hbarc;
+
+// ── Metal helpers (compiled only when USE_METAL is defined) ───────────────────
+#ifdef MUSIC_USE_GPU
+void Advance::init_metal_if_needed(SCGrid &arena_current) {
+    if (metal_initialized_) return;
+    metal_initialized_ = true;
+
+    auto& mp = GPUPipelines::instance();
+    if (!mp.initialize()) {
+        music_message << "[MUSIC-GPU] Metal init failed, falling back to CPU.";
+        music_message.flush("warning");
+        gpu_ready_ = false;
+        return;
+    }
+    if (!gpu_grid_.allocate(arena_current.nX(),
+                            arena_current.nY(),
+                            arena_current.nEta())) {
+        music_message << "[MUSIC-GPU] GPU buffer allocation failed.";
+        music_message.flush("warning");
+        gpu_ready_ = false;
+        return;
+    }
+
+    // Sample P(e) and dP/de(e) at rhob=0 on a uniform grid for the GPU EOS.
+    // This covers the standard zero-net-baryon case.
+    {
+        const int    N_EOS   = GPU_EOS_N;
+        double       eps_max = eos.get_eps_max();
+        if (eps_max <= 0.0) eps_max = 1.0e4;
+        const double de = eps_max / static_cast<double>(N_EOS - 1);
+        std::vector<float> P_data(N_EOS), dPde_data(N_EOS);
+        std::vector<float> s_data(N_EOS), T_data(N_EOS);
+        // P, dPde sampled linearly in e (typically near-linear in e so
+        // linear interpolation is essentially exact for the ideal-gas EOS).
+        for (int i = 0; i < N_EOS; i++) {
+            const double e = i * de;
+            P_data[i]    = static_cast<float>(eos.get_pressure(e, 0.0));
+            dPde_data[i] = static_cast<float>(eos.get_dpde(e, 0.0));
+        }
+        // Entropy s(e) ~ e^(3/4) and temperature T(e) ~ e^(1/4) are strongly
+        // non-linear in e, so they're sampled at LOG-spaced e to keep
+        // resolution in the dilute regime where most hydro cells live.
+        // Both share the same log grid (driven by GPUEosParams::log_*).
+        constexpr double s_log_e_floor = 1.0e-6;  // 1/fm^4
+        const double log_e_min = std::log(s_log_e_floor);
+        const double log_e_max = std::log(std::max(eps_max, s_log_e_floor*1.01));
+        const double dle = (log_e_max - log_e_min) / static_cast<double>(N_EOS - 1);
+        for (int i = 0; i < N_EOS; i++) {
+            const double e = std::exp(log_e_min + i * dle);
+            s_data[i] = static_cast<float>(eos.get_entropy    (e, 0.0));
+            T_data[i] = static_cast<float>(eos.get_temperature(e, 0.0));
+        }
+        if (!gpu_grid_.upload_eos(P_data.data(), dPde_data.data(),
+                                  s_data.data(), T_data.data(),
+                                  N_EOS, 0.0f, static_cast<float>(eps_max))) {
+            music_message << "[MUSIC-GPU] EOS table upload failed.";
+            music_message.flush("warning");
+            gpu_ready_ = false;
+            return;
+        }
+    }
+
+    gpu_ready_ = true;
+    music_message << "[MUSIC-GPU] GPU grid allocated ("
+                  << arena_current.nX() << "x"
+                  << arena_current.nY() << "x"
+                  << arena_current.nEta() << " cells).";
+    music_message.flush("info");
+}
+
+void Advance::make_gpu_params(double tau, int rk_flag,
+                              MUSICGridParams &p) const {
+    const double tau_rk = tau + rk_flag * DATA.delta_tau;
+    p.Nx     = DATA.nx;
+    p.Ny     = DATA.ny;
+    p.Neta   = DATA.neta;
+    p.Ncells = DATA.nx * DATA.ny * DATA.neta;
+    p.delta_x   = static_cast<float>(DATA.delta_x);
+    p.delta_y   = static_cast<float>(DATA.delta_y);
+    p.delta_eta = static_cast<float>(DATA.delta_eta);
+    p.delta_tau = static_cast<float>(DATA.delta_tau);
+    p.tau       = static_cast<float>(tau_rk);
+    p.boost_invariant = DATA.boost_invariant ? 1 : 0;
+    p.turn_on_bulk    = DATA.turn_on_bulk;
+    p.turn_on_diff    = DATA.turn_on_diff;
+    p.minmod_theta    = static_cast<float>(DATA.minmod_theta);
+    p.rk_flag         = rk_flag;
+    p.tau_orig        = static_cast<float>(tau);
+
+    // Phase-2 transport / config inputs
+    p.shear_to_s              = static_cast<float>(DATA.shear_to_s);
+    p.shear_relax_time_factor = static_cast<float>(DATA.shear_relax_time_factor);
+    p.turn_on_shear           = DATA.turn_on_shear;
+    p.T_dep_shear_mode        = DATA.T_dependent_shear_to_s;
+    p.shear_duke_min          = static_cast<float>(DATA.shear_2_min);
+    p.shear_duke_slope        = static_cast<float>(DATA.shear_2_slope);
+    p.shear_duke_curv         = static_cast<float>(DATA.shear_2_curv);
+    p.shear_sims_T_kink_GeV   = static_cast<float>(DATA.shear_3_T_kink_in_GeV);
+    p.shear_sims_low_slope    = static_cast<float>(DATA.shear_3_low_T_slope_in_GeV);
+    p.shear_sims_high_slope   = static_cast<float>(DATA.shear_3_high_T_slope_in_GeV);
+    p.shear_sims_at_kink      = static_cast<float>(DATA.shear_3_at_kink);
+    // Bulk-viscosity inputs (Phase 3) — turn_on_bulk already set above.
+    p.T_dep_bulk_mode         = DATA.T_dependent_bulk_to_s;
+    p.bulk_relaxation_type    = DATA.bulk_relaxation_type;
+    p.bulk_relax_time_factor  = static_cast<float>(DATA.bulk_relax_time_factor);
+    p.bulk_duke_norm          = static_cast<float>(DATA.bulk_2_normalisation);
+    p.bulk_duke_width_GeV     = static_cast<float>(DATA.bulk_2_width_in_GeV);
+    p.bulk_duke_peak_GeV      = static_cast<float>(DATA.bulk_2_peak_in_GeV);
+    p.bulk_sims_max           = static_cast<float>(DATA.bulk_3_max);
+    p.bulk_sims_width_GeV     = static_cast<float>(DATA.bulk_3_width_in_GeV);
+    p.bulk_sims_T_peak_GeV    = static_cast<float>(DATA.bulk_3_T_peak_in_GeV);
+    p.bulk_sims_lambda        = static_cast<float>(DATA.bulk_3_lambda_asymm);
+    p.bulk_asym10_max         = static_cast<float>(DATA.bulk_10_max);
+    p.bulk_asym10_width_low   = static_cast<float>(DATA.bulk_10_width_low);
+    p.bulk_asym10_width_high  = static_cast<float>(DATA.bulk_10_width_high);
+    p.bulk_asym10_Tpeak       = static_cast<float>(DATA.bulk_10_Tpeak);
+    // QuestRevert
+    p.do_quest_revert         = (DATA.Initial_profile != 0
+                                 && DATA.Initial_profile != 1) ? 1 : 0;
+    p.quest_revert_strength   = static_cast<float>(DATA.quest_revert_strength);
+    // Second-order transport-term flags
+    p.include_second_order_terms = DATA.include_second_order_terms;
+    p.init_profile_zero          = (DATA.Initial_profile == 0) ? 1 : 0;
+
+    // Precompute geometric factors for the longitudinal flux term
+    double de = DATA.delta_eta;
+    if (DATA.boost_invariant) {
+        p.cosh_deta = 0.f;
+        p.sinh_deta = 0.5f;
+    } else {
+        double cd = (de > 1e-10) ? cosh(de/2.) / de : 0.5;
+        double sd = (de > 1e-10) ? sinh(de/2.) / de : 0.5;
+        p.cosh_deta = static_cast<float>(cd);
+        p.sinh_deta = static_cast<float>(std::max(0.5, sd));
+    }
+}
+
+void Advance::swap_curr_future_gpu() {
+    if (gpu_owns_state_) gpu_grid_.swap_curr_future();
+}
+
+void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
+    if (!gpu_owns_state_ || !gpu_ready_) { eps_max = rhob_max = 0.0; return; }
+    GPUPipelines::instance().reduce_max(gpu_grid_, eps_max, rhob_max);
+}
+#endif  // MUSIC_USE_GPU
 
 Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
                  std::shared_ptr<HydroSourceBase> hydro_source_ptr_in) :
@@ -48,6 +196,7 @@ void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
     const int grid_nx   = arenaFieldsCurr.nX();
     const int grid_ny   = arenaFieldsCurr.nY();
 
+    // ── CPU triple loop: ideal evolution + Newton solve ───────────────────────
     #pragma omp parallel for collapse(3) schedule(guided)
     for (int ieta = 0; ieta < grid_neta; ieta++)
     for (int ix   = 0; ix   < grid_nx;   ix++  )

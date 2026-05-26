@@ -515,6 +515,40 @@ void Diss::Make_uWRHS(const double tau, Fields &arena,
 }
 
 
+// ── GPU-accelerated helper: algebraic/geometric tail of Make_uWRHS ──────────
+// Returns only the per-cell geometric source terms (no stencil flux).
+// Used by the GPU path in advance.cpp when the stencil flux is supplied by
+// the GPU pre-pass (dispatch_uwrhs) and only the CPU tail is needed.
+double Diss::Make_uWRHS_geom(const double tau, const Cell_small &grid_pt,
+                             const int mu, const int nu,
+                             const double theta_local,
+                             const DumuVec &a_local) const {
+    auto Wmunu_local = Util::UnpackVecToMatrix(grid_pt.Wmunu);
+
+    double tempf = (
+         - (DATA.gmunu[3][mu])*(Wmunu_local[0][nu])
+         - (DATA.gmunu[3][nu])*(Wmunu_local[0][mu])
+         + (DATA.gmunu[0][mu])*(Wmunu_local[3][nu])
+         + (DATA.gmunu[0][nu])*(Wmunu_local[3][mu])
+         + (Wmunu_local[3][nu])*(grid_pt.u[mu])*(grid_pt.u[0])
+         + (Wmunu_local[3][mu])*(grid_pt.u[nu])*(grid_pt.u[0])
+         - (Wmunu_local[0][nu])*(grid_pt.u[mu])*(grid_pt.u[3])
+         - (Wmunu_local[0][mu])*(grid_pt.u[nu])*(grid_pt.u[3]))
+         *(grid_pt.u[3]/tau);
+
+    for (int ic = 0; ic < 4; ic++) {
+        const double ic_fac = (ic == 0 ? -1.0 : 1.0);
+        tempf += (
+            (Wmunu_local[ic][nu])*(grid_pt.u[mu])*(a_local[ic])*ic_fac
+            + (Wmunu_local[ic][mu])*(grid_pt.u[nu])*(a_local[ic])*ic_fac);
+    }
+
+    return tempf*(DATA.delta_tau)
+           + (- (grid_pt.u[0]*Wmunu_local[mu][nu])/tau
+              + (theta_local*Wmunu_local[mu][nu]))*(DATA.delta_tau);
+}
+
+
 double Diss::Make_uPiSource(const double tau, const Cell_small &grid_pt,
                             const double theta_local,
                             const VelocityShearVec &sigma_1d,

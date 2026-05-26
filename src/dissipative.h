@@ -48,6 +48,15 @@ class Diss {
                     std::array<double, 9> &w_rhs,
                     const double theta_local, const DumuVec &a_local);
 
+    // Algebraic / geometric tail of Make_uWRHS only (the per-cell terms that
+    // depend on grid_pt, theta_local, a_local — no neighbor data).  Returns
+    // the value to be added to w_rhs after the stencil flux divergence has
+    // already been supplied (e.g. from a GPU pre-pass).
+    double Make_uWRHS_geom(const double tau, const Cell_small &grid_pt,
+                           const int mu, const int nu,
+                           const double theta_local,
+                           const DumuVec &a_local) const;
+
     double Make_uPiSource(const double tau, const Cell_small &grid_pt,
                           const double theta_local,
                           const VelocityShearVec &sigma_1d,

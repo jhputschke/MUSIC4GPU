@@ -220,6 +220,11 @@ typedef struct init_data {
     int output_evolution_every_N_x;
     int output_evolution_every_N_y;
     int output_evolution_every_N_eta;
+    // Cadence (in timesteps) for the per-step summary diagnostics written by
+    // EvolveIt: output_momentum_anisotropy_vs_tau (the dominant one), and on
+    // 3D runs also check_conservation_law.  N=1 (default) preserves legacy
+    // every-step behavior; larger N skips the calls on non-matching steps.
+    int output_diagnostics_every_N_timesteps;
     bool output_hydro_params_header;
     double output_evolution_T_cut;
     double output_evolution_e_cut;

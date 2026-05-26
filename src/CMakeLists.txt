@@ -41,6 +41,59 @@ if (GSL_FOUND)
         )
 endif()
 
+# ── Metal GPU sources (macOS / Apple Silicon) ────────────────────────────────
+if (USE_METAL)
+    set(SOURCES ${SOURCES}
+        gpu/GPUGrid.mm
+        gpu/MetalPipelines.mm
+        )
+
+    # Compile the Metal shader to a .metallib at build time.
+    # xcrun is part of the Xcode command-line tools (required on macOS).
+    set(METAL_SRC  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/music_kernels.metal")
+    set(METAL_AIR  "${CMAKE_CURRENT_BINARY_DIR}/music_kernels.air")
+    set(METAL_LIB  "${CMAKE_CURRENT_BINARY_DIR}/music_kernels.metallib")
+
+    find_program(XCRUN xcrun REQUIRED)
+
+    add_custom_command(
+        OUTPUT  ${METAL_AIR}
+        COMMAND ${XCRUN} -sdk macosx metal
+                    -c ${METAL_SRC}
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+                    -o ${METAL_AIR}
+        DEPENDS ${METAL_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_types.h
+        COMMENT "Compiling Metal shader music_kernels.metal -> .air"
+    )
+    add_custom_command(
+        OUTPUT  ${METAL_LIB}
+        COMMAND ${XCRUN} -sdk macosx metallib ${METAL_AIR} -o ${METAL_LIB}
+        DEPENDS ${METAL_AIR}
+        COMMENT "Linking Metal library -> music_kernels.metallib"
+    )
+    add_custom_target(metal_kernels ALL DEPENDS ${METAL_LIB})
+
+    # Copy metallib next to the final executable/library so it can be found
+    # at runtime via [NSBundle mainBundle].
+    add_custom_command(
+        TARGET metal_kernels POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${METAL_LIB}
+            ${CMAKE_HOME_DIRECTORY}/music_kernels.metallib
+        COMMENT "Copying music_kernels.metallib to install prefix"
+    )
+endif()
+
+# ── CUDA GPU sources (NVIDIA) ────────────────────────────────────────────────
+if (USE_CUDA)
+    set(SOURCES ${SOURCES}
+        gpu/GPUGrid_cuda.cu
+        gpu/CUDAPipelines.cu
+        gpu/music_kernels.cu
+        )
+endif()
+
 add_library(${libname} SHARED ${SOURCES})
 set(CompileFlags "")
 if (APPLE)
@@ -50,11 +103,63 @@ if (GSL_FOUND)
     set(CompileFlags "${CompileFlags} -DGSL")
     target_link_libraries (${libname} ${GSL_LIBRARIES})
 endif()
-if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
-  if (OpenMP_CXX_FOUND)
-    target_link_libraries (${libname} ${LIBOMP_LIBRARY})
-  endif()
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(${libname} OpenMP::OpenMP_CXX)
 endif()
+
+if (USE_METAL)
+    set(CompileFlags "${CompileFlags} -DUSE_METAL")
+    # Link Metal and Foundation frameworks
+    target_link_libraries(${libname} "-framework Metal" "-framework Foundation")
+    # Ensure .mm files are compiled as Objective-C++
+    set_source_files_properties(
+        gpu/GPUGrid.mm
+        gpu/MetalPipelines.mm
+        PROPERTIES COMPILE_FLAGS "-x objective-c++"
+    )
+    # Include gpu/ subdirectory for header search
+    target_include_directories(${libname} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+    )
+    add_dependencies(${libname} metal_kernels)
+endif()
+
+if (USE_CUDA)
+    set(CompileFlags "${CompileFlags} -DUSE_CUDA")
+    set_source_files_properties(
+        gpu/GPUGrid_cuda.cu
+        gpu/CUDAPipelines.cu
+        gpu/music_kernels.cu
+        PROPERTIES LANGUAGE CUDA
+    )
+    # USE_CUDA / NDEBUG must reach the nvcc compilation too (COMPILE_FLAGS is
+    # applied to every source, but defines are cleaner via this property, which
+    # spans both CXX and CUDA).
+    target_compile_definitions(${libname} PRIVATE USE_CUDA NDEBUG)
+    target_link_libraries(${libname} CUDA::cudart)
+    target_include_directories(${libname} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+    )
+    # Whole-program compilation: each .cu is self-contained (kernels and their
+    # __device__ helpers live in the same TU; cross-TU references are only the
+    # host launch stubs), so relocatable device code / device linking is not
+    # needed and we avoid the shared-library nvlink complications it brings.
+    # Forward OpenMP to nvcc's host compiler so the AoS<->SoA converters in
+    # GPUGrid_cuda.cu stay parallel.
+    if (OpenMP_CXX_FOUND)
+        target_compile_options(${libname} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${OpenMP_CXX_FLAGS}>)
+    endif()
+    # Phase 5: fast-math intrinsics for the compute-bound device kernels
+    # (Newton reconstruction divides/sqrtf, transport expf/powf).  The hydro
+    # state is already FP32 (~1e-5 vs CPU); fast-math stays well inside the
+    # 1e-3 correctness threshold while accelerating delta_qi / w_full.
+    target_compile_options(${libname} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+endif()
+
+
 set_target_properties (${libname} PROPERTIES COMPILE_FLAGS "${CompileFlags}")
 install(TARGETS ${libname} DESTINATION ${CMAKE_HOME_DIRECTORY})
 

@@ -1,5 +1,9 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(MUSIChydro VERSION 2.0 LANGUAGES CXX)
+
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 set(libname "music")
 set(exename "MUSIChydro")
@@ -30,25 +34,28 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
-    message("Using Clang compiler ... ")
-
-    find_library(LIBOMP_LIBRARY NAMES libomp.dylib HINTS /opt/homebrew/opt/libomp/lib/ /opt/Homebrew/opt/libomp/lib/ /usr/local/opt/libomp/lib/ /usr/local/homebrew/opt/libomp/lib/ /usr/local/Homebrew/opt/libomp/lib/ NO_DEFAULT_PATH)
-
-    if (LIBOMP_LIBRARY)
-
-      set(OpenMP_CXX_FOUND TRUE)
-
-      message("Found OpenMP with Clang ..." ${OpenMP_CXX_FOUND})
-      find_path(OpenMP_incDir omp.h PATHS /opt/homebrew/opt/libomp/include /usr/local/homebrew/opt/libomp/include /opt/Homebrew/opt/libomp/include /usr/local/opt/libomp/include /usr/local/Homebrew/opt/libomp/include NO_DEFAULT_PATH)
-
-      set(OpenMP_CXX_FLAGS "-Xclang -fopenmp -I${OpenMP_incDir} -Wno-unused-command-line-argument")
-      set(CMAKE_CXX_COMPILE_FLAGS ${CMAKE_CXX_COMPILE_FLAGS} ${OpenMP_CXX_FLAGS})
-
-      message(STATUS "OpenMP_incDir: " ${OpenMP_incDir})
-      message(STATUS "Found OpenMP library: " ${LIBOMP_LIBRARY})
-      message(STATUS "OpenMP_CXX_FLAGS: ${OpenMP_CXX_FLAGS}")
-
-    endif ()
+    # AppleClang has no built-in OpenMP runtime; use Homebrew libomp.
+    find_program(BREW_EXECUTABLE brew)
+    if (BREW_EXECUTABLE)
+        execute_process(
+            COMMAND ${BREW_EXECUTABLE} --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE LIBOMP_BREW_RESULT)
+    endif()
+    if (LIBOMP_PREFIX AND EXISTS "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        message(STATUS "Found Homebrew libomp at ${LIBOMP_PREFIX}")
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+        set(OpenMP_CXX_LIB_NAMES "omp")
+        set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        find_package(OpenMP)
+        if (OpenMP_FOUND)
+            message(STATUS "OpenMP enabled for AppleClang via Homebrew libomp")
+        endif()
+    else ()
+        message("AppleClang: Homebrew libomp not found "
+                "(install with: brew install libomp). Building serial...")
+    endif()
 else ()
     find_package(OpenMP COMPONENTS CXX)
     if (OpenMP_CXX_FOUND)
@@ -75,6 +82,29 @@ message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
 option (KNL "Build executable on KNL" OFF)
 option (unittest "Build Unit tests" OFF)
 option (link_with_lib "Link executable with the libarary" ON)
+option (USE_METAL "Enable Metal GPU acceleration (macOS/Apple Silicon)" OFF)
+option (USE_CUDA  "Enable CUDA GPU acceleration (NVIDIA)" OFF)
+
+if (USE_METAL AND NOT APPLE)
+    message(FATAL_ERROR "USE_METAL is only supported on macOS (Apple Silicon).")
+endif()
+
+if (USE_METAL AND USE_CUDA)
+    message(FATAL_ERROR "USE_METAL and USE_CUDA are mutually exclusive.")
+endif()
+
+if (USE_CUDA)
+    # Detect the local GPU's compute capability unless the user overrides it
+    # (e.g. -DCMAKE_CUDA_ARCHITECTURES=80 for an A100).
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "CUDA enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
+endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Intel")
     if (KNL)
@@ -85,14 +115,17 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Intel")
 elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     set(CMAKE_CXX_FLAGS "${OpenMP_CXX_FLAGS} -std=c++11 -DDOCTEST_CONFIG_DISABLE -DNDEBUG")
 elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
-    set(CMAKE_CXX_FLAGS "${OpenMP_CXX_FLAGS} -std=c++11  -stdlib=libc++ -DDOCTEST_CONFIG_DISABLE -DNDEBUG")
+    set(CMAKE_CXX_FLAGS "-std=c++11  -stdlib=libc++ -DDOCTEST_CONFIG_DISABLE -DNDEBUG -w")
+    string(APPEND CMAKE_OBJCXX_FLAGS " -w")
 endif()
 
 if (unittest)
     set(CMAKE_CXX_FLAGS "${OpenMP_CXX_FLAGS} -std=c++11 -DDOCTEST_CONFIG_IMPLEMENT_WITH_MAIN")
 endif()
 
-string(APPEND CMAKE_CXX_FLAGS " -Wall")
+if (NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+    string(APPEND CMAKE_CXX_FLAGS " -Wall")
+endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-g -O3")
 
