@@ -17,6 +17,21 @@ __global__ void gpu_make_w_source(
     float* __restrict__ dwmn_out,
     MUSICGridParams params);
 
+// Phase 3: shared-memory tiled variant of gpu_make_w_source.  Identical result,
+// but the current-snapshot Wmunu/u/pi_b are cooperatively staged into a
+// (blockDim + 2)^3 halo tile in dynamic shared memory, so the radius-1 stencil
+// reads hit shared memory instead of global.  Launch with dynamic shared bytes
+// = (14 + 4 + 1) * (bx+2)*(by+2)*(bz+2) * sizeof(float).
+__global__ void gpu_make_w_source_tiled(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ pi_b_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ u_prev,
+    float* __restrict__ dwmn_out,
+    MUSICGridParams params);
+
 __global__ void gpu_make_delta_qi(
     const float* __restrict__ epsilon_curr,
     const float* __restrict__ rhob_curr,

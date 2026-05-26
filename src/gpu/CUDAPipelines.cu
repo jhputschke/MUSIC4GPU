@@ -136,13 +136,24 @@ void CUDAPipelines::end_batch()   {}
 void CUDAPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& params) {
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
-    dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
-    gpu_make_w_source<<<grid, block, 0, stream>>>(
+    // Phase 3: shared-memory tiled launch.  Use a tiling-friendly 8x8xbz block
+    // (small, balanced halo) rather than the coalescing block other kernels
+    // use.  bz collapses to Neta for thin grids.  Dynamic shared holds the
+    // (bx+2)(by+2)(bz+2) halo tile of Wmunu[14]+u[4]+pi_b — all configs here
+    // stay under the 48 KB default carveout.
+    int bz = (gpu.Neta() >= 4) ? 4 : (gpu.Neta() < 1 ? 1 : gpu.Neta());
+    int bx = 8, by = 8;
+    dim3 block(bx, by, bz);
+    dim3 grid((gpu.Nx()   + bx - 1) / bx,
+              (gpu.Ny()   + by - 1) / by,
+              (gpu.Neta() + bz - 1) / bz);
+    size_t tile_cells = (size_t)(bx + 2) * (by + 2) * (bz + 2);
+    size_t shmem = (14 + 4 + 1) * tile_cells * sizeof(float);
+    gpu_make_w_source_tiled<<<grid, block, shmem, stream>>>(
         gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
         gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,
         gpu.dwmn, params);
-    check_launch("gpu_make_w_source");
+    check_launch("gpu_make_w_source_tiled");
 }
 
 // ── dispatch_delta_qi ─────────────────────────────────────────────────────────

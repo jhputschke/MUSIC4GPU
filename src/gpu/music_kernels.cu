@@ -198,6 +198,180 @@ __global__ void gpu_make_w_source(
         dwmn_out[alpha * Ncells + c] = dwmn[alpha];
 }
 
+// ── gpu_make_w_source_tiled (Phase 3) ─────────────────────────────────────────
+//
+// Shared-memory tiled port of gpu_make_w_source.  The radius-1 stencil over the
+// current snapshot (Wmunu[14], u[4], pi_b) is staged into a (bx+2)(by+2)(bz+2)
+// halo tile so every neighbour read is served from shared memory.  The previous
+// snapshot is only sampled at the cell centre (the dWdtau / dPidtau time
+// derivatives), so it stays in global memory.  Bit-for-bit the same arithmetic
+// as the untiled kernel.
+
+__global__ void gpu_make_w_source_tiled(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ pi_b_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ u_prev,
+    float* __restrict__ dwmn_out,
+    MUSICGridParams params)
+{
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+
+    const int bx = blockDim.x, by = blockDim.y, bz = blockDim.z;
+    const int tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+
+    // Tile geometry: 1-cell halo on every face.
+    const int TX = bx + 2, TY = by + 2, TZ = bz + 2;
+    const int tile_cells = TX * TY * TZ;
+
+    // Dynamic shared layout: Wmunu[14] | u[4] | pi_b[1], component-major.
+    extern __shared__ float smem[];
+    float* sW = smem;                         // 14 * tile_cells
+    float* sU = sW + 14 * tile_cells;         //  4 * tile_cells
+    float* sP = sU +  4 * tile_cells;         //  1 * tile_cells
+
+    // Global origin of this tile (halo offset of -1 on each axis).
+    const int gx0 = blockIdx.x * bx - 1;
+    const int gy0 = blockIdx.y * by - 1;
+    const int ge0 = blockIdx.z * bz - 1;
+
+    // Cooperative halo load: grid-stride over the linear tile.
+    const int tid      = (tz * by + ty) * bx + tx;
+    const int nthreads = bx * by * bz;
+    for (int t = tid; t < tile_cells; t += nthreads) {
+        int lz  = t / (TX * TY);
+        int rem = t - lz * TX * TY;
+        int ly  = rem / TX;
+        int lx  = rem - ly * TX;
+        int gxx = clampi(gx0 + lx, 0, Nx   - 1);
+        int gyy = clampi(gy0 + ly, 0, Ny   - 1);
+        int gee = clampi(ge0 + lz, 0, Neta - 1);
+        int gc  = cell_idx(gxx, gyy, gee, Nx, Ny);
+        for (int m = 0; m < 14; ++m) sW[m * tile_cells + t] = __ldg(&Wmunu_curr[m * Ncells + gc]);
+        for (int m = 0; m < 4;  ++m) sU[m * tile_cells + t] = __ldg(&u_curr[m * Ncells + gc]);
+        sP[t] = __ldg(&pi_b_curr[gc]);
+    }
+    __syncthreads();
+
+    int ix   = blockIdx.x * bx + tx;
+    int iy   = blockIdx.y * by + ty;
+    int ieta = blockIdx.z * bz + tz;
+    if (ix >= Nx || iy >= Ny || ieta >= Neta) return;
+
+    // This cell's interior tile coordinate (centre at local +1).
+    const int lx = tx + 1, ly = ty + 1, lz = tz + 1;
+    #define TILE(a,b,cc) (((cc) * TY + (b)) * TX + (a))
+    const int self = TILE(lx, ly, lz);
+
+    const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const float delta[4]   = {0.f, params.delta_x, params.delta_y, params.delta_eta};
+    const float tau_fac[4] = {0.f, params.tau, params.tau, 1.f};
+
+    // Centre values from shared (current) and global (previous, centre only).
+    float Wc[14], Wp[14];
+    for (int m = 0; m < 14; ++m) {
+        Wc[m] = sW[m * tile_cells + self];
+        Wp[m] = Wmunu_prev[m * Ncells + c];
+    }
+    float uc[4], up[4];
+    for (int m = 0; m < 4; ++m) {
+        uc[m] = sU[m * tile_cells + self];
+        up[m] = u_prev[m * Ncells + c];
+    }
+    float pib_c = sP[self];
+    float pib_p = pi_b_prev[c];
+
+    const int dix  [3] = { 1, 0, 0};
+    const int diy  [3] = { 0, 1, 0};
+    const int dieta[3] = { 0, 0, 1};
+
+    float W_eta_p[4] = {0.f, 0.f, 0.f, 0.f};
+    float W_eta_m[4] = {0.f, 0.f, 0.f, 0.f};
+    float dwmn[5]    = {0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int alpha = 0; alpha < 5; ++alpha) {
+        int idx_alpha0 = WMUNU_IDX[alpha][0];
+
+        float dWdtau = (Wc[idx_alpha0] - Wp[idx_alpha0]) / params.delta_tau;
+
+        float dPidtau   = 0.f;
+        float Pi_alpha0 = 0.f;
+        if (alpha < 4 && params.turn_on_bulk) {
+            float gfac  = (alpha == 0) ? -1.f : 0.f;
+            Pi_alpha0   = pib_c * (gfac + uc[alpha] * uc[0]);
+            float Pi_p0 = pib_p * (gfac + up[alpha] * up[0]);
+            dPidtau = (Pi_alpha0 - Pi_p0) / params.delta_tau;
+        }
+
+        float dWdx  = 0.f;
+        float dPidx = 0.f;
+
+        for (int dir = 0; dir < 3; ++dir) {
+            int direction = dir + 1;
+            int idx_1d = WMUNU_IDX[alpha][direction];
+
+            int pL = TILE(lx + dix[dir], ly + diy[dir], lz + dieta[dir]);
+            int mL = TILE(lx - dix[dir], ly - diy[dir], lz - dieta[dir]);
+
+            float tf = tau_fac[direction];
+            float dx = delta  [direction];
+
+            float sg   = Wc[idx_1d] * tf;
+            float sgp1 = sW[idx_1d * tile_cells + pL] * tf;
+            float sgm1 = sW[idx_1d * tile_cells + mL] * tf;
+
+            float W_m = (sg + sgm1) * 0.5f;
+            float W_p = (sg + sgp1) * 0.5f;
+
+            if (direction == 3 && (alpha == 0 || alpha == 3)) {
+                W_eta_p[alpha] += W_p;
+                W_eta_m[alpha] += W_m;
+            } else {
+                dWdx += (W_p - W_m) / dx;
+            }
+
+            if (alpha < 4 && params.turn_on_bulk) {
+                float gfac1 = (alpha == direction) ? 1.f : 0.f;
+                float bgp1  = sP[pL]
+                              * (gfac1 + sU[alpha * tile_cells + pL]
+                                       * sU[direction * tile_cells + pL]) * tf;
+                float bg    = pib_c * (gfac1 + uc[alpha] * uc[direction]) * tf;
+                float bgm1  = sP[mL]
+                              * (gfac1 + sU[alpha * tile_cells + mL]
+                                       * sU[direction * tile_cells + mL]) * tf;
+                float Pi_m = (bg + bgm1) * 0.5f;
+                float Pi_p = (bg + bgp1) * 0.5f;
+
+                if (direction == 3 && (alpha == 0 || alpha == 3)) {
+                    W_eta_p[alpha] += Pi_p;
+                    W_eta_m[alpha] += Pi_m;
+                } else {
+                    dPidx += (Pi_p - Pi_m) / dx;
+                }
+            }
+        }
+
+        float sf = params.tau * dWdtau + Wc[idx_alpha0] + dWdx;
+        float bf = params.tau * dPidtau + Pi_alpha0 + dPidx;
+        dwmn[alpha] += sf + bf;
+    }
+
+    dwmn[0] += (  (W_eta_p[0] - W_eta_m[0]) * params.cosh_deta
+               + (W_eta_p[3] + W_eta_m[3]) * params.sinh_deta);
+    dwmn[3] += (  (W_eta_p[3] - W_eta_m[3]) * params.cosh_deta
+               + (W_eta_p[0] + W_eta_m[0]) * params.sinh_deta);
+
+    for (int alpha = 0; alpha < 5; ++alpha)
+        dwmn_out[alpha * Ncells + c] = dwmn[alpha];
+    #undef TILE
+}
+
 // ── EOS table helpers ─────────────────────────────────────────────────────────
 
 DFI float gpu_eos_interp(const float* __restrict__ table, float e,

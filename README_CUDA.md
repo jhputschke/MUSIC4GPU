@@ -185,3 +185,63 @@ Correctness unchanged (max rel `eps_max` error still ~3e-5 at 64×64×32). The
 per-step speedup at the production grid is **5.21×**, versus the ~2.4× wall-clock
 figure of Phase 1 that was diluted by fixed init overhead — both the cleaner
 methodology and the cache/launch tuning contribute.
+
+---
+
+## Phase 3 — Shared-memory tiling
+
+### Profile-driven retargeting
+
+Before tiling anything, `nsys` was used to find where the time actually goes
+(64×64×32, shear on):
+
+| Kernel | % runtime | Nature |
+|--------|----------:|--------|
+| `gpu_make_delta_qi` | 31.5% | compute-bound (Newton-Brent reconstruction) |
+| `gpu_first_rk_step_w_full` | 25.2% | compute-bound (per-cell algebra, **no stencil**) |
+| `gpu_make_w_source` | **23.7%** | bandwidth-bound radius-1 stencil (14 Wmunu comps) |
+| `gpu_make_du` | 7.5% | radius-1 stencil |
+| `gpu_make_uwrhs` | 6.2% | radius-2 stencil |
+| `gpu_finalize_ideal` | 5.8% | per-cell |
+
+This contradicts the plan's tiling priority (which led with `gpu_make_delta_qi`).
+The two largest kernels are **compute-bound** — `delta_qi` spends its time in the
+Newton-Brent velocity solve (up to 60 iterations × EOS evaluations per
+reconstruction, 12 reconstructions per cell) and `w_full` reads only per-cell
+buffers with no neighbour stencil at all. Shared-memory tiling cannot help
+either; they are addressed by Phase 5 (warp-level Newton early exit) instead.
+
+The genuine tiling target is **`gpu_make_w_source`** (23.7%, a bandwidth-bound
+radius-1 stencil with high neighbour reuse), so that is what Phase 3 tiles.
+
+### Implementation
+
+`gpu_make_w_source_tiled` cooperatively stages the current-snapshot
+`Wmunu[14] + u[4] + pi_b` into a `(bx+2)(by+2)(bz+2)` halo tile in **dynamic
+shared memory**, then serves every stencil neighbour read from shared instead of
+global. The previous snapshot is sampled only at the cell centre (the time
+derivative), so it stays in global memory. The arithmetic is bit-for-bit
+identical to the untiled kernel. Launch uses a balanced 8×8×`min(Neta,4)` block
+(small, low-halo-overhead) — all configurations stay under the 48 KB default
+shared carveout (45.6 KB at the 3-D block).
+
+### Performance
+
+Kernel-level (`nsys`, 64×64×32, avg over 42 launches):
+
+| `gpu_make_w_source` | Phase 2 (untiled) | Phase 3 (tiled) |
+|---------------------|------------------:|----------------:|
+| avg per launch | 228.6 µs | 192.9 µs (**−16%**) |
+| share of runtime | 23.7% | 20.8% |
+
+Per-step (vs 20-thread CPU), correctness still PASS (~3e-5):
+
+| Grid | Phase 2 ms/step | Phase 3 ms/step | Speedup vs CPU |
+|------|----------------:|----------------:|---------------:|
+| 64×64×32 (131k) | 11.84 | 10.79 | **5.50×** |
+
+The ~16% kernel win translates to ~9% at the production grid — bounded by
+Amdahl, since the two compute-bound kernels (`delta_qi` + `w_full` ≈ 57%) are
+untouched by tiling. This is the honest ceiling for tiling on this workload;
+the remaining headroom is in the Newton solver (Phase 5) and host↔device
+overlap (Phase 4).
