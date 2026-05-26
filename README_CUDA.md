@@ -812,3 +812,104 @@ interact.
 > (it is host-bound — see the host-bound finding above), so packing one event
 > per GPU is also a good way to raise aggregate GPU utilization on a multi-GPU
 > node.
+
+### Packing several events onto one GPU with CUDA MPS
+
+Because a single event leaves the GPU ~83% idle (kernels are ~17% of the step —
+see Phase 6), more than one event can share a GPU.  Two ways to do it:
+
+1. **Just launch concurrent processes** (no MPS).  The OS time-slices the GPU
+   between each process's CUDA context.  For this host-bound workload that
+   already fills most of the idle gaps (see the measurements below).
+2. **CUDA MPS (Multi-Process Service).**  A per-user daemon that lets multiple
+   processes share *one* GPU context, so their kernels can run *concurrently*
+   on the SMs instead of being time-sliced.  It pays off when GPU kernels are
+   the contended resource; for MUSIC at production grid they are not (below).
+
+#### Step-by-step: MPS
+
+MPS is a per-user daemon; **no root and no compute-mode change is required** for
+basic use (a single cooperating set of processes in the GPU's `Default` compute
+mode).  From a shell:
+
+```bash
+# 1. Point MPS at per-user pipe/log dirs (avoids clashing with other users).
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_$USER/pipe
+export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_$USER/log
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+
+# 2. Start the control daemon (forks into the background).
+nvidia-cuda-mps-control -d
+
+# 3. (optional) sanity-check it is up.
+echo "get_default_active_thread_percentage" | nvidia-cuda-mps-control   # prints 100.0
+
+# 4. Launch the events normally.  Any process whose CUDA_MPS_PIPE_DIRECTORY
+#    matches the daemon auto-routes through MPS.  Separate working dirs
+#    (MUSIC writes output into CWD); split the cores; pin the GPU.
+CORES=$(nproc); N=8
+for i in $(seq 1 $N); do
+  mkdir -p run_$i
+  ( cd run_$i && CUDA_VISIBLE_DEVICES=$(( (i-1) % 2 )) \
+        OMP_NUM_THREADS=$(( CORES / N )) \
+        ../build_cuda/src/MUSIChydro ../input_$i > log.txt 2>&1 ) &
+done
+wait
+
+# 5. Shut the daemon down when done.
+echo quit | nvidia-cuda-mps-control
+```
+
+While running, `nvidia-smi` shows a single `M+C` (MPS server) process holding
+the GPU with the clients underneath it.  For strict single-tenant nodes you can
+additionally `sudo nvidia-smi -c EXCLUSIVE_PROCESS` so *all* work is forced
+through MPS — not needed for a cooperating batch in `Default` mode.
+
+#### Measured throughput (2× RTX 3090, 48 cores)
+
+Each "event" is the 64×64×32 / 110-step benchmark.  Single event (48 threads) =
+**0.91 s**, of which init (CUDA context + EOS sampling) is ~0.56 s — so these
+short events are **62% init**, which *understates* the steady-state gain a real
+(thousands-of-steps) event would see.  Throughput gain = (N × single-event
+time) / (wall time for N concurrent):
+
+| Config | wall (N events) | throughput gain |
+|--------|----------------:|----------------:|
+| N=4, 1 GPU, no MPS | 1.59 s | 2.29× |
+| N=4, 1 GPU, **MPS** | 1.64 s | 2.21× |
+| N=8, 1 GPU, no MPS | 2.52 s | 2.89× |
+| N=8, 1 GPU, **MPS** | 2.48 s | 2.93× |
+| N=8, **2 GPUs** (4+4), MPS | 2.62 s | 2.78× |
+
+Two honest findings the measurement forces:
+
+- **MPS adds essentially nothing here** (2.21× vs 2.29×, 2.93× vs 2.89× — within
+  run-to-run noise).  The throughput win comes from *concurrency itself*, which
+  plain process launching already delivers.  MPS's specialty — concurrent
+  kernel co-residency — only helps when GPU kernels are the contended resource,
+  and for MUSIC at this grid they are not.
+- **The second GPU did not help at N=8** (2.78× on 2 GPUs vs 2.93× on 1).  This
+  is direct confirmation that the GPU is *not* the bottleneck even when packed:
+  the binding resources are the **48 CPU cores** (host-side pack + diagnostics)
+  and the **per-process CUDA init** (largely driver-serialized).  Spreading the
+  kernels over two GPUs cannot speed up work that is waiting on the CPU.
+
+#### When MPS / the second GPU *do* pay off
+
+- **Longer events.** At thousands of steps, init (~0.5 s) is negligible and the
+  steady-state evolution dominates, so the per-event GPU-idle gaps are what's
+  being filled — the gain rises toward the GPU-utilization ceiling (~1/0.17 ≈
+  6× per GPU) until the CPU-core budget binds.
+- **Bigger grids / heavier configs** (128³, full shear+bulk+diffusion): the
+  kernels become a larger share of the step, GPU-kernel contention becomes real,
+  and MPS's concurrent execution + the second GPU both start to matter.
+- **More CPU cores per GPU.** The host-bound ceiling here is set by 48 cores
+  feeding 2 GPUs; a node with a higher core-to-GPU ratio reaches GPU saturation
+  (where MPS helps) before the CPU saturates.
+
+**Bottom line for production today:** on this box, just launch `N≈6–8` concurrent
+events round-robin across the two GPUs with `OMP_NUM_THREADS = 48/N` and separate
+working dirs — that already gives ~3× aggregate throughput. MPS is a no-cost
+add-on (start the daemon, no code change) that becomes worthwhile as event
+length and grid size grow, not at this short-event / production-grid operating
+point.
