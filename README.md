@@ -398,10 +398,47 @@ without CPU involvement.
 | dP/drhob table | Add `eos_dPdrho` buffer; restore the `J0 * dPdrho` term in `gpu_vel_fdf` |
 | Validation against CPU for `neos` / `best` EOS | The CPU fallback is currently used for all finite-muB runs |
 
-### Performance / quality
+### Stencil kernel fusion + threadgroup-shared neighbour loads
 
-| Task | Notes |
-|---|---|
-| Re-run benchmark script after Tier 2 | `MakeDeltaQI` was ~60% of wall time; updated numbers needed |
-| Thread-group tuning for `gpu_make_delta_qi` | Newton iteration is divergent across threads; profiling with Xcode GPU Frame Capture recommended |
-| Validate `gpu_make_delta_qi` against CPU over a full Pb+Pb event | Random-cell unit tests exist for the viscous kernels; add equivalent for the ideal step |
+After Steps 1–3 of dispatch/copy work, the highest-leverage remaining
+optimisation is reducing redundant global-memory traffic inside the
+stencil kernels.  Most cells today re-read each of their 12 neighbours
+(4 per direction × 3 directions) from global memory independently —
+neighbour-load traffic alone is ~2 kB/cell/substep (~520 MB/timestep
+at 131k cells).  A halo'd 12×12×8 threadgroup tile loaded once into
+threadgroup memory cuts that to ~108 B/cell — a ~19× reduction in raw
+bandwidth; the realised speedup is smaller because Apple's L1/LLC
+already captures part of the redundancy.
+
+| Item | Where | LOC | Risk | Est. kernel speedup | Est. total GPU |
+|---|---|---|---|---|---|
+| Pull `gpu_TJb0` out of the alpha loop in `gpu_make_delta_qi` | [music_kernels.metal:791-800](src/gpu/music_kernels.metal#L791-L800) | ~30 | Low | 15–25% | **5–9%** |
+| Fuse `gpu_make_w_source` + `gpu_make_du` (both consume `u_curr`) | [music_kernels.metal:74](src/gpu/music_kernels.metal#L74), [:1258](src/gpu/music_kernels.metal#L1258) | ~80 | Low | 10–15% combined | **2–3%** |
+| Fuse `gpu_make_uwrhs` + `gpu_make_uprhs` (identical KT pattern, extra output channel) | [music_kernels.metal:1001](src/gpu/music_kernels.metal#L1001), [:1128](src/gpu/music_kernels.metal#L1128) | ~60 | Low | 5–10% combined | **1–2%** |
+| Threadgroup tile `gpu_make_uwrhs` (Wmunu + u into shared mem) | [music_kernels.metal:1057-1072](src/gpu/music_kernels.metal#L1057-L1072) | ~120 | Medium | 20–30% kernel | **3–5%** |
+| Threadgroup tile `gpu_make_uprhs` (pi_b + u into shared mem) | [music_kernels.metal:1166-1188](src/gpu/music_kernels.metal#L1166-L1188) | ~80 | Medium | 20–30% kernel | **1–2%** |
+| Threadgroup tile `gpu_make_du` (u into shared mem) | [music_kernels.metal:1258](src/gpu/music_kernels.metal#L1258) | ~120 | Medium | 25–35% kernel | **3–4%** |
+| Threadgroup tile `gpu_make_delta_qi` (epsilon + rhob + u; coexist with Newton solve) | [music_kernels.metal:733](src/gpu/music_kernels.metal#L733) | ~200 | **High** — Newton + multi-alpha interplay; per-cell register pressure | 10–15% kernel | **3–5%** |
+
+**Cumulative realistic estimate: 18–30% additional GPU speedup**, lifting
+3D 64×64×32 GPU time from 1.62 s → ~1.15–1.30 s (ratio vs CPU-12T
+goes from 1.50× to **~1.85–2.10×**).  Same proportional gain at
+production sizes (≈ 1M cells).
+
+**Caveats:**
+- Apple GPU L1 caches are surprisingly effective on stencil patterns
+  even without explicit tiling; measured wins will likely be at the
+  lower end of these ranges.
+- `gpu_make_delta_qi`'s real bottleneck on Apple Silicon is the
+  divergent Newton-Brent iteration (12 reconst calls per cell, ~30
+  iterations each) — memory tiling cannot fix that.  A vectorised /
+  cooperative Newton variant is a separate, much harder workstream.
+- Threadgroup-size tuning is per-kernel — uniform 8×8×4 is unlikely
+  to be optimal once shared memory and register pressure differ across
+  kernels.
+
+**Recommended ordering:** the first three items (alpha-loop pull-out +
+two fusions, ~2.5 LOC-days, low risk) deliver about 1/3 of the maximum
+projected gain at minimal complexity cost.  The full tiling treatment
+(~2 weeks) takes the GPU from 1.5× to ~2.0× ahead of the 12-thread CPU
+in 3D production-size runs.
