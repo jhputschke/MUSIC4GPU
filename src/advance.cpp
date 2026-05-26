@@ -51,13 +51,27 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
         double       eps_max = eos.get_eps_max();
         if (eps_max <= 0.0) eps_max = 1.0e4;
         const double de = eps_max / static_cast<double>(N_EOS - 1);
-        std::vector<float> P_data(N_EOS), dPde_data(N_EOS);
+        std::vector<float> P_data(N_EOS), dPde_data(N_EOS), s_data(N_EOS);
+        // P, dPde sampled linearly in e (typically near-linear in e so
+        // linear interpolation is essentially exact for the ideal-gas EOS).
         for (int i = 0; i < N_EOS; i++) {
             const double e = i * de;
             P_data[i]    = static_cast<float>(eos.get_pressure(e, 0.0));
             dPde_data[i] = static_cast<float>(eos.get_dpde(e, 0.0));
         }
+        // Entropy is sampled in LOG e because s ~ e^(3/4) — a linear table
+        // at the same e_max would lose all resolution in the dilute regime
+        // where most hydro cells live.
+        constexpr double s_log_e_floor = 1.0e-6;  // 1/fm^4
+        const double log_e_min = std::log(s_log_e_floor);
+        const double log_e_max = std::log(std::max(eps_max, s_log_e_floor*1.01));
+        const double dle = (log_e_max - log_e_min) / static_cast<double>(N_EOS - 1);
+        for (int i = 0; i < N_EOS; i++) {
+            const double e = std::exp(log_e_min + i * dle);
+            s_data[i] = static_cast<float>(eos.get_entropy(e, 0.0));
+        }
         if (!gpu_grid_.upload_eos(P_data.data(), dPde_data.data(),
+                                  s_data.data(),
                                   N_EOS, 0.0f, static_cast<float>(eps_max))) {
             music_message << "[MUSIC-GPU] EOS table upload failed.";
             music_message.flush("warning");
@@ -92,6 +106,11 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     p.minmod_theta    = static_cast<float>(DATA.minmod_theta);
     p.rk_flag         = rk_flag;
     p.tau_orig        = static_cast<float>(tau);
+
+    // Phase-2 transport / config inputs
+    p.shear_to_s              = static_cast<float>(DATA.shear_to_s);
+    p.shear_relax_time_factor = static_cast<float>(DATA.shear_relax_time_factor);
+    p.turn_on_shear           = DATA.turn_on_shear;
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -155,6 +174,7 @@ void Advance::AdvanceIt(const double tau,
     const float* gpu_dwmn        = nullptr;
     bool         gpu_finalize_active = false;
     bool         gpu_du_active       = false;
+    bool         gpu_w_full_active   = false;
     if (gpu_ready_) {
         // Copy arena_current and arena_prev into GPU SoA buffers (AoS→SoA).
         gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
@@ -181,20 +201,58 @@ void Advance::AdvanceIt(const double tau,
         if (gpu_du_active) {
             mp.dispatch_make_du(gpu_grid_, gp);
         }
+
+        // gpu_first_rk_step_w_full (Phase 2): full viscous step on GPU.
+        // Restricted to the simple configuration also assumed by gpu_make_du
+        // plus: no bulk viscosity, no second-order terms, constant shear
+        // (T- and muB-independent), no QuestRevert.  Anything outside that
+        // matrix uses the existing CPU FirstRKStepW path (which still
+        // benefits from the GPU uwrhs flux and theta/a/sigma buffers).
+        gpu_w_full_active =
+               gpu_du_active                                  // already ensures vort=0, diff=0
+            && gpu_finalize_active                            // ensures hydro_source path is off
+            && (DATA.viscosity_flag == 1)
+            && (DATA.turn_on_shear == 1)
+            && (DATA.turn_on_bulk == 0)
+            && (DATA.include_second_order_terms == 0)
+            && (DATA.T_dependent_shear_to_s == 0)
+            && (DATA.muB_dependent_shear_to_s == 0)
+            // QuestRevert is only invoked for Initial_profile != 0 && != 1.
+            && (DATA.Initial_profile == 0 || DATA.Initial_profile == 1);
+        if (gpu_w_full_active) {
+            mp.dispatch_first_rk_step_w_full(gpu_grid_, gp);
+        }
         mp.wait();   // synchronize – on Apple Silicon this is near-zero cost
 
         gpu_dwmn = gpu_grid_.dwmn;   // CPU-readable (unified memory)
 
         if (gpu_finalize_active) {
             // Propagate post-Newton primitives into arena_future for the
-            // subsequent CPU viscous pass.
+            // subsequent CPU viscous pass (or just for output if both passes
+            // are on the GPU).
             gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future,
                                              arena_future);
+        }
+        if (gpu_w_full_active) {
+            // Propagate GPU-computed Wmunu + pi_b into arena_future so the
+            // rest of evolve.cpp (output / freeze-out / next RK substep) can
+            // consume them.
+            gpu_grid_.copy_wmunu_to_cpu(gpu_grid_.snap_future, arena_future);
         }
     }
 #endif  // USE_METAL
 
+#ifdef USE_METAL
+    // Both ideal and viscous fully on GPU: nothing left to do per cell.
+    const bool cpu_loop_needed =
+        !(gpu_finalize_active
+          && (DATA.viscosity_flag == 0 || gpu_w_full_active));
+#else
+    constexpr bool cpu_loop_needed = true;
+#endif
+
     // ── CPU triple loop: ideal evolution + Newton solve ───────────────────────
+    if (cpu_loop_needed) {
     #pragma omp parallel for collapse(3) schedule(guided)
     for (int ieta = 0; ieta < grid_neta; ieta++)
     for (int ix   = 0; ix   < grid_nx;   ix++  )
@@ -283,6 +341,7 @@ void Advance::AdvanceIt(const double tau,
 #endif
         }
     }
+    }  // if (cpu_loop_needed)
 }
 
 

@@ -34,6 +34,16 @@ struct MUSICGridParams {
     float minmod_theta;   // flux limiter parameter (used by gpu_make_delta_qi)
     int   rk_flag;        // RK sub-step index (0 or 1); used by gpu_finalize_ideal
     float tau_orig;       // tau at the start of this RK step (un-shifted)
+
+    // Transport / config inputs for gpu_first_rk_step_w_full (Tier 3c Phase 2).
+    // Phase-2 v1 only supports the constant-shear branch
+    // (T_dependent_shear_to_s == 0, muB_dependent_shear_to_s == 0,
+    //  include_second_order_terms == 0, include_vorticity_terms == 0,
+    //  turn_on_diff == 0).  The host falls back to CPU FirstRKStepW for
+    //  any other configuration.
+    float shear_to_s;             // DATA.shear_to_s   (constant η/s)
+    float shear_relax_time_factor; // DATA.shear_relax_time_factor
+    int   turn_on_shear;          // DATA.turn_on_shear flag
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
@@ -46,6 +56,14 @@ struct GPUEosParams {
     float e_max;    // upper bound (eos.get_eps_max())
     float delta_e;  // spacing = (e_max - e_min) / (n_pts - 1)
     int   n_pts;    // number of sample points (GPU_EOS_N)
+
+    // Entropy s(e) is sampled in log-e because s ~ e^(3/4) varies over many
+    // decades — a linear table at the same e_max would lose most resolution
+    // in the dilute regime where the bulk of hydro evolution lives.
+    // s_table[i] = s(exp(log_e_min + i * log_delta_e)).
+    float log_e_min;     // log(s_e_min)
+    float log_e_max;     // log(s_e_max) == log(e_max)
+    float log_delta_e;   // (log_e_max - log_e_min) / (n_pts - 1)
 };
 
 // Wmunu 2D->1D index table (same as Util::map_2d_idx_to_1d)

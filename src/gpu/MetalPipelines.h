@@ -34,6 +34,15 @@ public:
     // Non-blocking: call wait() to ensure completion.
     void dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& params);
 
+    // Dispatch gpu_first_rk_step_w_full over the full grid.
+    // Consumes the outputs of the four earlier viscous kernels (snap_prev,
+    // snap_curr, snap_future.u, uwrhs_out, theta_buf, a_buf, sigma_buf) and
+    // writes snap_future.Wmunu + snap_future.pi_b directly.  Used only when
+    // the simple-config support matrix is satisfied (see kernel docs);
+    // otherwise the host runs the CPU FirstRKStepW loop instead.
+    void dispatch_first_rk_step_w_full(GPUGrid& gpu,
+                                       const MUSICGridParams& params);
+
     // Dispatch gpu_make_du over the full grid.
     // Reads gpu.snap_curr.u and gpu.snap_prev.u; writes theta_buf,
     // a_buf, sigma_buf (per-cell viscous geometry).  v1 assumes
@@ -73,5 +82,6 @@ private:
     void*  pso_finalize_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_uwrhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  pso_make_du_   = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_w_full_    = nullptr;  // id<MTLComputePipelineState>
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
 };

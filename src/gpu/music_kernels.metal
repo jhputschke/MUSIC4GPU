@@ -1296,3 +1296,290 @@ kernel void gpu_make_du(
     sigma_out[8 * Ncells + c] = sigma_local[2][3];
     sigma_out[9 * Ncells + c] = sigma_local[3][3];
 }
+
+// ── gpu_first_rk_step_w_full ─────────────────────────────────────────────────
+//
+// GPU port of Advance::FirstRKStepW (shear sector) for the
+// constant-shear / no-bulk / no-vorticity / no-diffusion / no-second-order
+// configuration.  Consumes the outputs of the four earlier kernels and
+// writes the final viscous tensors of arena_future directly into
+// snap_future.Wmunu and snap_future.pi_b — no CPU per-cell loop needed.
+//
+// For each cell:
+//   1. Read W^{μν}_curr, u_curr, u_future, theta, a^μ, σ^{μν}, and the
+//      precomputed stencil flux uwrhs[5] for shear indices idx_1d ∈ {4..8}.
+//   2. For each shear index:
+//        w_rhs = uwrhs[idx_1d - 4] + Make_uWRHS_geom(...)
+//        SW    = Make_uWSource_constant(...)
+//        tempf = (1-rk_flag)*W*u^0 + rk_flag*W_prev*u^0_prev
+//                + SW*delta_tau + w_rhs + rk_flag*W*u^0
+//        tempf *= 1/(1+rk_flag)
+//        W_future[idx_1d] = tempf / u_future^0
+//   3. Re-make W^{33} via tracelessness, then W^{0μ} via transversality.
+//   4. Zero out the baryon-diffusion components (idx 10..13).
+//   5. Set pi_b_future = 0 (turn_on_bulk == 0 in this v1).
+//
+// Buffer bindings (must match MetalPipelines::dispatch_first_rk_step_w_full):
+//   0  Wmunu_curr   [14*Ncells]
+//   1  pi_b_curr    [Ncells]
+//   2  u_curr       [4*Ncells]
+//   3  Wmunu_prev   [14*Ncells]
+//   4  pi_b_prev    [Ncells]
+//   5  u_prev       [4*Ncells]
+//   6  epsilon_curr [Ncells]
+//   7  epsilon_prev [Ncells]
+//   8  u_future     [4*Ncells]   (from gpu_finalize_ideal)
+//   9  uwrhs_in     [5*Ncells]   (from gpu_make_uwrhs)
+//  10  theta_in     [Ncells]     (from gpu_make_du)
+//  11  a_in         [4*Ncells]
+//  12  sigma_in     [10*Ncells]
+//  13  Wmunu_future [14*Ncells]  output
+//  14  pi_b_future  [Ncells]     output
+//  15  eos_P        [GPU_EOS_N]
+//  16  eos_s        [GPU_EOS_N]
+//  17  params
+//  18  eos_p
+
+// Helper: entropy lookup via log-spaced table.
+// Linear interpolation in log(e) — s(e) ~ e^(3/4) is locally linear in log(e)
+// so this gives ~1e-6 relative error across the physical range.
+inline float gpu_s(float e, device const float* s_tab,
+                   constant GPUEosParams& ep) {
+    if (e <= 0.f) return 0.f;
+    float le = log(e);
+    le = clamp(le, ep.log_e_min, ep.log_e_max);
+    float fe   = (le - ep.log_e_min) / ep.log_delta_e;
+    int   idx  = clamp((int)fe, 0, ep.n_pts - 2);
+    float frac = fe - (float)idx;
+    return max(0.f, s_tab[idx] * (1.f - frac) + s_tab[idx + 1] * frac);
+}
+
+// Algebraic Make_uWSource for the constant-shear branch.
+// Returns S^{μν} = (NS_term + relaxation_term) / tau_pi.
+//
+// Inputs:
+//   W_mn         : current cell W^{μν}      (component idx_1d)
+//   sigma_mn     : σ^{μν}                   (component idx_1d in VelocityShearVec)
+//   eps_src      : ε to use for transport coefficients (curr or prev based on rk_flag)
+//   shear_to_s   : DATA.shear_to_s          (constant η/s)
+//   shear_relax_factor : DATA.shear_relax_time_factor
+//   delta_tau    : DATA.delta_tau
+inline float gpu_uW_source_constant(
+        float W_mn, float sigma_mn, float theta,
+        float eps_src,
+        device const float* P_tab,
+        device const float* s_tab,
+        constant GPUEosParams& ep,
+        float shear_to_s_in, float shear_relax_factor,
+        float delta_tau)
+{
+    float P       = gpu_P(eps_src, P_tab, ep);
+    float entropy = gpu_s(eps_src, s_tab, ep);
+    float shear   = shear_to_s_in * entropy;
+
+    float epsP = max(eps_src + P, 1.e-20f);
+    float tau_pi = shear_relax_factor * shear / epsP;
+    tau_pi = min(10.f, max(3.f * delta_tau, tau_pi));
+
+    // delta_pipi_coeff = 4/3 (second-order term); active even with
+    // include_second_order_terms == 0 since the (4/3) coefficient was
+    // historically applied unconditionally in CPU Make_uWSource.
+    // Wait — actually it IS unconditional in the CPU code; only the WW,
+    // Wsigma, Coupling_to_Bulk terms are gated.
+    const float dpi_pi = 4.f / 3.f;
+    float transport_coefficient2 = dpi_pi * tau_pi;
+
+    float NS_term = -2.f * shear * sigma_mn;
+    float relax   = -(1.f + transport_coefficient2 * theta) * W_mn;
+
+    return (NS_term + relax) / tau_pi;
+}
+
+// Algebraic Make_uWRHS geometric tail (the per-cell terms that depend on
+// W^{μν}, u^μ, a^μ, theta).  Matches Diss::Make_uWRHS_geom on the CPU.
+inline float gpu_uWRHS_geom(
+        thread const float W_local[4][4], thread const float u[4],
+        thread const float a_loc[4],
+        int mu, int nu, float theta, float tau, float delta_tau)
+{
+    // gmunu^{μν} = diag(-1, +1, +1, +1) → gmunu[3][μ] = 1 iff μ==3, else 0
+    //                                     gmunu[0][μ] = -1 iff μ==0, else 0
+    float g3m = (mu == 3) ? 1.f : 0.f;
+    float g3n = (nu == 3) ? 1.f : 0.f;
+    float g0m = (mu == 0) ? -1.f : 0.f;
+    float g0n = (nu == 0) ? -1.f : 0.f;
+
+    float tempf = (
+         - g3m * W_local[0][nu]
+         - g3n * W_local[0][mu]
+         + g0m * W_local[3][nu]
+         + g0n * W_local[3][mu]
+         + W_local[3][nu] * u[mu] * u[0]
+         + W_local[3][mu] * u[nu] * u[0]
+         - W_local[0][nu] * u[mu] * u[3]
+         - W_local[0][mu] * u[nu] * u[3])
+         * (u[3] / tau);
+
+    for (int ic = 0; ic < 4; ic++) {
+        float ic_fac = (ic == 0) ? -1.f : 1.f;
+        tempf +=  W_local[ic][nu] * u[mu] * a_loc[ic] * ic_fac
+                + W_local[ic][mu] * u[nu] * a_loc[ic] * ic_fac;
+    }
+
+    return tempf * delta_tau
+           + (-(u[0] * W_local[mu][nu]) / tau
+              + theta * W_local[mu][nu]) * delta_tau;
+}
+
+kernel void gpu_first_rk_step_w_full(
+    device const float*       Wmunu_curr   [[buffer(0)]],
+    device const float*       pi_b_curr    [[buffer(1)]],
+    device const float*       u_curr       [[buffer(2)]],
+    device const float*       Wmunu_prev   [[buffer(3)]],
+    device const float*       pi_b_prev    [[buffer(4)]],
+    device const float*       u_prev       [[buffer(5)]],
+    device const float*       epsilon_curr [[buffer(6)]],
+    device const float*       epsilon_prev [[buffer(7)]],
+    device const float*       u_future     [[buffer(8)]],
+    device const float*       uwrhs_in     [[buffer(9)]],
+    device const float*       theta_in     [[buffer(10)]],
+    device const float*       a_in         [[buffer(11)]],
+    device const float*       sigma_in     [[buffer(12)]],
+    device       float*       Wmunu_future [[buffer(13)]],
+    device       float*       pi_b_future  [[buffer(14)]],
+    device const float*       eos_P        [[buffer(15)]],
+    device const float*       eos_s        [[buffer(16)]],
+    constant MUSICGridParams& params       [[buffer(17)]],
+    constant GPUEosParams&    eos_p        [[buffer(18)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    int ix   = (int)gid.x;
+    int iy   = (int)gid.y;
+    int ieta = (int)gid.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const int   rkf       = params.rk_flag;
+    const float dt        = params.delta_tau;
+    const float tau_now   = params.tau;   // tau + rk_flag * delta_tau
+    const float rk_norm   = 1.f / (1.f + (float)rkf);
+
+    // Early exit if shear is disabled (host should have skipped the dispatch,
+    // but guard anyway): write zeros for all viscous components.
+    if (params.turn_on_shear == 0) {
+        for (int m = 0; m < 14; m++)
+            Wmunu_future[m * Ncells + c] = 0.f;
+        pi_b_future[c] = 0.f;
+        return;
+    }
+
+    // ── Load cell-local state ─────────────────────────────────────────────
+    float u_c[4], u_p[4], u_f[4];
+    for (int m = 0; m < 4; m++) {
+        u_c[m] = u_curr  [m * Ncells + c];
+        u_p[m] = u_prev  [m * Ncells + c];
+        u_f[m] = u_future[m * Ncells + c];
+    }
+
+    float Wc[14], Wp_cell[14];
+    for (int m = 0; m < 14; m++) {
+        Wc[m]      = Wmunu_curr[m * Ncells + c];
+        Wp_cell[m] = Wmunu_prev[m * Ncells + c];
+    }
+
+    // 4×4 matrix views (full Wmunu — only the upper-left 4×4 used here)
+    float W4[4][4];
+    W4[0][0]=Wc[0]; W4[0][1]=Wc[1]; W4[0][2]=Wc[2]; W4[0][3]=Wc[3];
+    W4[1][0]=Wc[1]; W4[1][1]=Wc[4]; W4[1][2]=Wc[5]; W4[1][3]=Wc[6];
+    W4[2][0]=Wc[2]; W4[2][1]=Wc[5]; W4[2][2]=Wc[7]; W4[2][3]=Wc[8];
+    W4[3][0]=Wc[3]; W4[3][1]=Wc[6]; W4[3][2]=Wc[8]; W4[3][3]=Wc[9];
+
+    float theta = theta_in[c];
+    float a_loc[4];
+    for (int m = 0; m < 4; m++) a_loc[m] = a_in[m * Ncells + c];
+
+    float sigma_vec[10];
+    for (int m = 0; m < 10; m++) sigma_vec[m] = sigma_in[m * Ncells + c];
+
+    float eps_src = (rkf == 0) ? epsilon_curr[c] : epsilon_prev[c];
+
+    // ── Shear update for idx_1d in {4..8} ─────────────────────────────────
+    float Wf[14];
+    for (int m = 0; m < 14; m++) Wf[m] = 0.f;
+
+    // (μ, ν) for the 5 shear indices.
+    const int MU_LIST[5] = {1, 1, 1, 2, 2};
+    const int NU_LIST[5] = {1, 2, 3, 2, 3};
+
+    for (int k = 0; k < 5; k++) {
+        int mu  = MU_LIST[k];
+        int nu  = NU_LIST[k];
+        int id  = WMUNU_IDX[mu][nu];     // 4, 5, 6, 7, or 8
+        int sid = id;                    // VelocityShearVec uses same idx
+
+        float W_mn       = W4[mu][nu];
+        float sigma_mn   = sigma_vec[sid];
+        float uwrhs_flux = uwrhs_in[k * Ncells + c];
+
+        float SW = gpu_uW_source_constant(
+                       W_mn, sigma_mn, theta, eps_src,
+                       eos_P, eos_s, eos_p,
+                       params.shear_to_s, params.shear_relax_time_factor, dt);
+
+        float w_rhs_geom = gpu_uWRHS_geom(W4, u_c, a_loc, mu, nu,
+                                          theta, tau_now, dt);
+        float w_rhs = uwrhs_flux + w_rhs_geom;
+
+        float tempf =
+              (1.f - (float)rkf) * (Wc[id] * u_c[0])
+            +        (float)rkf  * (Wp_cell[id] * u_p[0]);
+        tempf += SW * dt;
+        tempf += w_rhs;
+        tempf += (float)rkf * (Wc[id] * u_c[0]);
+        tempf *= rk_norm;
+
+        Wf[id] = tempf / u_f[0];
+    }
+
+    // ── Transversality / tracelessness ────────────────────────────────────
+    // W^{33}: re-make from traceless condition.
+    Wf[9] = ( 2.f * (  u_f[1]*u_f[2]*Wf[5]
+                     + u_f[1]*u_f[3]*Wf[6]
+                     + u_f[2]*u_f[3]*Wf[8])
+              - (u_f[0]*u_f[0] - u_f[1]*u_f[1]) * Wf[4]
+              - (u_f[0]*u_f[0] - u_f[2]*u_f[2]) * Wf[7])
+            / fmax(u_f[0]*u_f[0] - u_f[3]*u_f[3], 1.e-10f);
+
+    // W^{0μ} for μ = 1..3 via u_ν W^{μν} = 0.
+    for (int mu = 1; mu < 4; mu++) {
+        float s = 0.f;
+        for (int nu = 1; nu < 4; nu++)
+            s += Wf[WMUNU_IDX[mu][nu]] * u_f[nu];
+        Wf[mu] = s / u_f[0];
+    }
+    // W^{00} from transversality at μ=0.
+    {
+        float s = 0.f;
+        for (int nu = 1; nu < 4; nu++) s += Wf[nu] * u_f[nu];
+        Wf[0] = s / u_f[0];
+    }
+
+    // Baryon-diffusion components: zeroed (turn_on_diff == 0 in this v1).
+    for (int m = 10; m < 14; m++) Wf[m] = 0.f;
+
+    // ── Write outputs ─────────────────────────────────────────────────────
+    for (int m = 0; m < 14; m++)
+        Wmunu_future[m * Ncells + c] = Wf[m];
+
+    // Bulk pressure: turn_on_bulk == 0 in this v1 → pi_b_future = 0.
+    pi_b_future[c] = 0.f;
+
+    // Silence "unused" warnings for the optional buffers (pi_b_curr/_prev are
+    // kept in the bindings so dispatch_first_rk_step_w_full's wiring matches
+    // a future turn_on_bulk == 1 port without re-shuffling).
+    (void)pi_b_curr; (void)pi_b_prev;
+}

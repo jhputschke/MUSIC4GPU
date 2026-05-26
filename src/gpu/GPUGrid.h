@@ -73,10 +73,11 @@ public:
     // Output buffer: dwmn[5 * Ncells] produced by gpu_make_w_source.
     float* dwmn = nullptr;
 
-    // EOS table (sampled at rhob=0 on a uniform grid; see GPUEosParams).
+    // EOS tables (sampled at rhob=0 on a uniform grid; see GPUEosParams).
     // Uploaded once at init time via upload_eos().
-    float*       eos_P    = nullptr;   // pressure table    [GPU_EOS_N]
-    float*       eos_dPde = nullptr;   // dP/de table       [GPU_EOS_N]
+    float*       eos_P    = nullptr;   // pressure table     [GPU_EOS_N]
+    float*       eos_dPde = nullptr;   // dP/de table        [GPU_EOS_N]
+    float*       eos_s    = nullptr;   // entropy table s(e) [GPU_EOS_N]
     GPUEosParams eos_params = {};
 
     // Output buffer: qi_out[5 * Ncells] produced by gpu_make_delta_qi.
@@ -95,10 +96,11 @@ public:
     float* a_buf     = nullptr;
     float* sigma_buf = nullptr;
 
-    // Upload a pre-sampled EOS table (both P and dP/de) to GPU shared memory.
+    // Upload pre-sampled EOS tables (P, dP/de, s) to GPU shared memory.
     // Must be called after allocate() and before the first dispatch_delta_qi.
     // n_pts must be <= GPU_EOS_N.
     bool upload_eos(const float* P_data, const float* dPde_data,
+                    const float* s_data,
                     int n_pts, float e_min, float e_max);
 
 private:

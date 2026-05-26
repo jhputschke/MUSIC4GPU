@@ -2,6 +2,7 @@
 // Handles Metal buffer allocation and AoS<->SoA conversion.
 
 #import <Metal/Metal.h>
+#include <cmath>
 #include <cstring>
 #include "GPUGrid.h"
 #include "../grid.h"   // SCGrid, Cell_small
@@ -89,6 +90,7 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
 }
 
 bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
+                         const float* s_data,
                          int n_pts, float e_min, float e_max) {
     if (!g_metal_device || !allocated_) return false;
 
@@ -97,10 +99,13 @@ bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
                                 buf_handles_, n_handles_);
     eos_dPde = alloc_metal_buf(g_metal_device, nc * sizeof(float),
                                 buf_handles_, n_handles_);
-    if (!eos_P || !eos_dPde) return false;
+    eos_s    = alloc_metal_buf(g_metal_device, nc * sizeof(float),
+                                buf_handles_, n_handles_);
+    if (!eos_P || !eos_dPde || !eos_s) return false;
 
     std::memcpy(eos_P,    P_data,    nc * sizeof(float));
     std::memcpy(eos_dPde, dPde_data, nc * sizeof(float));
+    std::memcpy(eos_s,    s_data,    nc * sizeof(float));
 
     eos_params.e_min   = e_min;
     eos_params.e_max   = e_max;
@@ -108,6 +113,17 @@ bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
     eos_params.delta_e = (n_pts > 1)
                          ? (e_max - e_min) / static_cast<float>(n_pts - 1)
                          : 1.f;
+
+    // Log-spaced entropy table parameters.  The host sampled s_data at
+    // log-spaced e values in [s_log_e_floor, e_max]; here we record the
+    // matching grid so the kernel can compute the bin index.
+    constexpr float s_log_e_floor = 1.e-6f;   // 1/fm^4 — well below physical range
+    eos_params.log_e_min   = std::log(s_log_e_floor);
+    eos_params.log_e_max   = std::log(std::max(e_max, s_log_e_floor * 1.01f));
+    eos_params.log_delta_e = (n_pts > 1)
+                             ? (eos_params.log_e_max - eos_params.log_e_min)
+                                 / static_cast<float>(n_pts - 1)
+                             : 1.f;
     return true;
 }
 
@@ -129,6 +145,7 @@ void GPUGrid::release() {
     sigma_buf = nullptr;
     eos_P     = nullptr;
     eos_dPde  = nullptr;
+    eos_s     = nullptr;
     eos_params = {};
 }
 
