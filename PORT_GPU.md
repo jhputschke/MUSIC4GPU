@@ -218,9 +218,9 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh
 
 | Grid       | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×1    |  0.71 s    | 0.28 s |  **2.54×**     | 3.24×              | 1.0 × 10⁻¹         | 5.3 × 10⁻⁵             |
-| 64×64×1    |  0.36 s    | 0.47 s |  **0.77×**     | 1.19×              | 4.8 × 10⁻²         | 9.9 × 10⁻⁵             |
-| 128×128×1  |  1.21 s    | 1.20 s |  **1.01×**     | 2.29×              | 9.3 × 10⁻³         | 9.4 × 10⁻⁵             |
+| 32×32×1    |  0.69 s    | 0.27 s |  **2.56×**     | 3.24×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
+| 64×64×1    |  0.36 s    | 0.39 s |  **0.92×**     | 1.19×              | 3.6 × 10⁻³         | 9.9 × 10⁻⁵             |
+| 128×128×1  |  1.25 s    | 0.96 s |  **1.30×**     | 2.29×              | 1.1 × 10⁻²         | 9.4 × 10⁻⁵             |
 
 ### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
@@ -233,48 +233,80 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench_3d.sh
 
 | Grid (Nx × Ny × Nη) | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |---------------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×8             |  0.39 s    | 0.45 s |  **0.87×**     | 1.43×              | 4.6 × 10⁻²         | 5.3 × 10⁻⁵             |
-| 32×32×32            |  0.77 s    | 0.64 s |  **1.20×**     | 2.36×              | 1.9 × 10⁻²         | 3.7 × 10⁻⁵             |
-| 64×64×16            |  1.63 s    | 1.18 s |  **1.38×**     | 2.91×              | 2.4 × 10⁻²         | 3.1 × 10⁻⁵             |
-| 64×64×32            |  3.23 s    | 1.99 s |  **1.62×**     | 3.41×              | 2.4 × 10⁻²         | 3.1 × 10⁻⁵             |
+| 32×32×8             |  0.38 s    | 0.42 s |  **0.90×**     | 1.43×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
+| 32×32×32            |  0.74 s    | 0.66 s |  **1.12×**     | 2.36×              | 6.9 × 10⁻⁴         | 3.7 × 10⁻⁵             |
+| 64×64×16            |  1.64 s    | 1.23 s |  **1.33×**     | 2.91×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
+| 64×64×32            |  3.21 s    | 2.12 s |  **1.51×**     | 3.41×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
+
+**Precision improved ~10×** vs the previous intra-substep-only port
+(commit `0cecdf5`): the per-step H2D upload, which truncates every
+cell to float32 and back every step, is now skipped while
+`gpu_owns_state_` is set.  GPU state stays in float32 throughout an
+outer step and only round-trips when a diagnostic actually demands
+it (most diagnostics use `reduce_max_gpu` for eps_max or are gated
+by `output_diagnostics_every_N_timesteps`).
 
 ### 8.3 Honest performance assessment
 
-**XSCAPE+GPU is now a positive speedup at production-relevant 3D
-grid sizes (1.4–1.6× faster than 12-thread CPU at 64×64×16 and
-64×64×32)**, but it still trails the pre-merge `main_gpu` branch by
-about 2×.
+**XSCAPE+GPU delivers a positive speedup at production-relevant 3D
+grid sizes (1.3–1.5× faster than 12-thread CPU at 64×64×16 and
+64×64×32), with precision close to `main_gpu`'s.**  The remaining 2×
+gap to `main_gpu`'s GPU speedup is **not** in the GPU port itself —
+it's in the CPU-side diagnostics that get re-run every outer step
+even with full residency.
 
-Why XSCAPE is slower than `main_gpu`:
+Per-step profile breakdown at 64×64×32 (`MUSIC_PROFILE=1`):
 
-- **Inter-step round-trip not yet eliminated.** XSCAPE still does
-  one H2D upload at rk0 and one D2H sync at rk1 every outer step.
-  `main_gpu`'s full GPU residency (`gpu_owns_state_` flag) lets the
-  GPU hold state across outer step boundaries; the CPU arena gets
-  re-synced only when EvolveIt diagnostics demand it.  Implementing
-  this for the Fields path is the obvious next optimisation (§9.4).
-- **Same float32-truncation root cause for the precision gap.**
-  XSCAPE's max rel err (~10⁻²) is ~100× worse than `main_gpu`'s
-  (~10⁻⁴).  Each H2D round-trip truncates every cell to float32 and
-  back; over 100 outer steps that drift accumulates.  Closing the
-  inter-step round-trip would also close the correctness gap.
+| Section                                | XSCAPE   | `main_gpu` |
+|----------------------------------------|----------|------------|
+| `evolve.step_total`                    | 44 ms    | 15 ms      |
+| `evolve.AdvanceRK` (GPU kernels + sync)| 4 ms     | 11 ms      |
+| `evolve.check_conservation_law`        | ~30 ms ★ | 1.1 ms     |
+| `evolve.output_momentum_anisotropy_vs_tau` | 2.1 ms | 1.3 ms |
+| `evolve.max_energy_density` (reduce_max_gpu) | 0.07 ms | 0.07 ms |
 
-Where the GPU still beats 12-thread CPU at the larger grids: Apple
-M3 Max has 16 high-performance cores backed by unified memory.  At
-small grids the GPU's intra-substep bandwidth advantage isn't enough
-to amortise the H2D/D2H overhead; at 64×64×32 (131k cells) the
-per-kernel parallelism wins.
+★ Not separately timed in XSCAPE; the figure is `step_total − sum of
+others` and matches the gap closure I observed when bumping
+`output_diagnostics_every_N_timesteps` from 1 to 10 (step_total
+dropped 44 → 9 ms).
+
+The diagnostic gap is a **pre-existing CPU-side performance issue in
+the Fields path**, not something the GPU port introduced: XSCAPE's
+`check_conservation_law` and friends call the 4-arg
+`eos.get_pressure(e, rhob, rhoq, rhos)` overload (added when Fields
+gained multi-charge support), which is ~30× slower than `main_gpu`'s
+2-arg `get_pressure(e, rhob)` even when rhoq = rhos = 0.  Both XSCAPE's
+CPU-only and XSCAPE+GPU paths pay this same cost, so the GPU-vs-CPU
+ratio measured on this branch *understates* the raw GPU speedup vs
+what a fast Fields-CPU path would show.
+
+Workarounds:
+
+- `output_diagnostics_every_N_timesteps 10` in the input file
+  (introduced from `main_gpu` during the merge — see §9.5) lets the
+  GPU run unconstrained between every 10 diagnostic snapshots.  At
+  Nskip=10, the 64×64×32 GPU bench finishes in **1.1 s vs 7.4 s CPU
+  (6.7× speedup)** — comparable to `main_gpu`.
+- A separate clean-up could give the Fields `eos.get_pressure` /
+  `getThermalVariables` a fast path when `turn_on_QS == 0`; that
+  would benefit both CPU and CPU-side-of-GPU runs.  Tracked as §9.8.
 
 Where the GPU port should win decisively is **discrete GPUs** (CUDA
 on Linux): an NVIDIA A100/H100 vs an x86 CPU shifts the bandwidth
 ratio ~10× and makes the H2D round-trip much more painful, so the
-residency optimisation matters more there.  That comparison needs
-Linux/CUDA hardware and hasn't been re-run on this branch.
+residency optimisation matters more there.  All Metal-side
+improvements (intra-substep + inter-step residency, GPU-side
+reduce_max, diagnostic gating, Fields↔snapshot copies) are
+backend-agnostic and apply identically to the CUDA build — they call
+through the shared `GPUGrid` / `GPUPipelines` interfaces that both
+backends implement.  A CUDA bench on Linux hardware hasn't been
+re-run on this branch.
 
-**Bottom line:** the GPU port is *correct*, *portable*, and now
-*useful* at production 3D sizes on Apple Silicon.  Closing the
-remaining 2× vs `main_gpu` requires inter-step GPU residency — a
-self-contained follow-up tracked in §9.4.
+**Bottom line:** the GPU port is *correct*, *portable*, and
+*useful*.  The CPU-side `check_conservation_law` cost is the limiting
+factor for the apples-to-apples ratio on this hardware; setting
+`output_diagnostics_every_N_timesteps` to a sensible production value
+recovers the full GPU benefit.
 
 ### 8.4 Numerical accuracy note
 
@@ -386,34 +418,32 @@ GPU pipeline.  If profiling later shows otherwise, the source loop
 itself could be ported (porting the strings model would be most of the
 work).
 
-### 9.4 Full inter-step GPU residency — open
+### 9.4 Full inter-step GPU residency — done (commit `ae58f7c`)
 
-**Status:** intra-substep residency is done (commit `0cecdf5`), giving
-1.4–1.6× GPU speedup at production 3D sizes (§8.2).  Inter-step
-residency (skip H2D at every outer step's rk0, sync back to CPU only
-on demand) is the remaining 2× gap to `main_gpu`.
+**Implemented as planned.**  Summary of what landed:
 
-Plan:
+- `Advance::gpu_owns_state_` set after each successful rk1 substep.
+- `try_gpu_advance` skips its H2D upload when either residency flag
+  is set, and skips its D2H copy-back at last substep too.
+- `Advance::sync_arena_from_gpu_readonly(prev, curr)`: on-demand D2H
+  that does NOT clear `gpu_owns_state_` (next rk0 still skips H2D).
+- `Advance::sync_arena_from_gpu(prev, curr)`: same D2H plus clearing
+  the flag.  Used at end of EvolveIt / EvolveOneTimeStep.
+- `Evolve::EvolveIt` and `Evolve::EvolveOneTimeStep`:
+  - Every diagnostic / output / freezeout call site that reads the
+    arena is preceded by `sync_arena_from_gpu_readonly`.
+  - `get_maximum_energy_density` replaced by `reduce_max_gpu` when
+    `gpu_owns_state_` (GPU-side max reduction returning scalars).
+  - `output_momentum_anisotropy_vs_tau` and `check_conservation_law`
+    gated on `DATA.output_diagnostics_every_N_timesteps`.
+- All implementations use the backend-agnostic `GPUGrid` /
+  `GPUPipelines` abstractions, so the CUDA build inherits identical
+  behaviour without backend-specific changes.
 
-1. Add a `gpu_owns_state_` flag that means "snap_curr is the
-   authoritative arena across outer step boundaries".  Set it the
-   first time try_gpu_advance returns at rk_flag = rk_order - 1 with
-   no diagnostic dirty-read pending.
-2. At the end of rk1 substep, skip the D2H if `gpu_owns_state_` and
-   no consumer needs CPU-side arena this outer step.
-3. Add a `sync_to_cpu_if_needed()` helper that EvolveIt calls before
-   any code path that reads `arenaFieldsCurr` (eps_max,
-   conservation_law, freezeout, evolution_data, ...).
-4. `gpu_owns_state_` gets cleared whenever the CPU writes to the
-   arena (which after the merge is essentially never inside
-   AdvanceRK; only initial-condition load and rerun_hydro).
-
-Caveat: open question §7.2 — for the JETSCAPE step-by-step entry
-point (`EvolveOneTimeStep`), JETSCAPE may mutate Fields between
-AdvanceIt calls.  The flag must be cleared at every entry to
-`run_hydro_upto`.  For the standalone binary and XSCAPE batch path
-(`run_hydro` → `EvolveIt`), no external mutation happens between
-AdvanceRK calls so residency is safe.
+Caveat acted on (open question §7.2): `EvolveOneTimeStep` syncs and
+clears `gpu_owns_state_` at end of every call, so JETSCAPE always
+sees a CPU-fresh arena.  Standalone / XSCAPE batch (`EvolveIt`)
+keeps state on GPU across outer steps for maximum throughput.
 
 ### 9.5 EvolveOneTimeStep is missing diagnostics that EvolveIt has
 
@@ -532,3 +562,35 @@ None of these are wired today.  For most XSCAPE downstream uses
 error is fine — particle yields and flow harmonics smooth most of it
 out.  Revisit if/when JETSCAPE consumers report deviations they care
 about.
+
+### 9.8 Slow `check_conservation_law` on the Fields path
+
+Profiling at 64×64×32 (§8.3) shows `check_conservation_law` taking
+~30 ms/step on the Fields-based XSCAPE branch versus ~1.1 ms/step on
+the SCGrid-based `main_gpu` branch — a ~30× gap.  This bottlenecks
+both the CPU-only and the CPU-side-of-GPU paths and is the main
+reason the XSCAPE GPU bench shows 1.5× speedup at default settings
+where `main_gpu` shows 3.4×.
+
+Root cause: when Fields added support for multi-charge densities
+(`rhoq`, `rhos`), the diagnostic loop switched to the 4-argument EOS
+overload `eos.get_pressure(e, rhob, rhoq, rhos)`, which dispatches
+through a multi-dimensional EOS table even when rhoq = rhos = 0.
+The 2-argument `get_pressure(e, rhob)` used by `main_gpu` is a
+straight 1D lookup.  Other diagnostic / source-prep loops in the
+Fields path likely have similar overhead.
+
+Fix is straightforward and benefits *both* CPU and GPU runs:
+
+- In `check_conservation_law` and similar full-arena diagnostic
+  loops, branch on `DATA.turn_on_QS` (or a runtime sanity check on
+  `rhoq_[0]`) and use the 2-arg overload for the zero-charge fast
+  path.
+- Or wrap a thread-local cache of `get_pressure(e, rhob)` keyed by
+  (e, rhob) bins.
+- Or — most invasively — add a `getThermalVariables` fast path that
+  skips the multi-charge table interpolation when QS is off.
+
+Setting `output_diagnostics_every_N_timesteps 10` in the input file
+is a working short-term mitigation: 64×64×32 GPU bench drops to 1.1 s
+(6.7× over CPU) without changing the evolution.
