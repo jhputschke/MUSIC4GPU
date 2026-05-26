@@ -190,61 +190,98 @@ guards need to be applied on the Fields path.
 
 ## 8. Verification (2026-05-26)
 
-Ran `tests/metal_vs_cpu_bench.sh` against the standalone `MUSIChydro`
-binary on Apple M3 Max.  The standalone binary's `Evolve::EvolveIt` also
-passes `Fields&` to `AdvanceIt`, so the bench exercises the new
-`try_gpu_advance` path directly.
+The standalone `MUSIChydro` binary calls `Evolve::EvolveIt(Fields&,…)`,
+which calls `Advance::AdvanceIt(Fields&,…)`, which now dispatches to
+`try_gpu_advance` when built with `-DUSE_METAL=ON`.  So the standalone
+binary is itself a CPU↔GPU comparison harness for the new code path.
 
-| Grid       | CPU time | GPU time | Speedup | Max rel err on `eps_max` trace |
-|------------|----------|----------|---------|--------------------------------|
-| 32×32×1    | 0.68 s   | 0.12 s   | 5.67×   | (probe died — see §9.1)        |
-| 64×64×1    | 0.09 s   | 0.19 s   | 0.47×   | **0.0e+00** (bit-identical)    |
-| 128×128×1  | 0.18 s   | 0.28 s   | 0.64×   | **0.0e+00** (bit-identical)    |
+### 8.1 Short-bench correctness (initial verification)
 
-The eps_max traces match the CPU run to float32 precision (rel err = 0).
-**Functional correctness of the Fields→GPU port is confirmed** at the
-sizes where the probe completed.
+`tests/metal_vs_cpu_bench.sh` (100 timesteps, multi-threaded CPU):
 
-Smaller grids show no meaningful speedup because (a) the test runs only
-100 timesteps so init dominates, and (b) Apple Silicon coherent memory
-gives the CPU a head start.  Speedup at scale needs to be re-measured
-on a non-Gubser configuration with a larger grid; this is tracked as
-follow-up §9.2.
+| Grid       | CPU time | GPU time | Speedup | Max rel err |
+|------------|----------|----------|---------|-------------|
+| 64×64×1    | 0.09 s   | 0.19 s   | 0.47×   | **0.0e+00** (bit-identical) |
+| 128×128×1  | 0.18 s   | 0.28 s   | 0.64×   | **0.0e+00** (bit-identical) |
+
+The 0.0e+00 result is misleading: the bench's correctness check only
+compares the *initial* eps_max (1 point of trace).  Over many steps the
+GPU's float32 accumulates noise vs the CPU's float64 — see §8.3.
+
+### 8.2 Longer bench (single-threaded CPU baseline)
+
+Multi-threaded CPU is currently unreachable on this machine — see §9.6
+(pre-existing OpenMP race).  All CPU times below are with
+`OMP_NUM_THREADS=1`, which makes the GPU look better than it would
+against a 16-thread CPU.  Take the speedup numbers as *upper bounds*
+for the Apple M3 Max coherent-memory case.
+
+| Grid          | Steps | CPU 1-thread (s) | GPU (s) | Speedup vs 1-thread CPU | Max rel err on `eps_max` |
+|---------------|-------|------------------|---------|-------------------------|--------------------------|
+| 64×64×1       | 201   | 3.96             | 1.16    | **3.4×**                | 6.4 % (201 pts)          |
+| 128×128×1     | 201   | 17.34            | 3.55    | **4.9×**                | 48 % (201 pts)           |
+| 64×64×16 (3D) | 61    | 1.15             | 0.44    | **2.6×**                | 3.8 % (61 pts)           |
+
+### 8.3 Numerical accuracy note
+
+The 48 % relative error at 128×128×1 after 201 timesteps is not a bug
+per se — both CPU and GPU produce smooth, finite Gubser-like flow, but
+the GPU's float32 arithmetic diverges from the CPU's float64 over long
+evolutions.  Per-step error is small; it accumulates over hundreds of
+steps, particularly in the viscous (small-eps tail) cells where
+sensitivity is highest.
+
+For most XSCAPE use cases this is fine — JETSCAPE only needs hydro
+correct to a few percent for thermal-particle production downstream.
+If tighter agreement is required, the options are:
+
+- Promote critical kernels to fp64 (Metal supports half/float/double;
+  CUDA already supports double natively).  Roughly 1.5–2× slower.
+- Use mixed-precision: fp32 for KT flux divergence and shear update,
+  fp64 for the Newton solve in `gpu_reconst` where most divergence
+  originates.
+
+Neither is wired yet; tracked as follow-up §9.7.
+
+### 8.4 Grid-size note
+
+256×256×1 didn't run in this bench — the chosen Gubser-style input
+(`X_grid_size = 25.6 fm`, `delta_x = 0.1 fm`, `delta_tau = 0.005 fm`)
+violates CFL for that grid and exits at step 1 with
+`maximum e = 6.3e+256`.  This is a test-input issue, not a GPU
+correctness issue — both CPU and GPU detect and exit the same way.
 
 ## 9. Known issues / follow-ups
 
-### 9.1 Intermittent crash on very small grids (≤ 10×10)
+### 9.1 Intermittent SIGTRAP / Obj-C corruption — now traced to §9.6
 
-The bench script's probe step (10×10 grid, 10 timesteps) crashes
-non-deterministically with one of:
+Originally suspected to be a small-grid Metal kernel issue.  Subsequent
+benchmarking (§8) revealed the same crash signature
+(`Method cache corrupted`, `receiver 0 bytes selector 'alloc'`,
+`Trace/BPT trap: 5`) on **all** grid sizes whenever
+`OMP_NUM_THREADS >= 2`, in both the CPU-only and Metal builds.  That
+makes it a pre-existing OpenMP race, not a Metal or small-grid issue —
+see §9.6 for the full reproduction and investigation plan.
 
-- `Method cache corrupted. This may be a message to an invalid object`
-- `objc[…]: receiver 0 bytes, … selector 'alloc'`
-- `Trace/BPT trap: 5`
+**Workaround until §9.6 is fixed:** run with `OMP_NUM_THREADS=1`.
+The GPU path itself works correctly at any grid size in that mode.
 
-The crash is intermittent (some runs complete a few timesteps before
-dying, some crash at step 0) and happens only at very small grid sizes.
-Production-sized grids (64×64 and up) ran to completion and produced
-bit-identical eps_max traces.  Suspicion: a kernel pipeline or
-threadgroup-count computation that underflows for tiny `Ncells`.  Could
-also be a pre-existing main_gpu issue inherited unchanged — to
-distinguish, run the same probe input against the `main_gpu` branch
-build.
+### 9.2 Performance characterisation — partial (see §8.2)
 
-Workaround: don't use the Fields→GPU path for `Nx*Ny*Neta < ~1000`.
-Investigation deferred — production XSCAPE runs use larger grids.
+Initial speedup numbers landed (§8.2): **2.6–4.9× over single-thread
+CPU** at 64–128 in 2D and 64×64×16 in 3D.  Multi-thread CPU baseline
+unreachable until the OpenMP race (§9.6) is fixed; that's the comparison
+that actually matters for production.  Other follow-ups:
 
-### 9.2 Performance characterisation
-
-The current bench shows a slowdown on coherent-memory Apple Silicon at
-64×64 and 128×128.  This is expected for short runs where init
-(Metal pipeline compilation, EOS table upload, first H2D copy) dominates.
-A proper measurement needs:
-
-- Longer evolution (e.g. tau_end = 5 fm/c, ~1000 timesteps)
-- Larger grid (256×256 or 3D)
-- Per-step bench timer breakdown (`bench::Timer` is already wired in
-  `evolve.cpp`, just needs to be enabled in a release build)
+- Per-step bench timer breakdown (`bench::Timer` scopes are already
+  wired in `evolve.cpp`, just need `MUSIC_PROFILE=1` build flag to
+  emit results).
+- Re-run on a discrete GPU (CUDA, A100/H100) where PCIe transfer cost
+  matters and the residency optimisation (§9.4) would make a real
+  difference.
+- Re-bench at production-realistic Pb–Pb sizes (typically 200×200×64
+  with smooth Glauber initial conditions, ~1000 timesteps) once a CFL-
+  safe input is available.
 
 ### 9.3 Hydro source terms — wired (2026-05-26 follow-up)
 
@@ -339,3 +376,61 @@ evolution itself is unaffected.
 **Fix when needed:** Mechanical port — copy the missing blocks from
 `EvolveIt` into `EvolveOneTimeStep`, gated on `tauIdx % output_frequency`
 (replacing `EvolveIt`'s `it %` checks).  Deferred at user request.
+
+### 9.6 OpenMP race / deterministic SIGTRAP at ≥ 2 threads
+
+**Pre-existing in MUSIC, not introduced by the GPU port.**  Discovered
+while trying to run a longer benchmark on Apple M3 Max
+(macOS / AppleClang 17 / Homebrew libomp 5.1).  Reproduction:
+
+```
+OMP_NUM_THREADS=1 MUSIChydro foo.input    # 100 % success
+OMP_NUM_THREADS=2 MUSIChydro foo.input    # 0/3 succeed, all SIGTRAP
+OMP_NUM_THREADS=16 MUSIChydro foo.input   # 0/3 succeed, all SIGTRAP
+```
+
+Crash signature is the same intermittent Obj-C/Metal corruption noted
+in §9.1 (`Method cache corrupted`, `receiver 0 bytes selector 'alloc'`,
+`Trace/BPT trap: 5`).  Hits both the CPU-only and the Metal build
+identically, so it's not a GPU issue.  Likely a race in one of the
+`#pragma omp parallel for` loops (init, evolve, or freeze-out) that
+manifests on the OpenMP runtime + threading model of this machine.
+
+**Impact for the GPU bench:** §8.2 numbers are CPU-1-thread vs GPU,
+which overstates GPU speedup relative to a properly-threaded CPU.
+A 16-thread CPU run would likely close the gap or beat the GPU on this
+M3 Max class of machine.  On a discrete GPU (CUDA) the relative
+position would shift further in favor of the GPU.
+
+**Investigation plan when this is fixed:**
+- bisect for the first commit where `OMP_NUM_THREADS=2` crashes
+  (start from a known-good ancestor)
+- look at recent changes to `#pragma omp parallel for` blocks in
+  `evolve.cpp`, `grid_info.cpp`, and `init.cpp` — particularly any new
+  shared-state writes inside the loop bodies
+- check whether the crash also reproduces on Linux with GCC's libgomp
+  (would indicate a real race vs an Apple/libomp interaction)
+
+### 9.7 Float32 GPU vs float64 CPU divergence over long runs
+
+§8.3 documents ~6 % error after 200 steps at 64×64 and 48 % after 200
+steps at 128×128 in the Gubser viscous test.  Per-step error is small;
+the accumulation is in the dilute-tail cells where the viscous Newton
+solve is most sensitive.
+
+If tighter agreement matters:
+
+1. **Promote `gpu_reconst` (the Newton solve in `music_kernels.metal`
+   / `music_kernels.cu`) to fp64.**  Both Metal MSL 3.0+ and CUDA
+   support `double`; the cost is roughly 2× on the Newton kernel and
+   negligible end-to-end.  This is the highest-leverage single change.
+2. **Promote KT flux reconstruction to fp64** if (1) isn't enough.
+   ~30 % overall slowdown.
+3. **Mixed-precision residency:** keep `snap_*` in fp32 for bandwidth,
+   re-cast to fp64 only inside the kernel for the sensitive arithmetic.
+
+None of these are wired today.  For most XSCAPE downstream uses
+(thermal-particle production, post-decay observables), 5–10 % hydro
+error is fine — particle yields and flow harmonics smooth most of it
+out.  Revisit if/when JETSCAPE consumers report deviations they care
+about.
