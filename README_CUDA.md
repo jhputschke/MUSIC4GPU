@@ -37,11 +37,12 @@ cmake --build build -j$(nproc)
 | File | Role |
 |------|------|
 | `src/gpu/gpu_types.h` | Shared C++/MSL/CUDA structs; `__CUDACC__` branch puts the index tables in `__constant__` memory |
-| `src/gpu/music_kernels.cu` | All 7 kernels + device helpers (port of `music_kernels.metal`) |
+| `src/gpu/music_kernels.cu` | All 7 hydro kernels + `gpu_reduce_max_eps_rhob` (Phase 6) + device helpers (port of `music_kernels.metal`) |
 | `src/gpu/music_kernels.cuh` | `__global__` prototypes shared by the kernels and the dispatcher |
-| `src/gpu/CUDAPipelines.{h,cu}` | Singleton: device init, stream, 7 `dispatch_*`, `wait()` |
-| `src/gpu/GPUGrid_cuda.cu` | `cudaMallocManaged` allocation + prefetch; AoS↔SoA converters |
-| `src/advance.{h,cpp}` | `GPUPipelines` alias + `MUSIC_USE_GPU` guard select the back-end |
+| `src/gpu/CUDAPipelines.{h,cu}` | Singleton: device init, stream, 7 `dispatch_*` + `reduce_max`, `wait()` |
+| `src/gpu/GPUGrid_cuda.cu` | Two-memory-mode allocation (managed or device+pinned); AoS↔SoA converters; `rotate_snapshots` / `swap_curr_future` (Phase 6) |
+| `src/advance.{h,cpp}` | `GPUPipelines` alias + `MUSIC_USE_GPU` guard select the back-end; `gpu_owns_state_` flag (Phase 6) |
+| `src/evolve.cpp` | `AdvanceRK` mirrors host swap → `swap_curr_future_gpu()`; `EvolveIt` calls `reduce_max_gpu()` when residency active (Phase 6) |
 
 ## Verification
 
@@ -400,6 +401,108 @@ hardware.
 
 ---
 
+## Phase 6 — GPU-resident state across timesteps
+
+### Motivation
+
+Phases 1–5 left the per-step pipeline still re-uploading the evolving state on
+every rk0:
+
+```
+rk0 entry → copy_to_gpu(arena_current, snap_curr)   ≈ 10.5 MB AoS→SoA pack + H2D
+            copy_to_gpu(arena_prev,    snap_prev)   ≈ 10.5 MB AoS→SoA pack + H2D
+            kernels…                                ≈   13 ms compute
+rk1 entry → rotate_snapshots (intra-step, OK)
+            kernels…
+            copy_back snap_future → arena_future    ≈ 11 MB SoA→AoS unpack + D2H
+            host swap(current, future)
+```
+
+That `copy_to_gpu` at the start of every rk0 is **pure waste on a discrete GPU**:
+the data being uploaded is exactly the data the GPU produced one step earlier and
+sent back via the D2H copy-back at the previous rk1.  On RTX 3090 this is
+~21 MB of redundant PCIe H2D traffic per step (plus the AoS↔SoA pack work).
+
+The plan that targets this restructure is
+[`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md).
+
+### What was implemented (Phase A + Phase B of the plan)
+
+**Phase A — eliminate the per-step H2D upload.**
+A new `GPUGrid::swap_curr_future()` (pointer-alias swap of `snap_curr ↔
+snap_future`, no data move) is called from `Evolve::AdvanceRK` immediately after
+the rk1 `std::swap(arena_current, arena_future)`.  Combined with the existing
+`rotate_snapshots()` at the rk0→rk1 transition, this keeps the GPU snapshot
+roles in lockstep with the host arena pointers across the timestep boundary —
+so at the next rk0, `snap_curr` and `snap_prev` are already the correct
+arenas.  A run-level flag `gpu_owns_state_` (set after the first complete
+full-GPU step) then gates `AdvanceIt` to **skip the `copy_to_gpu` calls** at
+rk0.  The D2H copy-back is **kept** so that the every-step host diagnostics
+(`output_momentum_anisotropy_vs_tau`, `check_conservation_law`,
+`get_maximum_energy_density`) continue to read fresh arena data — see Phase C
+below for why this isn't free yet.
+
+**Phase B — GPU max-reduction for `eps_max` / `rhob_max`.**
+A new `gpu_reduce_max_eps_rhob` kernel (256-thread blocks, shared-memory tree
+reduction, `atomicMax` via the IEEE-754 non-negative-float trick) replaces the
+CPU O(N) scan in `get_maximum_energy_density` when residency is active.  Only
+two `float` scalars cross the PCIe boundary per step.  `T_max` is computed on
+the host as `eos.get_temperature(eps_max, 0)` — exact for the rhob=0 EOS used
+in standard runs, per §4.2 of the plan.  Metal gets a CPU-scan fallback
+(coherent unified memory, ≤ 1 MB scan, negligible).
+
+### Performance — before vs after Phase 6, on RTX 3090 (discrete PCIe)
+
+Hardware: **NVIDIA RTX 3090** (cc 8.6, 24 GB, discrete PCIe, `coherent host
+memory: no`) vs 48-thread CPU on the same node.  `tests/cuda_perstep_bench.sh`
+(min of 3 runs, 10-vs-110 step differencing — see Phase 2 methodology):
+
+| Grid | **Before** GPU ms/step | **After** GPU ms/step | Per-step speedup (after / before) | Speedup vs CPU (before → after) |
+|------|----------------------:|----------------------:|----------------------------------:|-------------------------------:|
+| 128×128×1 (2D) | 12.30 | 11.15 | **1.10×** | 1.57× → 1.77× |
+| 64×64×16 (3D) | 15.18 | 13.36 | **1.14×** | 2.25× → 2.55× |
+| 64×64×32 (3D, 131k) | 17.01 | 13.44 | **1.27×** | 3.22× → **4.17×** |
+
+The 3D production grid (64×64×32) gains **27% per-step** purely from the
+residency change — that is the per-step cost of the redundant H2D + AoS pack
+the previous pipeline was paying every step.  The 2D boost-invariant case
+gains less because its per-step transfer (~5 MB total) is a smaller fraction
+of step time.
+
+### Correctness
+
+Both regression tests pass unchanged on the new pipeline:
+
+| Test | Max rel `eps_max` error |
+|------|------------------------:|
+| `tests/cuda_vs_cpu_bench.sh` (2D, 100 steps) | 8.8e-05 |
+| `tests/cuda_vs_cpu_bench_3d.sh` (3D, 40 steps, 64×64×32) | 2.7e-05 |
+
+Identical to the pre-Phase-6 numbers — the residency change is a transport
+reshuffle, not a numerical change.
+
+### Phase C — full D2H elimination (future)
+
+The plan's full vision (§3) is to also drop the per-step D2H copy-back and
+sync host arenas only when needed (output cadence, freeze-out).  This would
+cut another ~11 MB/step of PCIe traffic, but it is **not implemented yet**:
+
+- `output_momentum_anisotropy_vs_tau` is called **every step** in `EvolveIt`
+  and reads the full host arena.  With on-demand `sync_host_from_gpu`, it
+  would force a D2H copy on every step anyway — yielding no net saving versus
+  the current always-copy-back approach.
+- `check_conservation_law` (in non-boost-invariant runs) is the same story.
+
+Phase C therefore requires either porting these every-step diagnostics to the
+GPU or frequency-gating them.  That is an evolve-loop refactor beyond the
+GPU kernel layer and is deferred to a follow-up.  All the *plumbing* needed
+for Phase C is already in place — `gpu_owns_state()`, the GPU max-reduction,
+and the `swap_curr_future()` mirror — so the change reduces to wiring an
+`Advance::sync_host_from_gpu(current[, prev])` call into the relevant
+`EvolveIt` blocks and removing the unconditional copy-back in `AdvanceIt`.
+
+---
+
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
 | Phase | Change | Per-step speedup | Key kernel-level result |
@@ -409,6 +512,7 @@ hardware.
 | 3 | Shared-memory tiling of `gpu_make_w_source` | 5.50× | w_source −16% |
 | 4 | Dual-stream scaffolding (memory-model gated) | 4.90× (neutral) | no-op on coherent GB10 |
 | 5 | `--use_fast_math` | 5.29× | `delta_qi` −51% (2.04×) |
+| 6 | GPU-resident state (skip H2D re-upload) + GPU max-reduction | 4.17× (RTX 3090) | 27% per-step on discrete; ≈neutral on coherent GB10 |
 
 (Per-step figures carry ≈±10% run-to-run noise; the kernel-level `nsys` numbers
 are the reliable per-optimization signal.) Correctness holds throughout: max
@@ -426,19 +530,26 @@ baseline's speedup ratio.
 ### The headline engineering finding
 
 At production grid on a coherent Grace-Blackwell superchip, **MUSIC's hydro
-kernels are not the bottleneck** — they are ~5.5% of wall time. The port is
+kernels are not the bottleneck** — they are ~5.5% of wall time.  The port is
 correct and the kernels are well-optimized (delta_qi halved, w_source tiled),
-but further end-to-end speedup on this hardware requires attacking the
-**host-side** cost: the per-step AoS↔SoA conversion and the CPU `eps_max`
-diagnostics, and keeping evolving state GPU-resident across timesteps so the
-grid is not repacked every step. Those are evolve-loop changes beyond the GPU
-kernel layer and are the recommended next step.
+so further end-to-end speedup required attacking the **host-side** cost: the
+per-step AoS↔SoA conversion and the CPU `eps_max` diagnostics, and keeping
+evolving state GPU-resident across timesteps so the grid is not repacked every
+step.  Phase 6 above implements Phases A+B of that restructure
+([`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md)): the H2D
+re-upload at the start of each rk0 is eliminated, and `eps_max`/`rhob_max` are
+reduced on the GPU.  On the discrete RTX 3090 this delivers a measured 27%
+per-step win at 64×64×32 (3.22× → 4.17× vs 48-thread CPU).  On coherent GB10
+the same change is correctness-neutral and ≈ performance-neutral, because no
+PCIe transfer ever happened.
 
-This restructure is specified in **[`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md)**
-— a standalone plan (current flow, proposed flow, file-by-file changes,
-validation, sequencing) intended to be picked up later, ideally with a discrete
-GPU on hand where its payoff is largest. It is the single highest-value
-remaining optimization.
+The remaining piece, Phase C — eliminating the D2H copy-back too — is gated on
+moving every-step diagnostics (`output_momentum_anisotropy_vs_tau`,
+`check_conservation_law`) off the host or frequency-gating them, since they
+would otherwise force a per-step sync anyway.  The plumbing for that change
+(the `gpu_owns_state_` flag, the GPU reduction, the snapshot mirroring) is now
+all in place; the remaining work is in the `EvolveIt` diagnostic loop, not the
+GPU kernel layer.
 
 **Multiple GPUs.** Scaling to several discrete GPUs is feasible — the structured
 grid suits η-slab domain decomposition with a 2-cell halo exchange — but it is
