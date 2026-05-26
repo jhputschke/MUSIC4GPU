@@ -137,6 +137,10 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     p.bulk_asym10_width_low   = static_cast<float>(DATA.bulk_10_width_low);
     p.bulk_asym10_width_high  = static_cast<float>(DATA.bulk_10_width_high);
     p.bulk_asym10_Tpeak       = static_cast<float>(DATA.bulk_10_Tpeak);
+    // QuestRevert
+    p.do_quest_revert         = (DATA.Initial_profile != 0
+                                 && DATA.Initial_profile != 1) ? 1 : 0;
+    p.quest_revert_strength   = static_cast<float>(DATA.quest_revert_strength);
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -303,9 +307,9 @@ void Advance::AdvanceIt(const double tau,
             && (DATA.include_second_order_terms == 0)
             && T_dep_mode_supported
             && T_dep_bulk_supported                           // turn_on_bulk == 1 now allowed
-            && (DATA.muB_dependent_shear_to_s == 0)
-            // QuestRevert is only invoked for Initial_profile != 0 && != 1.
-            && (DATA.Initial_profile == 0 || DATA.Initial_profile == 1);
+            && (DATA.muB_dependent_shear_to_s == 0);
+        // QuestRevert (Initial_profile not in {0, 1}) is now handled by the
+        // gpu_first_rk_step_w_full kernel itself — no host-side restriction.
         if (gpu_w_full_active) {
             mp.dispatch_first_rk_step_w_full(gpu_grid_, gp);
         }

@@ -1844,6 +1844,9 @@ kernel void gpu_first_rk_step_w_full(
     device const float*       uprhs_in     [[buffer(19)]],
     constant MUSICGridParams& params       [[buffer(20)]],
     constant GPUEosParams&    eos_p        [[buffer(21)]],
+    // For QuestRevert: needs the future-state primitives (post-Newton).
+    device const float*       epsilon_future [[buffer(22)]],
+    device const float*       rhob_future    [[buffer(23)]],
     uint3 gid [[thread_position_in_grid]])
 {
     int ix   = (int)gid.x;
@@ -1963,11 +1966,8 @@ kernel void gpu_first_rk_step_w_full(
     // Baryon-diffusion components: zeroed (turn_on_diff == 0 in this v1).
     for (int m = 10; m < 14; m++) Wf[m] = 0.f;
 
-    // ── Write outputs ─────────────────────────────────────────────────────
-    for (int m = 0; m < 14; m++)
-        Wmunu_future[m * Ncells + c] = Wf[m];
-
     // ── Bulk pressure update (turn_on_bulk == 1 only) ─────────────────────
+    float pi_b_out;
     if (params.turn_on_bulk == 1) {
         float pi_c = pi_b_curr[c];
         float pi_p = pi_b_prev[c];
@@ -1989,8 +1989,68 @@ kernel void gpu_first_rk_step_w_full(
         tempf += p_rhs;
         tempf += (float)rkf * (pi_c * u_c[0]);
         tempf *= rk_norm;
-        pi_b_future[c] = tempf / u_f[0];
+        pi_b_out = tempf / u_f[0];
     } else {
-        pi_b_future[c] = 0.f;
+        pi_b_out = 0.f;
     }
+
+    // ── QuestRevert regulator (per-cell, no stencil) ──────────────────────
+    //
+    // GPU port of Advance::QuestRevert.  Active when the host sets
+    // do_quest_revert == 1 (i.e. Initial_profile not in {0, 1}).  Reduces
+    // the magnitude of W^{μν} and pi_b when they grow too large relative
+    // to the equilibrium scale, matching the CPU regulator that fires
+    // after FirstRKStepW.  Uses the future-state primitives (post-Newton)
+    // as the equilibrium reference.
+    if (params.do_quest_revert == 1) {
+        const float eps_scale     = 0.1f;
+        const float xi            = 0.05f;
+        const float rho_shear_max = 0.1f;
+        const float rho_bulk_max  = 0.1f;
+
+        float e_local = epsilon_future[c];
+        // Smoothstep factor: matches the CPU `1/(1+exp(-(e-eps)/xi)) - const`
+        float sig_e   = 1.f / (exp(-(e_local - eps_scale) / xi) + 1.f);
+        float sig_off = 1.f / (exp(eps_scale / xi)              + 1.f);
+        float factor  = 10.f * params.quest_revert_strength
+                            * (sig_e - sig_off);
+
+        // pisize = Σ g_μ g_ν W^{μν} · W^{μν} (with off-diagonal signs).
+        float pi00 = Wf[0], pi01 = Wf[1], pi02 = Wf[2], pi03 = Wf[3];
+        float pi11 = Wf[4], pi12 = Wf[5], pi13 = Wf[6];
+        float pi22 = Wf[7], pi23 = Wf[8];
+        float pi33 = Wf[9];
+        float pisize =
+              pi00*pi00 + pi11*pi11 + pi22*pi22 + pi33*pi33
+            - 2.f * (pi01*pi01 + pi02*pi02 + pi03*pi03)
+            + 2.f * (pi12*pi12 + pi13*pi13 + pi23*pi23);
+
+        float bulksize = 3.f * pi_b_out * pi_b_out;
+
+        float p_local  = gpu_P(e_local, eos_P, eos_p);
+        float eq_size  = e_local * e_local + 3.f * p_local * p_local;
+        eq_size        = max(eq_size, 1.e-30f);
+
+        // Shear regulator: division by `factor` reproduces the CPU sign
+        // convention (negative factor at low e ⇒ rho_shear < 0 ⇒ no reduction).
+        float rho_shear = sqrt(max(pisize, 0.f) / eq_size) / factor;
+        float rho_bulk  = sqrt(max(bulksize, 0.f) / eq_size) / factor;
+
+        if (isnan(rho_shear)) {
+            for (int m = 0; m < 10; m++) Wf[m] = 0.f;
+        } else if (rho_shear > rho_shear_max) {
+            float scale = rho_shear_max / rho_shear;
+            for (int m = 0; m < 10; m++) Wf[m] *= scale;
+        }
+        if (rho_bulk > rho_bulk_max) {
+            pi_b_out *= rho_bulk_max / rho_bulk;
+        }
+
+        (void)rhob_future;  // EOS at rhob=0 for this v1 — future µB needs Tier 4
+    }
+
+    // ── Write outputs ─────────────────────────────────────────────────────
+    for (int m = 0; m < 14; m++)
+        Wmunu_future[m * Ncells + c] = Wf[m];
+    pi_b_future[c] = pi_b_out;
 }

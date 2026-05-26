@@ -83,6 +83,12 @@ struct MUSICGridParams {
     // the CPU (strings / AMPT / TATB).
     int   has_hydro_source;        // 1 if the CPU pre-filled qi_source_buf
     int   has_rhob_source;         // 1 if qi_source_buf[4] is populated too
+
+    // QuestRevert regulator (Tier 3c Phase 5).  Active only when the host
+    // sets do_quest_revert == 1, matching the CPU rule
+    // `Initial_profile != 0 && Initial_profile != 1`.
+    int   do_quest_revert;
+    float quest_revert_strength;   // DATA.quest_revert_strength
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
