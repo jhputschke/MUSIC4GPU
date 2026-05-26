@@ -85,6 +85,14 @@ class Advance {
     bool       try_gpu_advance(double tau, Fields &arenaFieldsPrev,
                                Fields &arenaFieldsCurr,
                                Fields &arenaFieldsNext, int rk_flag);
+
+    // CPU pre-pass: evaluate the hydro source term j^alpha per cell and
+    // populate gpu_grid_.qi_source_buf in the layout the GPU kernel expects
+    // (qi_source_in[alpha * Ncells + cell] = tau_rk * j^alpha).  Mirrors the
+    // per-cell formula in Advance::FirstRKStepT.  Caller must guard
+    // turn_on_QS == 1 — rhoq/rhos sources are not GPU-supported.
+    void       prefill_hydro_source_on_cpu(double tau, int rk_flag,
+                                           Fields &arenaFieldsCurr);
 #endif
 
  public:

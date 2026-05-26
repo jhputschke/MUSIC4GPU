@@ -246,12 +246,41 @@ A proper measurement needs:
 - Per-step bench timer breakdown (`bench::Timer` is already wired in
   `evolve.cpp`, just needs to be enabled in a release build)
 
-### 9.3 Hydro source terms not wired for GPU on Fields path
+### 9.3 Hydro source terms — wired (2026-05-26 follow-up)
 
-`flag_add_hydro_source == true` currently triggers CPU fallback.  The
-SCGrid path had a CPU pre-pass that populated `gpu_grid_.qi_source_buf`
-before dispatch; that pre-pass needs to be re-implemented for the
-Fields layout if XSCAPE wants string/AMPT/TATB source terms on GPU.
+✅ Now supported via `prefill_hydro_source_on_cpu()` in `advance.cpp`.
+That CPU pre-pass walks the grid in parallel, evaluates
+`hydro_source_terms_ptr->get_hydro_energy_source(...)` (and
+`get_hydro_rhob_source` when `turn_on_rhob == 1`) at each cell's
+`(tau_rk, x, y, eta_s, u_mu)`, and writes `tau_rk * j^alpha` into
+`gpu_grid_.qi_source_buf[alpha * Ncells + cell]`.  `MUSICGridParams`
+gets `has_hydro_source = 1` / `has_rhob_source` set accordingly and the
+existing `gpu_finalize_ideal` kernel picks the buffer up.
+
+**Guard:** `DATA.turn_on_QS == 1` (rhoq/rhos source channels) still
+forces CPU fallback — `GPUSnapshot` doesn't carry rhoq/rhos, so the
+multi-charge source channels would be silently dropped.  See §4.1.
+
+**Verification limitation:** End-to-end CPU↔GPU agreement on this code
+path could not be confirmed in-session because the available test
+input (`tests/test_source_terms/strings_event_0.dat`, after the
+six-column format patch required to load it) crashes both the CPU and
+the GPU build intermittently at step 1 (`SIGTRAP` / `SIGABRT`).  The
+crash is pre-existing in the CPU build and unrelated to the GPU port.
+Code correctness was confirmed by structural comparison with the
+per-cell formula in `Advance::FirstRKStepT`.  A clean source-terms
+verification needs a working input file — likely an updated
+`strings_event_0.dat`, an AMPT-style input, or a hand-crafted
+`HydroSourceBase` subclass with a smooth profile.
+
+**Performance note:** The pre-pass is sequential per-cell on the CPU
+(parallelised with OpenMP).  For string/AMPT sources the dominant cost
+is `prepare_list_for_current_tau_frame` plus the inner loop over active
+strings inside `get_hydro_energy_source`; in practice this is a small
+fraction of an RK step so the CPU pre-pass shouldn't bottleneck the
+GPU pipeline.  If profiling later shows otherwise, the source loop
+itself could be ported (porting the strings model would be most of the
+work).
 
 ### 9.4 Residency / multi-step GPU state
 

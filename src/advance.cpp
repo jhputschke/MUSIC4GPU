@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -176,9 +177,59 @@ bool Advance::gpu_features_supported() const {
     if (DATA.viscosity_flag != 1)         return false;
     if (DATA.turn_on_diff)                return false;
     if (DATA.muB_dependent_shear_to_s != 0) return false;
-    if (flag_add_hydro_source)            return false;  // CPU pre-pass not wired
     if (DATA.whichEOS > 9)                return false;  // finite-muB EOS
+    // Hydro source terms: GPU snapshot only carries rhob, so QS (rhoq/rhos)
+    // source contributions can't be applied — fall back to CPU in that case.
+    // Pure energy + baryon sources are supported via prefill_hydro_source_on_cpu.
+    if (flag_add_hydro_source && DATA.turn_on_QS == 1) return false;
     return true;
+}
+
+// CPU-side pre-pass that fills qi_source_buf with tau_rk * j^alpha at each
+// cell.  This mirrors the per-cell logic in FirstRKStepT (alpha = 0..3 for
+// energy + momentum, alpha = 4 for baryon when turn_on_rhob).  The result is
+// consumed by gpu_finalize_ideal when params.has_hydro_source == 1.
+void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
+                                          Fields &arenaFieldsCurr) {
+    const int Nx    = arenaFieldsCurr.nX();
+    const int Ny    = arenaFieldsCurr.nY();
+    const int Neta  = arenaFieldsCurr.nEta();
+    const int N     = Nx * Ny * Neta;
+    const double tau_rk      = tau + rk_flag * DATA.delta_tau;
+    const double tauRkFactor = (DATA.CoorType == 1) ? 1.0 : tau_rk;
+
+    // qi_source_buf layout: [alpha * Ncells + cell]; written for alpha 0..4.
+    // Zero the buffer first so unused alpha slots stay clean.
+    float* qb = gpu_grid_.qi_source_buf;
+    std::memset(qb, 0, static_cast<size_t>(5) * N * sizeof(float));
+
+    const bool rhob_src = (DATA.turn_on_rhob == 1);
+
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = arenaFieldsCurr.getFieldIdx(ix, iy, ieta);
+        const double x_local     = -DATA.x_size  /2. + ix   * DATA.delta_x;
+        const double y_local     = -DATA.y_size  /2. + iy   * DATA.delta_y;
+        const double eta_s_local = -DATA.eta_size/2. + ieta * DATA.delta_eta;
+
+        FlowVec u_local;
+        for (int ii = 0; ii < 4; ii++)
+            u_local[ii] = arenaFieldsCurr.u_[ii][c];
+
+        EnergyFlowVec j_mu = {0};
+        hydro_source_terms_ptr->get_hydro_energy_source(
+                tau_rk, x_local, y_local, eta_s_local, u_local, j_mu);
+        for (int ii = 0; ii < 4; ii++) {
+            qb[ii * N + c] = static_cast<float>(tauRkFactor * j_mu[ii]);
+        }
+        if (rhob_src) {
+            const double j_rhob = hydro_source_terms_ptr->get_hydro_rhob_source(
+                    tau_rk, x_local, y_local, eta_s_local, u_local);
+            qb[4 * N + c] = static_cast<float>(tauRkFactor * j_rhob);
+        }
+    }
 }
 
 bool Advance::gpu_charges_ok(const Fields &arena) const {
@@ -254,11 +305,21 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
 
     MUSICGridParams p;
     make_gpu_params(tau, rk_flag, p);
-    // Mark hydro source as inactive — the CPU pre-pass that populates
-    // qi_source_buf is not wired for the Fields path, and we already
-    // bail out above when flag_add_hydro_source is true.
-    p.has_hydro_source = 0;
-    p.has_rhob_source  = 0;
+
+    // Hydro source pre-pass (energy + momentum, plus rhob if turn_on_rhob).
+    // turn_on_QS == 1 is rejected upstream in gpu_features_supported(), so we
+    // only need to evaluate energy + baryon channels here.
+    if (flag_add_hydro_source) {
+        // prepare_list_for_current_tau_frame is already called once per
+        // timestep by Evolve::AdvanceRK before AdvanceIt, matching the CPU
+        // FirstRKStepT contract (no per-substep re-prep).
+        prefill_hydro_source_on_cpu(tau, rk_flag, arenaFieldsCurr);
+        p.has_hydro_source = 1;
+        p.has_rhob_source  = (DATA.turn_on_rhob == 1) ? 1 : 0;
+    } else {
+        p.has_hydro_source = 0;
+        p.has_rhob_source  = 0;
+    }
 
     auto& mp = GPUPipelines::instance();
     mp.begin_batch();
