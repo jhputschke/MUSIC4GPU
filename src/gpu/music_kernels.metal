@@ -1102,6 +1102,125 @@ kernel void gpu_make_uwrhs(
     }
 }
 
+// ── gpu_make_uprhs ───────────────────────────────────────────────────────────
+//
+// Bulk-pressure stencil — GPU port of the Neighbourloop portion of
+// Diss::Make_uPRHS().  For each cell, writes the KT flux divergence of
+// (u^a * pi_b) summed over the three spatial directions, pre-multiplied by
+// delta_tau (matching the convention of gpu_make_uwrhs).  The per-cell
+// algebraic tail (-u^0/τ + θ)*pi_b * Δτ is added inside
+// gpu_first_rk_step_w_full alongside the source term.
+//
+// Buffer bindings (must match MetalPipelines::dispatch_uprhs):
+//   0  pi_b_curr   [Ncells]
+//   1  u_curr      [4*Ncells]
+//   2  uprhs_out   [Ncells]   output
+//   3  params      (constant struct)
+
+kernel void gpu_make_uprhs(
+    device const float*       pi_b_curr  [[buffer(0)]],
+    device const float*       u_curr     [[buffer(1)]],
+    device       float*       uprhs_out  [[buffer(2)]],
+    constant MUSICGridParams& params     [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    int ix   = (int)gid.x;
+    int iy   = (int)gid.y;
+    int ieta = (int)gid.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const float delta[4] = {0.f,
+                            params.delta_x,
+                            params.delta_y,
+                            params.delta_eta * params.tau};
+    const float theta_l   = params.minmod_theta;
+    const float delta_tau = params.delta_tau;
+
+    const int DX[3]   = {1, 0, 0};
+    const int DY[3]   = {0, 1, 0};
+    const int DETA[3] = {0, 0, 1};
+
+    float u_c0 = u_curr[0 * Ncells + c];
+    float u_cd[3];
+    for (int d = 0; d < 3; d++) u_cd[d] = u_curr[(d + 1) * Ncells + c];
+
+    float flux = 0.f;
+
+    for (int dir = 0; dir < 3; dir++) {
+        int direction = dir + 1;
+
+        int ip1 = clamped_cell(ix +   DX[dir], iy +   DY[dir],
+                               ieta +   DETA[dir], Nx, Ny, Neta);
+        int ip2 = clamped_cell(ix + 2*DX[dir], iy + 2*DY[dir],
+                               ieta + 2*DETA[dir], Nx, Ny, Neta);
+        int im1 = clamped_cell(ix -   DX[dir], iy -   DY[dir],
+                               ieta -   DETA[dir], Nx, Ny, Neta);
+        int im2 = clamped_cell(ix - 2*DX[dir], iy - 2*DY[dir],
+                               ieta - 2*DETA[dir], Nx, Ny, Neta);
+
+        // pi_b values
+        float pi_c   = pi_b_curr[c];
+        float pi_p1  = pi_b_curr[ip1];
+        float pi_p2  = pi_b_curr[ip2];
+        float pi_m1  = pi_b_curr[im1];
+        float pi_m2  = pi_b_curr[im2];
+
+        // u^direction and u^0 on the same neighbors
+        float ud_c   = u_cd[dir];
+        float u0_c   = u_c0;
+        float ud_p1  = u_curr[direction * Ncells + ip1];
+        float u0_p1  = u_curr[0         * Ncells + ip1];
+        float ud_p2  = u_curr[direction * Ncells + ip2];
+        float u0_p2  = u_curr[0         * Ncells + ip2];
+        float ud_m1  = u_curr[direction * Ncells + im1];
+        float u0_m1  = u_curr[0         * Ncells + im1];
+        float ud_m2  = u_curr[direction * Ncells + im2];
+        float u0_m2  = u_curr[0         * Ncells + im2];
+
+        // f = pi_b * u^direction,  g = pi_b * u^0
+        float f_c   = pi_c  * ud_c;    float g_c   = pi_c  * u0_c;
+        float f_p1  = pi_p1 * ud_p1;   float g_p1  = pi_p1 * u0_p1;
+        float f_p2  = pi_p2 * ud_p2;   float g_p2  = pi_p2 * u0_p2;
+        float f_m1  = pi_m1 * ud_m1;   float g_m1  = pi_m1 * u0_m1;
+        float f_m2  = pi_m2 * ud_m2;   float g_m2  = pi_m2 * u0_m2;
+
+        // Half-cell u·Pi (minmod-limited)
+        float uPiphR = f_p1 - 0.5f * gpu_minmod_dx(f_p2, f_p1, f_c , theta_l);
+        float temp   = 0.5f * gpu_minmod_dx(f_p1, f_c , f_m1, theta_l);
+        float uPiphL = f_c  + temp;
+        float uPimhR = f_c  - temp;
+        float uPimhL = f_m1 + 0.5f * gpu_minmod_dx(f_c , f_m1, f_m2, theta_l);
+
+        // Half-cell Pi (minmod-limited)
+        float PiphR = g_p1 - 0.5f * gpu_minmod_dx(g_p2, g_p1, g_c , theta_l);
+        float temp2 = 0.5f * gpu_minmod_dx(g_p1, g_c , g_m1, theta_l);
+        float PiphL = g_c  + temp2;
+        float PimhR = g_c  - temp2;
+        float PimhL = g_m1 + 0.5f * gpu_minmod_dx(g_c , g_m1, g_m2, theta_l);
+
+        // Wave speeds
+        float a   = fabs(ud_c ) / u0_c;
+        float ap1 = fabs(ud_p1) / u0_p1;
+        float am1 = fabs(ud_m1) / u0_m1;
+
+        float ax;
+        ax = max(a, ap1);
+        float HPiph = ((uPiphR + uPiphL) - ax * (PiphR - PiphL)) * 0.5f;
+        ax = max(a, am1);
+        float HPimh = ((uPimhR + uPimhL) - ax * (PimhR - PimhL)) * 0.5f;
+
+        flux += -((HPiph - HPimh) / delta[direction]);
+    }
+
+    uprhs_out[c] = flux * delta_tau;
+}
+
 // ── gpu_make_du ──────────────────────────────────────────────────────────────
 //
 // Per-cell port of U_derivative::MakedU + calculate_expansion_rate +
@@ -1430,6 +1549,167 @@ inline float gpu_eta_over_s_profile_mult(float T_in_fm, float shear_to_s_baselin
     return shear_to_s_baseline * f_T;
 }
 
+// ── ζ/s profile functions ────────────────────────────────────────────────────
+//
+// MSL ports of TransportCoeffs::get_zeta_over_s and its temperature
+// branches.  Supported modes: 0 (off), 1 (default/Gabriel), 2 (Duke,
+// Cauchy), 3 (Sims, skewed Cauchy), 8 (AsymGaussian, fixed),
+// 9 (AsymGaussian, fixed), 10 (AsymGaussian, DATA-controlled).
+// Mode 7 (bigbroadP) and any unsupported value fall back to CPU.
+
+inline float gpu_zeta_over_s_default(float T_in_fm) {
+    // T-dependent bulk viscosity from Gabriel (arXiv:1502.01675).
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    const float Ttr = 0.18f;
+    float dummy = T_in_GeV / Ttr;
+    float bulk;
+    if (T_in_GeV < 0.995f * Ttr) {
+        const float lambda3 = 0.9f;
+        const float lambda4 = 0.22f;
+        const float sigma3  = 0.0025f;
+        const float sigma4  = 0.022f;
+        bulk = lambda3 * exp((dummy - 1.f) / sigma3)
+             + lambda4 * exp((dummy - 1.f) / sigma4) + 0.03f;
+    } else if (T_in_GeV > 1.05f * Ttr) {
+        const float lambda1 = 0.9f;
+        const float lambda2 = 0.25f;
+        const float sigma1  = 0.025f;
+        const float sigma2  = 0.13f;
+        bulk = lambda1 * exp(-(dummy - 1.f) / sigma1)
+             + lambda2 * exp(-(dummy - 1.f) / sigma2) + 0.001f;
+    } else {
+        // 0.995 Ttr <= T <= 1.05 Ttr: polynomial branch
+        const float A1 = -13.77f;
+        const float A2 =  27.55f;
+        const float A3 =  13.45f;
+        bulk = A1 * dummy * dummy + A2 * dummy - A3;
+    }
+    return bulk;
+}
+
+inline float gpu_zeta_over_s_duke(float T_in_fm,
+                                  float norm, float width_GeV, float peak_GeV) {
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    float diff_ratio = (T_in_GeV - peak_GeV) / width_GeV;
+    return norm / (1.f + diff_ratio * diff_ratio);
+}
+
+inline float gpu_zeta_over_s_sims(float T_in_fm,
+                                  float max_norm, float width_GeV,
+                                  float T_peak_GeV, float lambda) {
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    float diff = T_in_GeV - T_peak_GeV;
+    float s    = (diff > 0.f) ? 1.f : ((diff < 0.f) ? -1.f : 0.f);
+    float diff_ratio = diff / (width_GeV * (lambda * s + 1.f));
+    return max_norm / (1.f + diff_ratio * diff_ratio);
+}
+
+inline float gpu_zeta_over_s_asym_gaussian(
+        float T_in_fm,
+        float B_norm, float B_width_low_GeV, float B_width_high_GeV,
+        float Tpeak_GeV) {
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    float Tdiff    = T_in_GeV - Tpeak_GeV;
+    Tdiff = (Tdiff > 0.f) ? (Tdiff / B_width_high_GeV)
+                          : (Tdiff / B_width_low_GeV);
+    return B_norm * exp(-Tdiff * Tdiff);
+}
+
+inline float gpu_zeta_over_s(float T_in_fm, constant MUSICGridParams& params) {
+    float zoverS = 0.f;
+    switch (params.T_dep_bulk_mode) {
+        case 0:
+            zoverS = 0.f;
+            break;
+        case 1:
+            zoverS = gpu_zeta_over_s_default(T_in_fm);
+            break;
+        case 2:
+            zoverS = gpu_zeta_over_s_duke(T_in_fm,
+                                          params.bulk_duke_norm,
+                                          params.bulk_duke_width_GeV,
+                                          params.bulk_duke_peak_GeV);
+            break;
+        case 3:
+            zoverS = gpu_zeta_over_s_sims(T_in_fm,
+                                          params.bulk_sims_max,
+                                          params.bulk_sims_width_GeV,
+                                          params.bulk_sims_T_peak_GeV,
+                                          params.bulk_sims_lambda);
+            break;
+        case 8:
+            // IPGlasma+MUSIC+UrQMD fixed params
+            zoverS = gpu_zeta_over_s_asym_gaussian(
+                        T_in_fm, 0.13f, 0.01f, 0.12f, 0.160f);
+            break;
+        case 9:
+            // IPGlasma+KoMPoST+MUSIC+UrQMD fixed params
+            zoverS = gpu_zeta_over_s_asym_gaussian(
+                        T_in_fm, 0.175f, 0.01f, 0.12f, 0.160f);
+            break;
+        case 10:
+            zoverS = gpu_zeta_over_s_asym_gaussian(
+                        T_in_fm,
+                        params.bulk_asym10_max,
+                        params.bulk_asym10_width_low,
+                        params.bulk_asym10_width_high,
+                        params.bulk_asym10_Tpeak);
+            break;
+        default:
+            zoverS = 0.f;
+            break;
+    }
+    return max(0.f, zoverS);
+}
+
+// ── Make_uPiSource (port of Diss::Make_uPiSource) ────────────────────────────
+//
+// Returns the relaxation source SΠ for the bulk pressure pi_b.  Mirrors
+// the CPU formula with include_second_order_terms == 0 (so BB_term and
+// Coupling_to_Shear are zero) and zero net baryon (T(e), P(e), cs2(e)
+// taken from the rhob=0 tables).
+inline float gpu_uPi_source(float pi_b, float theta,
+                            float eps_src,
+                            device const float* P_tab,
+                            device const float* dPde_tab,
+                            device const float* T_tab,
+                            constant GPUEosParams& ep,
+                            constant MUSICGridParams& params,
+                            float delta_tau)
+{
+    float P_local  = gpu_P (eps_src, P_tab, ep);
+    float T_local  = gpu_T_e(eps_src, T_tab, ep);
+    float cs2      = clamp(gpu_dPde(eps_src, dPde_tab, ep), 0.01f, 0.333333f);
+
+    float zeta_s   = gpu_zeta_over_s(T_local, params);
+    float epsP     = max(eps_src + P_local, 1.e-20f);
+    float T_safe   = max(T_local, 1.e-20f);
+    float bulk_zeta = zeta_s * epsP / T_safe;   // η_b ≡ ζ in CPU code
+
+    float csfactor = max(1.f/3.f - cs2, 1.e-20f);
+    float tau_Pi;
+    if (params.bulk_relaxation_type == 1) {
+        tau_Pi = bulk_zeta
+               / (params.bulk_relax_time_factor * csfactor)
+               / epsP;
+    } else {
+        tau_Pi = params.bulk_relax_time_factor
+               / (csfactor * csfactor)
+               / epsP * bulk_zeta;
+    }
+    tau_Pi = min(10.f, max(3.f * delta_tau, tau_Pi));
+
+    // delta_PiPi = 2/3 — unconditional in CPU Make_uPiSource (BB_term and
+    // Coupling_to_Shear are gated on include_second_order_terms == 1).
+    const float delta_PiPi = 2.f / 3.f;
+    float transport_coeff1 = delta_PiPi * tau_Pi;
+
+    float NS_term  = -bulk_zeta * theta;
+    float relax    = -pi_b - transport_coeff1 * theta * pi_b;
+
+    return (NS_term + relax) / tau_Pi;
+}
+
 // Dispatch on T_dependent_shear_to_s.  Mirrors get_eta_over_s() in
 // transport_coeffs.cpp; the muB-dependence branch (mode 10) is not handled
 // here (it falls back to CPU at the host gate).
@@ -1552,8 +1832,10 @@ kernel void gpu_first_rk_step_w_full(
     device const float*       eos_P        [[buffer(15)]],
     device const float*       eos_s        [[buffer(16)]],
     device const float*       eos_T        [[buffer(17)]],
-    constant MUSICGridParams& params       [[buffer(18)]],
-    constant GPUEosParams&    eos_p        [[buffer(19)]],
+    device const float*       eos_dPde     [[buffer(18)]],
+    device const float*       uprhs_in     [[buffer(19)]],
+    constant MUSICGridParams& params       [[buffer(20)]],
+    constant GPUEosParams&    eos_p        [[buffer(21)]],
     uint3 gid [[thread_position_in_grid]])
 {
     int ix   = (int)gid.x;
@@ -1677,11 +1959,30 @@ kernel void gpu_first_rk_step_w_full(
     for (int m = 0; m < 14; m++)
         Wmunu_future[m * Ncells + c] = Wf[m];
 
-    // Bulk pressure: turn_on_bulk == 0 in this v1 → pi_b_future = 0.
-    pi_b_future[c] = 0.f;
+    // ── Bulk pressure update (turn_on_bulk == 1 only) ─────────────────────
+    if (params.turn_on_bulk == 1) {
+        float pi_c = pi_b_curr[c];
+        float pi_p = pi_b_prev[c];
 
-    // Silence "unused" warnings for the optional buffers (pi_b_curr/_prev are
-    // kept in the bindings so dispatch_first_rk_step_w_full's wiring matches
-    // a future turn_on_bulk == 1 port without re-shuffling).
-    (void)pi_b_curr; (void)pi_b_prev;
+        // Make_uPRHS pre-pass: stencil flux (already pre-multiplied by Δτ).
+        // Add the per-cell algebraic tail.
+        float p_rhs = uprhs_in[c]
+                    + (-(u_c[0] * pi_c) / tau_now + theta * pi_c) * dt;
+
+        // Source term (relaxation toward Navier-Stokes).
+        float SPi = gpu_uPi_source(pi_c, theta, eps_src,
+                                   eos_P, eos_dPde, eos_T, eos_p, params, dt);
+
+        // RK mixing — mirrors the FirstRKStepW assembly.
+        float tempf =
+              (1.f - (float)rkf) * (pi_c * u_c[0])
+            +        (float)rkf  * (pi_p * u_p[0]);
+        tempf += SPi * dt;
+        tempf += p_rhs;
+        tempf += (float)rkf * (pi_c * u_c[0]);
+        tempf *= rk_norm;
+        pi_b_future[c] = tempf / u_f[0];
+    } else {
+        pi_b_future[c] = 0.f;
+    }
 }

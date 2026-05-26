@@ -54,6 +54,27 @@ struct MUSICGridParams {
     float shear_sims_low_slope;    // DATA.shear_3_low_T_slope_in_GeV
     float shear_sims_high_slope;   // DATA.shear_3_high_T_slope_in_GeV
     float shear_sims_at_kink;      // DATA.shear_3_at_kink
+
+    // Bulk-viscosity inputs (Tier 3c Phase 3).  turn_on_bulk lives in the
+    // top section of this struct.  Only honored when T_dep_bulk_mode is a
+    // supported value (0, 1, 2, 3, 8, 9, 10).  Mode 7 falls back to CPU.
+    int   T_dep_bulk_mode;         // DATA.T_dependent_bulk_to_s
+    int   bulk_relaxation_type;    // DATA.bulk_relaxation_type
+    float bulk_relax_time_factor;  // DATA.bulk_relax_time_factor
+    // Duke (mode 2) — Cauchy
+    float bulk_duke_norm;          // DATA.bulk_2_normalisation
+    float bulk_duke_width_GeV;     // DATA.bulk_2_width_in_GeV
+    float bulk_duke_peak_GeV;      // DATA.bulk_2_peak_in_GeV
+    // Sims (mode 3) — skewed Cauchy
+    float bulk_sims_max;           // DATA.bulk_3_max
+    float bulk_sims_width_GeV;     // DATA.bulk_3_width_in_GeV
+    float bulk_sims_T_peak_GeV;    // DATA.bulk_3_T_peak_in_GeV
+    float bulk_sims_lambda;        // DATA.bulk_3_lambda_asymm
+    // Custom AsymGaussian (mode 10) — DATA-controlled
+    float bulk_asym10_max;         // DATA.bulk_10_max
+    float bulk_asym10_width_low;   // DATA.bulk_10_width_low   (GeV)
+    float bulk_asym10_width_high;  // DATA.bulk_10_width_high  (GeV)
+    float bulk_asym10_Tpeak;       // DATA.bulk_10_Tpeak       (GeV)
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.

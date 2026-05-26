@@ -89,6 +89,11 @@ public:
     // shear-stress indices idx_1d = {4, 5, 6, 7, 8}.
     float* uwrhs_out = nullptr;
 
+    // Output buffer: uprhs_out[Ncells] produced by gpu_make_uprhs — the
+    // KT flux divergence of (u^a * pi_b), pre-multiplied by delta_tau.
+    // Consumed by gpu_first_rk_step_w_full when turn_on_bulk == 1.
+    float* uprhs_out = nullptr;
+
     // Output buffers produced by gpu_make_du (per-cell viscous geometry):
     //   theta_buf [Ncells]      — expansion rate θ
     //   a_buf     [4 * Ncells]  — a^μ = u^ν ∂_ν u^μ

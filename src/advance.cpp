@@ -122,6 +122,21 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     p.shear_sims_low_slope    = static_cast<float>(DATA.shear_3_low_T_slope_in_GeV);
     p.shear_sims_high_slope   = static_cast<float>(DATA.shear_3_high_T_slope_in_GeV);
     p.shear_sims_at_kink      = static_cast<float>(DATA.shear_3_at_kink);
+    // Bulk-viscosity inputs (Phase 3) — turn_on_bulk already set above.
+    p.T_dep_bulk_mode         = DATA.T_dependent_bulk_to_s;
+    p.bulk_relaxation_type    = DATA.bulk_relaxation_type;
+    p.bulk_relax_time_factor  = static_cast<float>(DATA.bulk_relax_time_factor);
+    p.bulk_duke_norm          = static_cast<float>(DATA.bulk_2_normalisation);
+    p.bulk_duke_width_GeV     = static_cast<float>(DATA.bulk_2_width_in_GeV);
+    p.bulk_duke_peak_GeV      = static_cast<float>(DATA.bulk_2_peak_in_GeV);
+    p.bulk_sims_max           = static_cast<float>(DATA.bulk_3_max);
+    p.bulk_sims_width_GeV     = static_cast<float>(DATA.bulk_3_width_in_GeV);
+    p.bulk_sims_T_peak_GeV    = static_cast<float>(DATA.bulk_3_T_peak_in_GeV);
+    p.bulk_sims_lambda        = static_cast<float>(DATA.bulk_3_lambda_asymm);
+    p.bulk_asym10_max         = static_cast<float>(DATA.bulk_10_max);
+    p.bulk_asym10_width_low   = static_cast<float>(DATA.bulk_10_width_low);
+    p.bulk_asym10_width_high  = static_cast<float>(DATA.bulk_10_width_high);
+    p.bulk_asym10_Tpeak       = static_cast<float>(DATA.bulk_10_Tpeak);
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -205,6 +220,9 @@ void Advance::AdvanceIt(const double tau,
         if (DATA.viscosity_flag == 1 && DATA.turn_on_shear == 1) {
             mp.dispatch_uwrhs(gpu_grid_, gp);
         }
+        if (DATA.viscosity_flag == 1 && DATA.turn_on_bulk == 1) {
+            mp.dispatch_uprhs(gpu_grid_, gp);
+        }
         // gpu_make_du: v1 supports vorticity=off, baryon-diffusion=off only.
         gpu_du_active = (DATA.viscosity_flag == 1)
                         && (DATA.include_vorticity_terms == 0)
@@ -225,14 +243,23 @@ void Advance::AdvanceIt(const double tau,
             || (DATA.T_dependent_shear_to_s == 2)
             || (DATA.T_dependent_shear_to_s == 3)
             || (DATA.T_dependent_shear_to_s == 11);
+        const bool T_dep_bulk_supported =
+               (DATA.turn_on_bulk == 0)
+            || (DATA.T_dependent_bulk_to_s == 0)
+            || (DATA.T_dependent_bulk_to_s == 1)
+            || (DATA.T_dependent_bulk_to_s == 2)
+            || (DATA.T_dependent_bulk_to_s == 3)
+            || (DATA.T_dependent_bulk_to_s == 8)
+            || (DATA.T_dependent_bulk_to_s == 9)
+            || (DATA.T_dependent_bulk_to_s == 10);
         gpu_w_full_active =
                gpu_du_active                                  // already ensures vort=0, diff=0
             && gpu_finalize_active                            // ensures hydro_source path is off
             && (DATA.viscosity_flag == 1)
             && (DATA.turn_on_shear == 1)
-            && (DATA.turn_on_bulk == 0)
             && (DATA.include_second_order_terms == 0)
             && T_dep_mode_supported
+            && T_dep_bulk_supported                           // turn_on_bulk == 1 now allowed
             && (DATA.muB_dependent_shear_to_s == 0)
             // QuestRevert is only invoked for Initial_profile != 0 && != 1.
             && (DATA.Initial_profile == 0 || DATA.Initial_profile == 1);

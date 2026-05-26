@@ -56,6 +56,13 @@ public:
     // 4..8 per cell).  Non-blocking; sync with wait().
     void dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params);
 
+    // Dispatch gpu_make_uprhs over the full grid.
+    // Reads gpu.snap_curr.pi_b and gpu.snap_curr.u; writes
+    // uprhs_out[Ncells] into gpu.uprhs_out — the scalar KT flux divergence
+    // of (u^a * pi_b).  Only call when turn_on_bulk == 1.
+    // Non-blocking; sync with wait().
+    void dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params);
+
     // Dispatch gpu_finalize_ideal over the full grid.
     // Reads qi_out + dwmn (already produced by the two kernels above), the
     // current and previous snapshots, and the EOS tables; writes the
@@ -83,5 +90,6 @@ private:
     void*  pso_uwrhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  pso_make_du_   = nullptr;  // id<MTLComputePipelineState>
     void*  pso_w_full_    = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_uprhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
 };
