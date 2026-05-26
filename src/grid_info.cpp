@@ -2563,7 +2563,11 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
     double eccn_den [norder] = {0.0};
     double meanpT_est_num[4] = {0.0};
     double meanpT_est_den[1] = {0.0};
-    std::vector<double> thermalVec;
+    // NOTE: thermalVec must be thread-private — it's filled by
+    // eos.getThermalVariables() inside the parallel reduction loop below.
+    // Originally a single shared std::vector outside the loop, which races
+    // on resize and causes the SIGTRAP / Method-cache-corruption seen at
+    // OMP_NUM_THREADS >= 2.  See PORT_GPU.md §9.6.
     for (int ieta = 0; ieta < arena.nEta(); ieta++) {
         double eta = 0.0;
         if (!DATA.boost_invariant) {
@@ -2602,6 +2606,10 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
                             eccn_den[:norder])
             for (int iy = 0; iy < arena.nY(); iy++)
             for (int ix = 0; ix < arena.nX(); ix++) {
+                // Thread-local — must NOT be shared across the parallel
+                // reduction or eos.getThermalVariables' resize races and
+                // corrupts the heap.
+                std::vector<double> thermalVec;
                 int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
                 double x_local   = (- DATA.x_size/2. + ix*DATA.delta_x - x_o);
                 double y_local   = (- DATA.y_size/2. + iy*DATA.delta_y - y_o);
