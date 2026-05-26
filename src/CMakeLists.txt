@@ -93,6 +93,10 @@ if (GSL_FOUND)
     target_link_libraries (${libname} ${GSL_LIBRARIES})
 endif()
 
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(${libname} OpenMP::OpenMP_CXX)
+endif()
+
 if (USE_METAL)
     set(CompileFlags "${CompileFlags} -DUSE_METAL")
     # Link Metal and Foundation frameworks

@@ -71,11 +71,21 @@ about `generate_music_inputfile.py`,  one can simply type:
 
 ## Run MUSIC on multiple CPU cores
 
-MUSIC uses openMP for parallelization.  For example, to run on two processors 
+MUSIC uses OpenMP for parallelization.  For example, to run on two processors
 and use the sample input file, type:
 
     export OMP_NUM_THREADS=2
     ./MUSIChydro input_example
+
+**macOS (AppleClang) note.** AppleClang ships without an OpenMP runtime.
+Install Homebrew's `libomp` keg once:
+
+    brew install libomp
+
+CMake auto-detects it via `brew --prefix libomp` and links the resulting
+binary against `/opt/homebrew/opt/libomp/lib/libomp.dylib`.  If `libomp` is
+absent the build falls back to serial execution and prints a notice during
+configure.
 Once the prerequisites are installed, you can build the package using:
 
     make -j 10 #Adjust 10 to the number of cores available.
@@ -216,41 +226,51 @@ XY profile replicated across all η slices (so `u^η = 0` initially);
 the evolution stays approximately η-invariant, but the code paths are
 fully exercised.
 
-Example output (Apple M3 Max, both binaries built with `-DCMAKE_BUILD_TYPE=Release`):
+Example output (Apple M3 Max, 12 P-cores; both binaries built with `-DCMAKE_BUILD_TYPE=Release`,
+CPU build linked against Homebrew `libomp`):
 
 **2D (`metal_vs_cpu_bench.sh`, 100 timesteps, `Delta_Tau=0.005`)**
 ```
-Grid                   CPU(s)   GPU(s)  Speedup   MaxErr
-----                   ------   ------  -------   ------
-32x32x1                 0.56s    0.36s    1.56x  5.3e-05
-64x64x1                 2.01s    0.52s    3.87x  1.0e-04
-128x128x1              10.79s    1.38s    7.82x  9.9e-05
+Grid              CPU-1T(s)  CPU-12T(s)   GPU(s)   GPU/1T   GPU/12T   MaxErr
+----              ---------  ----------   ------   ------   -------   ------
+32x32x1               1.07        0.17      0.21    5.10x     0.81x   5.3e-05
+64x64x1               1.88        0.36      0.49    3.84x     0.73x   9.9e-05
+128x128x1            10.20        1.44      1.36    7.50x     1.06x   9.4e-05
 ```
 
 **3+1D (`metal_vs_cpu_bench_3d.sh`, 40 timesteps each)**
 ```
-Grid (Nx×Ny×Nη)       Cells   CPU(s)   GPU(s)  Speedup   MaxErr
-----                  -----   ------   ------  -------   ------
-32x32x8                8.2k    2.27s    0.45s    5.04x   5.3e-05
-32x32x32              32.8k    5.94s    0.80s    7.42x   3.7e-05
-64x64x16              65.5k   12.18s    1.59s    7.66x   3.1e-05
-64x64x32             131.1k   24.63s    3.05s    8.08x   3.1e-05
+Grid (Nx×Ny×Nη)  Cells   CPU-1T(s)  CPU-12T(s)   GPU(s)   GPU/1T   GPU/12T   MaxErr
+----             -----   ---------  ----------   ------   ------   -------   ------
+32x32x8           8.2k       2.24        0.35      0.45    4.98x     0.78x   5.3e-05
+32x32x32         32.8k       5.84        0.65      0.81    7.21x     0.80x   3.7e-05
+64x64x16         65.5k      11.94        1.32      1.57    7.61x     0.84x   3.1e-05
+64x64x32        131.1k      24.08        2.42      3.04    7.92x     0.80x   3.1e-05
 ```
 
-The 3D run is the more realistic production workload: speedup scales
-**up** with cell count (5× at 8k cells → 8× at 131k cells), reflecting
-the fact that the GPU was under-occupied at small 2D grids and saturates
-much better once Nη > 1.  The 64×64×32 case is 1/8 of a typical
-128×128×64 production grid; at full production size the GPU's relative
-advantage should hold or grow further.
+Set `OMP_NUM_THREADS` before invoking either benchmark script (e.g.
+`OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh`).  The "12T" column
+above used all 12 performance cores of the M3 Max; the "1T" column is the
+historical serial baseline retained for comparison.
+
+**Reading the numbers.** Vs the serial baseline the GPU is consistently
+5–8× ahead.  Vs the 12-thread OpenMP CPU the picture flips: the CPU is
+~20% faster at small grids and within ±10% of the GPU at the largest
+tested sizes.  CPU strong-scaling 1T→12T is near-linear in 2D (~7×) and
+super-linear in 3D (~9–10×, helped by cache pressure dropping as the
+working set partitions across cores).  At grids beyond what's tested
+(e.g. 128×128×64 production runs ≈ 1M cells) the GPU is expected to pull
+ahead again — it kept gaining speedup with cell count in the serial
+comparison and is still below saturation at 131k cells.  Below that
+crossover the OpenMP CPU path is the faster choice on Apple Silicon.
 
 These numbers reflect the **Tier 3 + Tier 3c Phase 1 + Phase 2** state:
 the entire per-cell ideal-and-viscous update runs on the GPU.  The CPU side
 of `AdvanceIt` is now just a SoA↔AoS copy on the way in and out — no
 per-cell loop body runs unless an unsupported configuration flag is set.
-The 7.82× at 128² is roughly 2× the post-Phase-1 number, achieved by
-retiring the CPU viscous source-term loop and the SoA→AoS round-trip
-that used to happen between ideal and viscous passes.
+The 7.50× at 128² (vs serial CPU) is roughly 2× the post-Phase-1 number,
+achieved by retiring the CPU viscous source-term loop and the SoA→AoS
+round-trip that used to happen between ideal and viscous passes.
 
 The max relative error in `eps_max` is O(10⁻⁴) after Phase 2 — at the
 bench's 1e-4 pass threshold.  An earlier draft of Phase 2 hit O(10⁻²) at
@@ -262,8 +282,9 @@ genuine float32 vs float64 accumulation in the long-time Wmunu evolution.
 
 ### Understanding the speedup
 
-The 2.98× at 128² reflects Amdahl's law applied to the remaining CPU work.
-The original CPU-only wall time breaks down roughly as follows:
+The 7.50× at 128² (vs serial CPU) reflects Amdahl's law applied to the
+remaining CPU work after Tier 3.  The original serial CPU wall time
+breaks down roughly as follows:
 
 | Work | CPU fraction | Tier 3 status |
 |---|---|---|

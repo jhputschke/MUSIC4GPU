@@ -30,7 +30,28 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
-    message("Using Clang compiler without OpenMP parallelization... ")
+    # AppleClang has no built-in OpenMP runtime; use Homebrew libomp.
+    find_program(BREW_EXECUTABLE brew)
+    if (BREW_EXECUTABLE)
+        execute_process(
+            COMMAND ${BREW_EXECUTABLE} --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE LIBOMP_BREW_RESULT)
+    endif()
+    if (LIBOMP_PREFIX AND EXISTS "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        message(STATUS "Found Homebrew libomp at ${LIBOMP_PREFIX}")
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+        set(OpenMP_CXX_LIB_NAMES "omp")
+        set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        find_package(OpenMP)
+        if (OpenMP_FOUND)
+            message(STATUS "OpenMP enabled for AppleClang via Homebrew libomp")
+        endif()
+    else ()
+        message("AppleClang: Homebrew libomp not found "
+                "(install with: brew install libomp). Building serial...")
+    endif()
 else ()
     find_package(OpenMP)
     if (OpenMP_FOUND)
