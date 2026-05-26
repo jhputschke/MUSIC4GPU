@@ -2171,16 +2171,16 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
     // compute epsilon_{p2} and epsilon_{p3} using T^{0\mu} vector
     // epsilon_{pn} = (\int (T^{0r} exp(i n \phi_u))/(\int T^{0r})
     // for every n, we compute T^{0\mu} for ideal, ideal + shear, and full
-    std::vector<double> ep_num1(6, 0.0);
-    std::vector<double> ep_num2(6, 0.0);
-    std::vector<double> ep_den (6, 0.0);
-
-    const int norder = 6;
-    std::vector<double> eccn_num1(norder, 0.0);
-    std::vector<double> eccn_num2(norder, 0.0);
-    std::vector<double> eccn_den (norder, 0.0);
-    std::vector<double> meanpT_est_num(4, 0.0);
-    std::vector<double> meanpT_est_den(1, 0.0);
+    // Plain C arrays (not std::vector) so OpenMP array-section reduction works.
+    constexpr int norder = 6;
+    double ep_num1[6] = {0.0};
+    double ep_num2[6] = {0.0};
+    double ep_den [6] = {0.0};
+    double eccn_num1[norder] = {0.0};
+    double eccn_num2[norder] = {0.0};
+    double eccn_den [norder] = {0.0};
+    double meanpT_est_num[4] = {0.0};
+    double meanpT_est_den[1] = {0.0};
     for (int ieta = 0; ieta < arena.nEta(); ieta++) {
         double eta = 0.0;
         if (!DATA.boost_invariant) {
@@ -2191,6 +2191,7 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
             double x_o   = 0.0;
             double y_o   = 0.0;
             double w_sum = 0.0;
+            #pragma omp parallel for collapse(2) reduction(+:x_o, y_o, w_sum)
             for (int iy = 0; iy < arena.nY(); iy++)
             for (int ix = 0; ix < arena.nX(); ix++) {
                 double x_local    = - DATA.x_size/2. + ix*DATA.delta_x;
@@ -2203,6 +2204,18 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
             }
             x_o /= w_sum;
             y_o /= w_sum;
+            #pragma omp parallel for collapse(2) \
+                reduction(+:ideal_num1, ideal_num2, ideal_den, \
+                            shear_num1, shear_num2, shear_den, \
+                            full_num1, full_num2, full_den, \
+                            u_perp_num, u_perp_den, \
+                            T_avg_num, T_avg_den, \
+                            R_Pi_num, R_Pi_den, \
+                            R_shearpi_num, R_shearpi_den, \
+                            meanpT_est_num[:4], meanpT_est_den[:1], \
+                            ep_num1[:6], ep_num2[:6], ep_den[:6], \
+                            eccn_num1[:norder], eccn_num2[:norder], \
+                            eccn_den[:norder])
             for (int iy = 0; iy < arena.nY(); iy++)
             for (int ix = 0; ix < arena.nX(); ix++) {
                 double x_local   = (- DATA.x_size/2. + ix*DATA.delta_x - x_o);
