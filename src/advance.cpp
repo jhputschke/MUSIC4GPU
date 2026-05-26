@@ -156,7 +156,21 @@ void Advance::make_gpu_params(double tau, int rk_flag,
 }
 
 void Advance::swap_curr_future_gpu() {
-    if (gpu_owns_state_) gpu_grid_.swap_curr_future();
+    // Mirror the host rk1 fpCurr↔fpNext swap on the GPU side.  After rk1,
+    // try_gpu_advance has written results into snap_future; the host swap
+    // makes fpCurr point at what was fpNext, so on GPU snap_curr must now
+    // point at what was snap_future.
+    if (gpu_state_authoritative_) gpu_grid_.swap_curr_future();
+}
+
+void Advance::rotate_snapshots_gpu() {
+    // 3-way mirror of the host rk0 rotation
+    // (fpPrev ← fpCurr ← fpNext ← old fpPrev).  After rk0, try_gpu_advance
+    // has written results into snap_future; the host rotation makes fpCurr
+    // point at what was fpNext, so on GPU snap_curr must now point at what
+    // was snap_future, snap_prev at what was snap_curr, and snap_future
+    // becomes scratch (was prev).  Lets the rk1 substep skip its H2D upload.
+    if (gpu_state_authoritative_) gpu_grid_.rotate_snapshots();
 }
 
 void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
@@ -232,16 +246,24 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
     }
 }
 
-bool Advance::gpu_charges_ok(const Fields &arena) const {
-    // GPU snapshot only carries rhob; if rhoq_/rhos_ are populated, the kernel
-    // would silently miss the multi-charge contribution to T^{tau alpha}.
+bool Advance::gpu_charges_ok(const Fields &arena) {
+    // First-call scan only — the result is cached for the rest of the run.
+    // rhoq/rhos can only become non-zero through a multi-charge source term
+    // (DATA.turn_on_QS == 1), which gpu_features_supported() rejects upstream.
+    // Skipping per-substep scans is essential for throughput: at 64x64x32
+    // and 200 substeps a per-substep scan would cost ~26M serial cell
+    // comparisons, eating most of the GPU speedup.
+    if (charges_checked_) return charges_ok_cache_;
     const auto &rhoq = arena.rhoq_;
     const auto &rhos = arena.rhos_;
     const size_t N = rhoq.size();
+    bool ok = true;
     for (size_t i = 0; i < N; ++i) {
-        if (rhoq[i] != 0.0 || rhos[i] != 0.0) return false;
+        if (rhoq[i] != 0.0 || rhos[i] != 0.0) { ok = false; break; }
     }
-    return true;
+    charges_ok_cache_ = ok;
+    charges_checked_  = true;
+    return ok;
 }
 
 // ── Full-GPU AdvanceIt substep (Fields path) ─────────────────────────────────
@@ -294,13 +316,27 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
                          arenaFieldsCurr.nEta());
     if (!gpu_ready_) return false;  // init failed; init_metal_if_needed already warned
 
-    // Upload host arenas into the GPU snapshots.
-    gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_curr);
-    if (rk_flag > 0) {
-        gpu_grid_.copy_to_gpu(arenaFieldsPrev, gpu_grid_.snap_prev);
-    } else {
-        // At rk_flag == 0, prev == curr (initial state of the substep).
-        gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_prev);
+    // Upload host arenas into the GPU snapshots — unless the previous
+    // substep's result is already resident on GPU (gpu_state_authoritative_),
+    // in which case Evolve::AdvanceRK has already rotated/swapped the GPU
+    // snapshot aliases to match the host pointer roles.
+    //
+    // This residency optimisation matters in two ways:
+    //   1. Skips ~7 MB of H2D upload per substep at 64x64x32 (kernel
+    //      throughput-bound, this is most of the per-substep cost).
+    //   2. Skips the double→float→double round-trip that would otherwise
+    //      truncate every cell to single precision on every substep —
+    //      without it, eps_max accumulates ~1e-2 drift over 100 steps;
+    //      with it, drift stays at the kernel-internal float32 noise
+    //      level (~1e-4).
+    if (!gpu_state_authoritative_) {
+        gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_curr);
+        if (rk_flag > 0) {
+            gpu_grid_.copy_to_gpu(arenaFieldsPrev, gpu_grid_.snap_prev);
+        } else {
+            // At rk_flag == 0 of a cold start, prev == curr.
+            gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_prev);
+        }
     }
 
     MUSICGridParams p;
@@ -333,11 +369,27 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     mp.end_batch();
     mp.wait();
 
-    // Bring the post-step state back into arenaFieldsNext.  rhoq_/rhos_ in
-    // arenaFieldsNext stay at whatever the caller left them (gpu_charges_ok
-    // ensured they're zero, and the kernels don't write them).
-    gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future, arenaFieldsNext);
-    gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_future, arenaFieldsNext);
+    // Decide whether to keep state on GPU (skip D2H) or sync back to
+    // arenaFieldsNext now.  We can stay on GPU iff another RK substep
+    // will follow in this AdvanceRK call — that substep will inherit
+    // the state through rotate_snapshots_gpu() / swap_curr_future_gpu().
+    // On the final substep, EvolveIt needs CPU-side arena data for
+    // diagnostics, freeze-out, and the next outer step's setup, so we
+    // sync back unconditionally.
+    const bool last_substep = (rk_flag == DATA.rk_order - 1);
+    if (last_substep) {
+        gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future,
+                                         arenaFieldsNext);
+        gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_future,
+                                         arenaFieldsNext);
+        gpu_state_authoritative_ = false;
+    } else {
+        // Result lives in snap_future; the host-side rk0 pointer rotation
+        // will be mirrored on GPU via rotate_snapshots_gpu() so that the
+        // next substep sees snap_curr = (this substep's) snap_future and
+        // snap_prev = (this substep's) snap_curr — no H2D needed.
+        gpu_state_authoritative_ = true;
+    }
     return true;
 }
 #endif  // MUSIC_USE_GPU

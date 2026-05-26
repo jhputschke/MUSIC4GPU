@@ -73,9 +73,15 @@ class Advance {
     bool       gpu_features_supported() const;
 
     // Per-cell guard that scans the Fields arrays for non-zero rhoq/rhos.
-    // Returns false on the first non-zero entry.  Logged once per session
-    // when it fires.
-    bool       gpu_charges_ok(const Fields &arena) const;
+    // Returns false on the first non-zero entry.  The result is cached
+    // after the first call — once we've confirmed rhoq/rhos are zero at
+    // the start of a run they stay zero (gpu_features_supported() gates
+    // out the only path that could write them, multi-charge sources).
+    // Per-substep scanning would cost O(Ncells) extra serial work and
+    // significantly hurt throughput at production grid sizes.
+    bool       gpu_charges_ok(const Fields &arena);
+    bool       charges_checked_ = false;
+    bool       charges_ok_cache_ = false;
 
     // Run a single AdvanceIt substep entirely on the GPU.  Uploads from
     // arenaFieldsCurr/arenaFieldsPrev, dispatches the kernel pipeline,
@@ -108,6 +114,13 @@ class Advance {
     // snap_future).  Called from Evolve::AdvanceRK immediately after the
     // std::swap so the GPU and host pointer roles stay in lockstep.
     void swap_curr_future_gpu();
+
+    // Mirror the rk0 host arena 3-way rotation in GPU snapshot space
+    // (snap_prev ← snap_curr ← snap_future ← old snap_prev).  Called from
+    // Evolve::AdvanceRK immediately after the host pointer rotation when
+    // gpu_state_authoritative_ is set, so rk1 can read snap_curr+snap_prev
+    // without an H2D upload.
+    void rotate_snapshots_gpu();
 
     // True when the GPU holds the authoritative evolving state across timestep
     // boundaries (H2D upload at rk0 is skipped).

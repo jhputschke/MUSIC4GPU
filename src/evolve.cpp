@@ -506,9 +506,12 @@ void Evolve::AdvanceRK(double tau, Fields* &fpPrev, Fields* &fpCurr,
             fpPrev = fpCurr;
             fpCurr = fpNext;
             fpNext = temp2;
-            // GPU: rotate_snapshots() is called at the START of the next
-            // AdvanceIt call (when gpu_state_authoritative_ is set), so no
-            // explicit mirror is needed here for the rk0 3-cycle.
+#ifdef MUSIC_USE_GPU
+            // Mirror the host 3-way rotation in GPU snapshot space so the
+            // next substep sees snap_curr / snap_prev that match the new
+            // fpCurr / fpPrev — letting try_gpu_advance skip its H2D.
+            advance.rotate_snapshots_gpu();
+#endif
         } else {
             Fields* temp = fpCurr;
             fpCurr = fpNext;
