@@ -1,5 +1,9 @@
-cmake_minimum_required(VERSION 3.4)
-project(MUSIChydro VERSION 2.0 LANGUAGES CXX OBJCXX)
+cmake_minimum_required(VERSION 3.10)
+project(MUSIChydro VERSION 2.0 LANGUAGES CXX)
+
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 set(libname "music")
 set(exename "MUSIChydro")
