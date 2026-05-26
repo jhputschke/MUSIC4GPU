@@ -1,5 +1,10 @@
 # MUSIC4GPU — CUDA Port
 
+> **Experimental — port only, no new physics.** This is a direct GPU port of the
+> CPU algorithms in **MUSIC release 3.1**, produced with **Claude Opus 4.7**. It
+> is **not yet validated for physics production** — see the scope-and-status
+> disclaimer at the top of the main [README.md](README.md) before use.
+
 CUDA (NVIDIA) back-end for the GPU-accelerated MUSIC 3+1D viscous
 hydrodynamics solver, ported from the Metal 3 implementation. The CUDA layer
 preserves the same public API (`GPUGrid` + a `*Pipelines` singleton with seven
