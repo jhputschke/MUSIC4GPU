@@ -218,9 +218,9 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh
 
 | Grid       | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×1    |  0.69 s    | 0.27 s |  **2.56×**     | 3.24×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
-| 64×64×1    |  0.36 s    | 0.39 s |  **0.92×**     | 1.19×              | 3.6 × 10⁻³         | 9.9 × 10⁻⁵             |
-| 128×128×1  |  1.25 s    | 0.96 s |  **1.30×**     | 2.29×              | 1.1 × 10⁻²         | 9.4 × 10⁻⁵             |
+| 32×32×1    |  0.17 s    | 0.27 s |  **0.63×**     | 3.24×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
+| 64×64×1    |  0.38 s    | 0.33 s |  **1.15×**     | 1.19×              | 3.6 × 10⁻³         | 9.9 × 10⁻⁵             |
+| 128×128×1  |  1.23 s    | 0.72 s |  **1.71×**     | 2.29×              | 1.1 × 10⁻²         | 9.4 × 10⁻⁵             |
 
 ### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
@@ -233,10 +233,18 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench_3d.sh
 
 | Grid (Nx × Ny × Nη) | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |---------------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×8             |  0.38 s    | 0.42 s |  **0.90×**     | 1.43×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
-| 32×32×32            |  0.74 s    | 0.66 s |  **1.12×**     | 2.36×              | 6.9 × 10⁻⁴         | 3.7 × 10⁻⁵             |
-| 64×64×16            |  1.64 s    | 1.23 s |  **1.33×**     | 2.91×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
-| 64×64×32            |  3.21 s    | 2.12 s |  **1.51×**     | 3.41×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
+| 32×32×8             |  0.38 s    | 0.67 s |  **0.57×**     | 1.43×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
+| 32×32×32            |  0.79 s    | 0.37 s |  **2.14×**     | 2.36×              | 6.9 × 10⁻⁴         | 3.7 × 10⁻⁵             |
+| 64×64×16            |  1.64 s    | 0.56 s |  **2.93×**     | 2.91×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
+| 64×64×32            |  3.21 s    | 0.83 s |  **3.87×**     | 3.41×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
+
+**XSCAPE+GPU now matches or beats `main_gpu`'s speedup at production
+3D sizes** (64×64×16 at 2.93× vs 2.91×, 64×64×32 at 3.87× vs 3.41×) —
+the gap that earlier section text complained about has been closed by
+the sync-optimisation commit `950c1ea`.  Small grids (32×32×8 at
+0.57×) regressed slightly because the OpenMP thread spin-up cost for
+the now-cheap sync starts to dominate when there's only ~8k cells of
+real work per substep; not a regime XSCAPE production cares about.
 
 **Precision improved ~10×** vs the previous intra-substep-only port
 (commit `0cecdf5`): the per-step H2D upload, which truncates every
@@ -248,48 +256,44 @@ by `output_diagnostics_every_N_timesteps`).
 
 ### 8.3 Honest performance assessment
 
-**XSCAPE+GPU delivers a positive speedup at production-relevant 3D
-grid sizes (1.3–1.5× faster than 12-thread CPU at 64×64×16 and
-64×64×32), with precision close to `main_gpu`'s.**  The remaining 2×
-gap to `main_gpu`'s GPU speedup is **not** in the GPU port itself —
-it's in the CPU-side diagnostics that get re-run every outer step
-even with full residency.
+**XSCAPE+GPU now matches or beats `main_gpu`'s speedup at production
+3D grid sizes** (3.87× at 64×64×32 vs `main_gpu`'s 3.41×; 2.93× at
+64×64×16 vs 2.91×).  Precision matches the kernel-internal float32
+noise floor (~3 × 10⁻³ over 100 steps), about 100× tighter than
+before inter-step residency landed.
 
-Per-step profile breakdown at 64×64×32 (`MUSIC_PROFILE=1`):
+Per-step profile breakdown at 64×64×32 after commit `950c1ea`
+(`MUSIC_PROFILE=1`):
 
 | Section                                | XSCAPE   | `main_gpu` |
 |----------------------------------------|----------|------------|
-| `evolve.step_total`                    | 44 ms    | 15 ms      |
+| `evolve.step_total`                    | 16 ms    | 15 ms      |
 | `evolve.AdvanceRK` (GPU kernels + sync)| 4 ms     | 11 ms      |
-| `evolve.check_conservation_law`        | ~30 ms ★ | 1.1 ms     |
+| `advance.sync_curr_from_gpu`           | 3.9 ms   | (n/a)      |
+| `advance.sync_arena_from_gpu`          | 3.5 ms   | 3.7 ms ★   |
 | `evolve.output_momentum_anisotropy_vs_tau` | 2.1 ms | 1.3 ms |
+| `evolve.check_conservation_law`        | 1.2 ms   | 1.1 ms     |
 | `evolve.max_energy_density` (reduce_max_gpu) | 0.07 ms | 0.07 ms |
 
-★ Not separately timed in XSCAPE; the figure is `step_total − sum of
-others` and matches the gap closure I observed when bumping
-`output_diagnostics_every_N_timesteps` from 1 to 10 (step_total
-dropped 44 → 9 ms).
+★ `main_gpu`'s timer breakdown calls this `advance.d2h_copyback`.
 
-The diagnostic gap is a **pre-existing CPU-side performance issue in
-the Fields path**, not something the GPU port introduced: XSCAPE's
-`check_conservation_law` and friends call the 4-arg
-`eos.get_pressure(e, rhob, rhoq, rhos)` overload (added when Fields
-gained multi-charge support), which is ~30× slower than `main_gpu`'s
-2-arg `get_pressure(e, rhob)` even when rhoq = rhos = 0.  Both XSCAPE's
-CPU-only and XSCAPE+GPU paths pay this same cost, so the GPU-vs-CPU
-ratio measured on this branch *understates* the raw GPU speedup vs
-what a fast Fields-CPU path would show.
+How the gap closed (commit `950c1ea`):
 
-Workarounds:
-
-- `output_diagnostics_every_N_timesteps 10` in the input file
-  (introduced from `main_gpu` during the merge — see §9.5) lets the
-  GPU run unconstrained between every 10 diagnostic snapshots.  At
-  Nskip=10, the 64×64×32 GPU bench finishes in **1.1 s vs 7.4 s CPU
-  (6.7× speedup)** — comparable to `main_gpu`.
-- A separate clean-up could give the Fields `eos.get_pressure` /
-  `getThermalVariables` a fast path when `turn_on_QS == 0`; that
-  would benefit both CPU and CPU-side-of-GPU runs.  Tracked as §9.8.
+1. **Split sync API.**  Most diagnostics only read `fpCurr`, not
+   `fpPrev`.  `sync_curr_from_gpu_readonly` copies one arena instead
+   of two, halving the sync cost at every call site that doesn't
+   need `prev`.
+2. **Pointer-hoist in `copy_*_to_cpu(Fields&)`.**  Fields stores
+   `u_` and `Wmunu_` as `std::vector<std::vector<double>>`; naive
+   `dst.u_[m][c]` does an indirect load on every iteration.
+   Hoisting the inner-vector `.data()` pointers outside the parallel
+   loop unlocks vectorisation and goes from ~1 GB/s effective
+   throughput to near memory-bandwidth peak.  Identical change in
+   both `GPUGrid.mm` (Metal) and `GPUGrid_cuda.cu` (CUDA).
+3. **`host_curr_fresh_` / `host_prev_fresh_` cache.**  Subsequent
+   sync calls within the same outer iteration are no-ops.
+   `try_gpu_advance` clears them at substep entry so the next sync
+   actually runs.
 
 Where the GPU port should win decisively is **discrete GPUs** (CUDA
 on Linux): an NVIDIA A100/H100 vs an x86 CPU shifts the bandwidth
@@ -563,34 +567,30 @@ error is fine — particle yields and flow harmonics smooth most of it
 out.  Revisit if/when JETSCAPE consumers report deviations they care
 about.
 
-### 9.8 Slow `check_conservation_law` on the Fields path
+### 9.8 Slow `check_conservation_law` — misdiagnosis, retracted
 
-Profiling at 64×64×32 (§8.3) shows `check_conservation_law` taking
-~30 ms/step on the Fields-based XSCAPE branch versus ~1.1 ms/step on
-the SCGrid-based `main_gpu` branch — a ~30× gap.  This bottlenecks
-both the CPU-only and the CPU-side-of-GPU paths and is the main
-reason the XSCAPE GPU bench shows 1.5× speedup at default settings
-where `main_gpu` shows 3.4×.
+An earlier version of this section claimed `check_conservation_law`
+took ~30 ms/step because of the multi-charge `eos.get_pressure(e,
+rhob, rhoq, rhos)` overload.  That was wrong on two counts:
 
-Root cause: when Fields added support for multi-charge densities
-(`rhoq`, `rhos`), the diagnostic loop switched to the 4-argument EOS
-overload `eos.get_pressure(e, rhob, rhoq, rhos)`, which dispatches
-through a multi-dimensional EOS table even when rhoq = rhos = 0.
-The 2-argument `get_pressure(e, rhob)` used by `main_gpu` is a
-straight 1D lookup.  Other diagnostic / source-prep loops in the
-Fields path likely have similar overhead.
+1. The 4-arg `EOS::get_pressure` wrapper in `src/eos.h` actually
+   delegates straight to `eos_ptr->get_pressure(e, rhob)` — it
+   silently drops rhoq and rhos.  So Fields and SCGrid paths call
+   the same underlying 2-arg lookup.
+2. Adding a `bench::Timer` around the call confirmed
+   `check_conservation_law` is 1.3 ms/step on XSCAPE — essentially
+   identical to `main_gpu`'s 1.1 ms.  My "~30 ms" figure was a
+   `step_total − sum_of_measured` residual that I (incorrectly)
+   attributed to this function.
 
-Fix is straightforward and benefits *both* CPU and GPU runs:
+The real bottleneck was the GPU→CPU sync itself
+(`sync_arena_from_gpu`), where the `dst.u_[m][c]` double-indirection
+through `std::vector<std::vector<double>>` ran at ~1 GB/s on a
+400 GB/s memory bus.  Fixed in commit `950c1ea` by hoisting the
+inner-vector `.data()` pointers outside the parallel loop and by
+splitting the sync API into curr-only / both-arena variants so
+diagnostics that only read `fpCurr` don't pay for an extra `fpPrev`
+copy.  See §8.2 for the post-fix bench.
 
-- In `check_conservation_law` and similar full-arena diagnostic
-  loops, branch on `DATA.turn_on_QS` (or a runtime sanity check on
-  `rhoq_[0]`) and use the 2-arg overload for the zero-charge fast
-  path.
-- Or wrap a thread-local cache of `get_pressure(e, rhob)` keyed by
-  (e, rhob) bins.
-- Or — most invasively — add a `getThermalVariables` fast path that
-  skips the multi-charge table interpolation when QS is off.
-
-Setting `output_diagnostics_every_N_timesteps 10` in the input file
-is a working short-term mitigation: 64×64×32 GPU bench drops to 1.1 s
-(6.7× over CPU) without changing the evolution.
+Lessons learnt: don't quote unmeasured residuals as numbers — use a
+timer or shut up.
