@@ -71,6 +71,11 @@ public:
     // same RK step; non-blocking, sync with wait().
     void dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams& params);
 
+    // GPU max-reduction over snap_curr.  On Apple Silicon (coherent memory)
+    // the managed buffers are directly readable on the CPU, so this scans
+    // epsilon/rhob on the host after wait() has ensured the last kernel is done.
+    void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
+
     // Block until all pending GPU work is done.
     void wait();
 

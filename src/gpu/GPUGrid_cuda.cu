@@ -143,8 +143,12 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
     a_buf     = alloc_managed_buf( 4 * nc * sizeof(float), buf_handles_, n_handles_);
     sigma_buf = alloc_managed_buf(10 * nc * sizeof(float), buf_handles_, n_handles_);
 
+    reduce_eps_out  = alloc_managed_buf(sizeof(float), buf_handles_, n_handles_);
+    reduce_rhob_out = alloc_managed_buf(sizeof(float), buf_handles_, n_handles_);
+
     ok = ok && dwmn && qi_out && uwrhs_out && uprhs_out && qi_source_buf
-            && theta_buf && a_buf && sigma_buf;
+            && theta_buf && a_buf && sigma_buf
+            && reduce_eps_out && reduce_rhob_out;
 
     allocated_ = ok;
     return ok;
@@ -226,6 +230,8 @@ void GPUGrid::release() {
     eos_s     = nullptr;
     eos_T     = nullptr;
     eos_params = {};
+    reduce_eps_out  = nullptr;
+    reduce_rhob_out = nullptr;
 }
 
 // ── AoS → SoA (double → float) ───────────────────────────────────────────────
@@ -300,6 +306,12 @@ void GPUGrid::rotate_snapshots() {
     snap_prev   = snap_curr;
     snap_curr   = snap_future;
     snap_future = temp;
+}
+
+void GPUGrid::swap_curr_future() {
+    GPUSnapshot tmp = snap_curr;
+    snap_curr   = snap_future;
+    snap_future = tmp;
 }
 
 void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const {

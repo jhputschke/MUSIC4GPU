@@ -50,6 +50,12 @@ public:
     void begin_batch();
     void end_batch();
 
+    // GPU max-reduction over snap_curr: find max(epsilon) and max(rhob) across
+    // all Ncells.  Results are written to gpu.reduce_eps_out[0] and
+    // gpu.reduce_rhob_out[0] (managed memory, readable on the host after the
+    // call).  Launches on the compute stream and synchronizes before returning.
+    void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
+
     // Phase 4 (dual-stream): prefetch the freshly-packed snap_curr / snap_prev
     // SoA buffers to the device on a dedicated copy stream, then gate the
     // compute stream on completion via an event.  On a discrete GPU this moves

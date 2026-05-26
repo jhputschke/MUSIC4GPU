@@ -202,8 +202,31 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
         double emax_loc = 0.;
         double Tmax_curr = 0.;
         double nB_max_curr = 0.;
+#ifdef MUSIC_USE_GPU
+        if (advance.gpu_owns_state()) {
+            double eps_raw = 0., rhob_raw = 0.;
+            advance.reduce_max_gpu(eps_raw, rhob_raw);
+            emax_loc    = eps_raw  * Util::hbarc;   // 1/fm^4 → GeV/fm^3
+            nB_max_curr = rhob_raw;
+            // T(e) is monotone in e; use rhob=0 for the max-T approximation.
+            Tmax_curr = eos.get_temperature(eps_raw, 0.0) * Util::hbarc;
+            if (emax_loc > 1e5) {
+                music_message << "The maximum e = " << emax_loc
+                              << " GeV/fm^3 > 1e5 GeV/fm^3. Exiting.";
+                music_message.flush("error");
+                exit(1);
+            }
+            music_message << "eps_max = " << emax_loc << " GeV/fm^3, "
+                          << "rhob_max = " << nB_max_curr << " 1/fm^3, "
+                          << "T_max = " << Tmax_curr << " GeV.";
+            music_message.flush("info");
+        } else {
+#endif
         grid_info.get_maximum_energy_density(*ap_current, emax_loc,
                                              nB_max_curr, Tmax_curr);
+#ifdef MUSIC_USE_GPU
+        }
+#endif
         if (tau > source_tau_max && it > 0) {
             if (eps_max_cur < 0.) {
                 eps_max_cur = emax_loc;
@@ -312,8 +335,16 @@ void Evolve::AdvanceRK(double tau, GridPointer &arena_prev, GridPointer &arena_c
             arena_prev    = std::move(arena_current);
             arena_current = std::move(arena_future);
             arena_future  = std::move(temp);
+            // GPU: rotate_snapshots() is called at the START of the next
+            // AdvanceIt call (when gpu_state_authoritative_ is set), so no
+            // explicit mirror is needed here for the rk0 3-cycle.
         } else {
             std::swap(arena_current, arena_future);
+#ifdef MUSIC_USE_GPU
+            // Mirror the host swap in GPU snapshot space so snap_curr stays
+            // aligned with arena_current across the timestep boundary.
+            advance.swap_curr_future_gpu();
+#endif
         }
     }  /* loop over rk_flag */
 }
