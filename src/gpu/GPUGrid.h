@@ -87,6 +87,14 @@ public:
     // shear-stress indices idx_1d = {4, 5, 6, 7, 8}.
     float* uwrhs_out = nullptr;
 
+    // Output buffers produced by gpu_make_du (per-cell viscous geometry):
+    //   theta_buf [Ncells]      — expansion rate θ
+    //   a_buf     [4 * Ncells]  — a^μ = u^ν ∂_ν u^μ
+    //   sigma_buf [10 * Ncells] — velocity shear σ^{μν}
+    float* theta_buf = nullptr;
+    float* a_buf     = nullptr;
+    float* sigma_buf = nullptr;
+
     // Upload a pre-sampled EOS table (both P and dP/de) to GPU shared memory.
     // Must be called after allocate() and before the first dispatch_delta_qi.
     // n_pts must be <= GPU_EOS_N.
@@ -105,7 +113,10 @@ private:
 
     // Opaque MTLBuffer handles kept alive via CF-bridged __bridge_retained.
     // Stored as void* to keep this header free of ObjC.
-    // 3 snapshots × 5 fields + dwmn + eos_P + eos_dPde + qi_out = 19 max
-    void* buf_handles_[24];
+    // 3 snapshots × 5 fields = 15
+    //   + dwmn + qi_out + uwrhs_out + theta_buf + a_buf + sigma_buf = 21
+    //   + eos_P + eos_dPde = 23
+    // Leave headroom for upcoming Phase-2 buffers (eos_T, eos_s, ...).
+    void* buf_handles_[32];
     int   n_handles_ = 0;
 };

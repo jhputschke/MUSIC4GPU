@@ -154,6 +154,7 @@ void Advance::AdvanceIt(const double tau,
 
     const float* gpu_dwmn        = nullptr;
     bool         gpu_finalize_active = false;
+    bool         gpu_du_active       = false;
     if (gpu_ready_) {
         // Copy arena_current and arena_prev into GPU SoA buffers (AoS→SoA).
         gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
@@ -172,6 +173,13 @@ void Advance::AdvanceIt(const double tau,
         }
         if (DATA.viscosity_flag == 1 && DATA.turn_on_shear == 1) {
             mp.dispatch_uwrhs(gpu_grid_, gp);
+        }
+        // gpu_make_du: v1 supports vorticity=off, baryon-diffusion=off only.
+        gpu_du_active = (DATA.viscosity_flag == 1)
+                        && (DATA.include_vorticity_terms == 0)
+                        && (DATA.turn_on_diff == 0);
+        if (gpu_du_active) {
+            mp.dispatch_make_du(gpu_grid_, gp);
         }
         mp.wait();   // synchronize – on Apple Silicon this is near-zero cost
 
@@ -217,25 +225,45 @@ void Advance::AdvanceIt(const double tau,
 #endif
 
         if (DATA.viscosity_flag == 1) {
-            U_derivative u_derivative_helper(DATA, eos);
-            u_derivative_helper.MakedU(tau, arena_prev, arena_current,
-                                       ix, iy, ieta);
-            double theta_local = u_derivative_helper.calculate_expansion_rate(
+            double theta_local = 0.;
+            DumuVec a_local                          = {0.};
+            VelocityShearVec sigma_local             = {0.};
+            VorticityVec omega_local                 = {0.};
+            DmuMuBoverTVec baryon_diffusion_vector   = {0.};
+
+#ifdef USE_METAL
+            if (gpu_du_active) {
+                // Read theta / a^μ / σ^{μν} produced by gpu_make_du.
+                // Layout: field[comp * Ncells + cell]; component 4 of a and
+                // omega/baryon_diffusion remain zero (vorticity + baryon
+                // diffusion disabled in this v1 path).
+                const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;
+                const int Ncells_gpu = grid_nx * grid_ny * grid_neta;
+                theta_local = static_cast<double>(gpu_grid_.theta_buf[cell]);
+                for (int m = 0; m < 4; m++) {
+                    a_local[m] = static_cast<double>(
+                        gpu_grid_.a_buf[m * Ncells_gpu + cell]);
+                }
+                for (int m = 0; m < 10; m++) {
+                    sigma_local[m] = static_cast<double>(
+                        gpu_grid_.sigma_buf[m * Ncells_gpu + cell]);
+                }
+            } else
+#endif
+            {
+                U_derivative u_derivative_helper(DATA, eos);
+                u_derivative_helper.MakedU(tau, arena_prev, arena_current,
+                                           ix, iy, ieta);
+                theta_local = u_derivative_helper.calculate_expansion_rate(
                                             tau, arena_current, ieta, ix, iy);
-            DumuVec a_local;
-            u_derivative_helper.calculate_Du_supmu(tau, arena_current,
-                                                   ieta, ix, iy, a_local);
-
-            VelocityShearVec sigma_local;
-            u_derivative_helper.calculate_velocity_shear_tensor(
-                    tau, arena_current, ieta, ix, iy, a_local, sigma_local);
-
-            VorticityVec omega_local;
-            u_derivative_helper.calculate_kinetic_vorticity_with_spatial_projector(
-                    tau, arena_current, ieta, ix, iy, a_local, omega_local);
-
-            DmuMuBoverTVec baryon_diffusion_vector;
-            u_derivative_helper.get_DmuMuBoverTVec(baryon_diffusion_vector);
+                u_derivative_helper.calculate_Du_supmu(tau, arena_current,
+                                                       ieta, ix, iy, a_local);
+                u_derivative_helper.calculate_velocity_shear_tensor(
+                        tau, arena_current, ieta, ix, iy, a_local, sigma_local);
+                u_derivative_helper.calculate_kinetic_vorticity_with_spatial_projector(
+                        tau, arena_current, ieta, ix, iy, a_local, omega_local);
+                u_derivative_helper.get_DmuMuBoverTVec(baryon_diffusion_vector);
+            }
 
 #ifdef USE_METAL
             const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;

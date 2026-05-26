@@ -34,6 +34,13 @@ public:
     // Non-blocking: call wait() to ensure completion.
     void dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& params);
 
+    // Dispatch gpu_make_du over the full grid.
+    // Reads gpu.snap_curr.u and gpu.snap_prev.u; writes theta_buf,
+    // a_buf, sigma_buf (per-cell viscous geometry).  v1 assumes
+    // include_vorticity_terms == 0 and zero net baryon (no dUoverTsup /
+    // dUTsup / ∂(µ_B/T) terms).  Non-blocking; sync with wait().
+    void dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& params);
+
     // Dispatch gpu_make_uwrhs over the full grid.
     // Reads gpu.snap_curr.Wmunu and gpu.snap_curr.u; writes
     // uwrhs_out[5 * Ncells] into gpu.uwrhs_out (one entry per shear index
@@ -65,5 +72,6 @@ private:
     void*  pso_delta_qi_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_finalize_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_uwrhs_     = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_make_du_   = nullptr;  // id<MTLComputePipelineState>
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
 };

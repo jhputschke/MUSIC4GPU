@@ -1101,3 +1101,198 @@ kernel void gpu_make_uwrhs(
         uwrhs_out[k * Ncells + c] = flux * delta_tau;
     }
 }
+
+// ── gpu_make_du ──────────────────────────────────────────────────────────────
+//
+// Per-cell port of U_derivative::MakedU + calculate_expansion_rate +
+// calculate_Du_supmu + calculate_velocity_shear_tensor.  Writes three
+// per-cell output buffers consumed by the CPU viscous loop:
+//
+//   theta_out[Ncells]      — expansion rate  theta = ∂_μ u^μ + u^0/τ
+//   a_out    [4*Ncells]    — a^μ = u^ν ∂_ν u^μ          (DumuVec components 0..3)
+//   sigma_out[10*Ncells]   — velocity shear tensor σ^{μν} (VelocityShearVec layout)
+//
+// Restrictions (v1): assumes vorticity terms OFF (no dUoverTsup / dUTsup)
+// and zero net baryon (no ∂^n (µ_B/T) component).  The host code falls back
+// to the CPU path when either is enabled.
+//
+// Spatial stencil uses minmod limiter (matching MakeDSpatial).
+// Time derivative is backward first-order (matching MakeDTau).
+// delta[3] = params.delta_eta * params.tau  (proper length).
+//
+// Buffer bindings (must match MetalPipelines::dispatch_make_du):
+//   0  u_curr     [4*Ncells]
+//   1  u_prev     [4*Ncells]
+//   2  theta_out  [Ncells]
+//   3  a_out      [4*Ncells]
+//   4  sigma_out  [10*Ncells]
+//   5  params     (constant struct)
+
+kernel void gpu_make_du(
+    device const float*       u_curr     [[buffer(0)]],
+    device const float*       u_prev     [[buffer(1)]],
+    device       float*       theta_out  [[buffer(2)]],
+    device       float*       a_out      [[buffer(3)]],
+    device       float*       sigma_out  [[buffer(4)]],
+    constant MUSICGridParams& params     [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    int ix   = (int)gid.x;
+    int iy   = (int)gid.y;
+    int ieta = (int)gid.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const float tau       = params.tau;
+    const float delta_tau = params.delta_tau;
+    const float theta_l   = params.minmod_theta;
+    const float delta[4]  = {0.f, params.delta_x, params.delta_y,
+                             params.delta_eta * tau};
+
+    // Load center-cell u^μ
+    float u[4];
+    for (int m = 0; m < 4; m++) u[m] = u_curr[m * Ncells + c];
+
+    // ── dUsup[m][n] = ∂^n u^m ────────────────────────────────────────────────
+    //
+    // dUsup_local[m][n]; m=0..3 row, n=0..3 column.
+    //   n=0   → ∂^τ u^m (backward time difference; with g^00=-1 sign flip)
+    //   n=1,2,3 → ∂^n u^m (spatial minmod stencil)
+    //   m=0 derived from u·∂u = 0 (transversality) after stencil pass.
+    float dUsup_local[4][4];
+    for (int m = 0; m < 4; m++)
+        for (int n = 0; n < 4; n++)
+            dUsup_local[m][n] = 0.f;
+
+    // Spatial stencil: m=1..3, direction=1..3
+    const int DX[3]   = {1, 0, 0};
+    const int DY[3]   = {0, 1, 0};
+    const int DETA[3] = {0, 0, 1};
+
+    for (int dir = 0; dir < 3; dir++) {
+        int direction = dir + 1;
+        int ip1 = clamped_cell(ix + DX[dir], iy + DY[dir],
+                               ieta + DETA[dir], Nx, Ny, Neta);
+        int im1 = clamped_cell(ix - DX[dir], iy - DY[dir],
+                               ieta - DETA[dir], Nx, Ny, Neta);
+        for (int m = 1; m <= 3; m++) {
+            float f   = u[m];
+            float fp1 = u_curr[m * Ncells + ip1];
+            float fm1 = u_curr[m * Ncells + im1];
+            dUsup_local[m][direction] =
+                gpu_minmod_dx(fp1, f, fm1, theta_l) / delta[direction];
+        }
+    }
+
+    // dUsup[0][n] from u^μ u_μ = -1  →  u_μ ∂^n u^μ = 0
+    for (int n = 1; n <= 3; n++) {
+        float f = 0.f;
+        for (int m = 1; m <= 3; m++)
+            f += dUsup_local[m][n] * u[m];
+        dUsup_local[0][n] = f / u[0];
+    }
+
+    // Time derivative: backward first-order; g^00 = -1 gives the minus sign.
+    for (int m = 0; m < 4; m++) {
+        float u_m_c = u[m];
+        float u_m_p = u_prev[m * Ncells + c];
+        dUsup_local[m][0] = -((u_m_c - u_m_p) / delta_tau);
+    }
+    // dUsup[0][0] from constraint (overwrites the literal time-diff value).
+    {
+        float f = 0.f;
+        for (int m = 1; m < 4; m++)
+            f += dUsup_local[m][0] * u[m];
+        dUsup_local[0][0] = f / u[0];
+    }
+
+    // ── theta = ∂_μ u^μ + u^0/τ ──────────────────────────────────────────────
+    // ∂_μ u^μ = -∂^0 u^0 + ∂^1 u^1 + ∂^2 u^2 + ∂^3 u^3
+    float theta_cell = (-dUsup_local[0][0] + dUsup_local[1][1]
+                        + dUsup_local[2][2] + dUsup_local[3][3]
+                        + u[0] / tau);
+    theta_out[c] = theta_cell;
+
+    // ── a^μ = u^ν ∂_ν u^μ (DumuVec components 0..3) ─────────────────────────
+    // ∂_ν = (-1, +1, +1, +1) * ∂^ν
+    float a_loc[4];
+    for (int m = 0; m < 4; m++) {
+        float s = 0.f;
+        for (int n = 0; n < 4; n++) {
+            float tfac = (n == 0) ? -1.f : 1.f;
+            s += tfac * u[n] * dUsup_local[m][n];
+        }
+        a_loc[m] = s;
+        a_out[m * Ncells + c] = s;
+    }
+
+    // ── σ^{μν} (matches calculate_velocity_shear_tensor) ────────────────────
+    //
+    // Spatial entries (a, b in [1..3], with a ≤ b):
+    //   σ[a][b] = ((∂^a u^b + ∂^b u^a)/2
+    //             − (gδ_{ab} + u^a u^b) θ/3
+    //             + u^0/τ δ_{a3} δ_{b3}
+    //             + u^3 u^0/(2τ) (δ_{a3} u^b + δ_{b3} u^a)
+    //             + (u^a a^b + u^b a^a)/2)
+    float sigma_local[4][4];
+    for (int a = 1; a < 4; a++) {
+        for (int b = a; b < 4; b++) {
+            float gfac = (a == b) ? 1.f : 0.f;
+            float g_a3 = (a == 3) ? 1.f : 0.f;
+            float g_b3 = (b == 3) ? 1.f : 0.f;
+            sigma_local[a][b] =
+                  (dUsup_local[a][b] + dUsup_local[b][a]) * 0.5f
+                - (gfac + u[a] * u[b]) * theta_cell / 3.f
+                + u[0] / tau * g_a3 * g_b3
+                + u[3] * u[0] / tau * 0.5f * (g_a3 * u[b] + g_b3 * u[a])
+                + (u[a] * a_loc[b] + u[b] * a_loc[a]) * 0.5f;
+            sigma_local[b][a] = sigma_local[a][b];
+        }
+    }
+
+    // σ[3][3] from tracelessness g_{μν} σ^{μν} = 0 (rewritten using
+    // transversality u_μ σ^{μν} = 0 to eliminate the σ[0][·] entries).
+    sigma_local[3][3] = (
+        ( 2.f * (  u[1] * u[2] * sigma_local[1][2]
+                 + u[1] * u[3] * sigma_local[1][3]
+                 + u[2] * u[3] * sigma_local[2][3])
+         - (u[0]*u[0] - u[1]*u[1]) * sigma_local[1][1]
+         - (u[0]*u[0] - u[2]*u[2]) * sigma_local[2][2])
+        / fmax(u[0]*u[0] - u[3]*u[3], 1e-10f));
+
+    // σ[0][a] from transversality u_μ σ^{μν} = 0
+    for (int a = 1; a < 4; a++) {
+        float s = 0.f;
+        for (int b = 1; b < 4; b++)
+            s += sigma_local[a][b] * u[b];
+        sigma_local[0][a] = s / u[0];
+    }
+    // σ[0][0]
+    {
+        float s = 0.f;
+        for (int a = 1; a < 4; a++)
+            s += sigma_local[0][a] * u[a];
+        sigma_local[0][0] = s / u[0];
+    }
+
+    // VelocityShearVec layout:
+    //   [0]=σ00 [1]=σ01 [2]=σ02 [3]=σ03
+    //   [4]=σ11 [5]=σ12 [6]=σ13
+    //   [7]=σ22 [8]=σ23
+    //   [9]=σ33
+    sigma_out[0 * Ncells + c] = sigma_local[0][0];
+    sigma_out[1 * Ncells + c] = sigma_local[0][1];
+    sigma_out[2 * Ncells + c] = sigma_local[0][2];
+    sigma_out[3 * Ncells + c] = sigma_local[0][3];
+    sigma_out[4 * Ncells + c] = sigma_local[1][1];
+    sigma_out[5 * Ncells + c] = sigma_local[1][2];
+    sigma_out[6 * Ncells + c] = sigma_local[1][3];
+    sigma_out[7 * Ncells + c] = sigma_local[2][2];
+    sigma_out[8 * Ncells + c] = sigma_local[2][3];
+    sigma_out[9 * Ncells + c] = sigma_local[3][3];
+}

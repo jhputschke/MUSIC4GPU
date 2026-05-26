@@ -73,6 +73,17 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
                                 buf_handles_, n_handles_);
     ok = ok && (uwrhs_out != nullptr);
 
+    theta_buf = alloc_metal_buf(g_metal_device,
+                                static_cast<size_t>(Ncells_) * sizeof(float),
+                                buf_handles_, n_handles_);
+    a_buf     = alloc_metal_buf(g_metal_device,
+                                4 * static_cast<size_t>(Ncells_) * sizeof(float),
+                                buf_handles_, n_handles_);
+    sigma_buf = alloc_metal_buf(g_metal_device,
+                                10 * static_cast<size_t>(Ncells_) * sizeof(float),
+                                buf_handles_, n_handles_);
+    ok = ok && theta_buf && a_buf && sigma_buf;
+
     allocated_ = ok;
     return ok;
 }
@@ -113,6 +124,9 @@ void GPUGrid::release() {
     dwmn      = nullptr;
     qi_out    = nullptr;
     uwrhs_out = nullptr;
+    theta_buf = nullptr;
+    a_buf     = nullptr;
+    sigma_buf = nullptr;
     eos_P     = nullptr;
     eos_dPde  = nullptr;
     eos_params = {};

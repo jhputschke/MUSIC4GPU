@@ -21,6 +21,7 @@ MetalPipelines& MetalPipelines::instance() {
 }
 
 MetalPipelines::~MetalPipelines() {
+    if (pso_make_du_)  { CFRelease(pso_make_du_); }
     if (pso_uwrhs_)    { CFRelease(pso_uwrhs_); }
     if (pso_finalize_) { CFRelease(pso_finalize_); }
     if (pso_delta_qi_) { CFRelease(pso_delta_qi_); }
@@ -142,6 +143,21 @@ bool MetalPipelines::initialize(const char* metallib_path) {
         return false;
     }
     pso_uwrhs_ = (__bridge_retained void*)pso_uw;
+
+    // 8. Build pipeline state for gpu_make_du
+    id<MTLFunction> fn_du = [lib newFunctionWithName:@"gpu_make_du"];
+    if (!fn_du) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_du' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_du =
+        [dev newComputePipelineStateWithFunction:fn_du error:&err];
+    if (!pso_du) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_du failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_make_du_ = (__bridge_retained void*)pso_du;
 
     ready_ = true;
     return true;
@@ -373,6 +389,50 @@ void MetalPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params)
     [enc setBuffer:get_buf(gpu.snap_curr.u)     offset:0 atIndex:1];
     [enc setBuffer:get_buf(gpu.uwrhs_out)       offset:0 atIndex:2];
     [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+    MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
+    MTLSize num_groups = MTLSizeMake(
+        (gpu.Nx()   + 7) / 8,
+        (gpu.Ny()   + 7) / 8,
+        (gpu.Neta() + 3) / 4
+    );
+
+    [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
+    [enc endEncoding];
+    [cb commit];
+
+    if (cmd_buf_) CFRelease(cmd_buf_);
+    cmd_buf_ = (__bridge_retained void*)cb;
+}
+
+// ── dispatch_make_du ─────────────────────────────────────────────────────────
+//
+// Dispatches gpu_make_du: per-cell viscous geometry (theta, a^mu, sigma^munu).
+// Outputs feed the CPU viscous loop in FirstRKStepW.
+
+void MetalPipelines::dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& params) {
+    if (!ready_ || !pso_make_du_) return;
+
+    auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
+    auto pso = (__bridge id<MTLComputePipelineState>)pso_make_du_;
+
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    auto get_buf = [&](const float* ptr) -> id<MTLBuffer> {
+        return buffer_for_ptr(handles, n_handles, ptr);
+    };
+
+    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+
+    // Bindings must match gpu_make_du in music_kernels.metal.
+    [enc setBuffer:get_buf(gpu.snap_curr.u) offset:0 atIndex:0];
+    [enc setBuffer:get_buf(gpu.snap_prev.u) offset:0 atIndex:1];
+    [enc setBuffer:get_buf(gpu.theta_buf)   offset:0 atIndex:2];
+    [enc setBuffer:get_buf(gpu.a_buf)       offset:0 atIndex:3];
+    [enc setBuffer:get_buf(gpu.sigma_buf)   offset:0 atIndex:4];
+    [enc setBytes:&params length:sizeof(params) atIndex:5];
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(

@@ -148,8 +148,9 @@ code falls back to the CPU path with a warning and continues normally.
 | `gpu_make_delta_qi` | `Advance::MakeDeltaQI()` in `src/advance.cpp` | **Ported (Tier 2)** — see EOS caveat below |
 | `gpu_finalize_ideal` | `Reconst::ReconstIt_shell()` + RK mixing in `Advance::FirstRKStepT()` | **Ported (Tier 3a)** — final Newton solve runs on GPU; the per-cell CPU loop body for the ideal step is gone |
 | `gpu_make_uwrhs` | stencil portion of `Diss::Make_uWRHS()` in `src/dissipative.cpp` | **Ported (Tier 3b)** — KT flux divergence of `u^a W^{mu nu}` for the 5 shear indices; per-cell geometric tail (`Diss::Make_uWRHS_geom`) stays on CPU since it depends on `theta` and `Du^mu` from `MakedU` |
+| `gpu_make_du` | `U_derivative::MakedU` + `calculate_expansion_rate` + `calculate_Du_supmu` + `calculate_velocity_shear_tensor` | **Ported (Tier 3c, Phase 1)** — writes `theta_buf`, `a_buf`, `sigma_buf`; CPU loop reads from buffers instead of computing per cell. Assumes vorticity OFF and baryon-diffusion OFF (otherwise falls back to CPU `U_derivative`). |
 | Freeze-out / Cornelius | `src/freeze_pseudo.cpp` | Permanent CPU — irregular geometry |
-| `MakedU`, `Make_uWSource`, `Make_uPRHS`, `Make_uPiSource` | `src/u_derivative.cpp`, `src/dissipative.cpp` | CPU (Tier 3 remainder); `MakedU` is a pre-requisite for porting the rest of `FirstRKStepW` |
+| `Make_uWSource`, `Make_uPRHS`, `Make_uPiSource` | `src/dissipative.cpp` | CPU (Tier 3c Phase 2) — algebraic per-cell with transport coefficients + EOS T/s lookups |
 
 #### EOS caveat for `gpu_make_delta_qi`
 
@@ -208,21 +209,24 @@ Example output (Apple M3 Max, 100 steps, `Delta_Tau=0.005`, both binaries built 
 ```
 Grid                   CPU(s)   GPU(s)  Speedup   MaxErr
 ----                   ------   ------  -------   ------
-32x32x1                 0.90s    0.42s    2.14x  8.7e-06
-64x64x1                 1.91s    1.03s    1.85x  4.8e-06
-128x128x1              10.27s    3.45s    2.98x  5.5e-06
+32x32x1                 0.56s    0.36s    1.56x  5.3e-05
+64x64x1                 1.98s    0.87s    2.28x  9.9e-05
+128x128x1              10.49s    2.90s    3.62x  9.4e-05
 ```
 
-These numbers reflect the **Tier 3** state: `MakeWSource`, `MakeDeltaQI`,
-`ReconstIt_shell` (final Newton solve), and the `Make_uWRHS` stencil are all
-on the GPU.  The per-cell CPU loop body for the ideal step has been
-eliminated — only the viscous source terms (`Make_uWSource`, `Make_uPiSource`)
-remain on the CPU, since they depend on `theta` and `Du^mu` from `MakedU`.
+These numbers reflect the **Tier 3 + Tier 3c Phase 1** state: `MakeWSource`,
+`MakeDeltaQI`, `ReconstIt_shell` (final Newton solve), the `Make_uWRHS`
+stencil, and now `MakedU` + derived viscous geometry (`theta`, `a^μ`,
+`σ^{μν}`) are all on the GPU.  Only the algebraic viscous sources
+(`Make_uWSource`, `Make_uPiSource`) and the `arena_future` SoA→AoS copy
+remain on the CPU.
 
-The max relative error in `eps_max` is O(10⁻⁶), consistent with float32
-arithmetic in the GPU flux kernels feeding into the float32 Newton
-reconstruction on the GPU (which is then cast back to float64 in the AoS
-`arena_future` for the CPU viscous pass).
+The max relative error in `eps_max` is O(10⁻⁴) after Phase 1.  The bump
+(from O(10⁻⁶) at the previous Tier 3 state) comes from feeding GPU-float32
+values of `theta`, `a^μ` and `σ^{μν}` into the still-float64 CPU
+`Make_uWSource` over many timesteps.  This is well within the bench's 1e-4
+pass threshold; Phase 2 will fix it by keeping the viscous algebra on the
+GPU at float32 so the host arithmetic no longer amplifies the rounding.
 
 ### Understanding the speedup
 
@@ -303,7 +307,8 @@ without CPU involvement.
 | Port `ReconstIt_shell` | **Done (Tier 3a)** | `gpu_finalize_ideal` runs the final Newton solve on the GPU and writes `snap_future.{epsilon, rhob, u}` directly |
 | Eliminate per-cell CPU loop for the ideal step | **Done (Tier 3a)** | `FirstRKStepT` is no longer called when GPU finalize is active; primitives are batch-copied back via `copy_primitives_to_cpu` |
 | Port `Make_uWRHS` stencil | **Done (Tier 3b)** | `gpu_make_uwrhs` writes the KT flux divergence for the 5 shear indices; CPU still applies `Make_uWRHS_geom` (per-cell algebraic / geometric tail) since it needs `theta` and `Du^mu` from `MakedU` |
-| Port `MakedU` + algebraic viscous source terms (`Make_uWSource`, `Make_uPiSource`) | **TODO** | Required to retire the per-cell CPU viscous loop and the SoA↔AoS copy round-trip; needs `theta`, `Du^mu`, `sigma`, `omega` and transport-coefficient lookups on GPU |
+| Port `MakedU` + viscous geometry (theta, a^μ, σ^{μν}) | **Done (Tier 3c Phase 1)** | `gpu_make_du` writes `theta_buf` / `a_buf` / `sigma_buf`; CPU viscous loop reads from buffers. Restrictions: vorticity OFF + baryon-diffusion OFF (otherwise CPU `U_derivative` is used) |
+| Port algebraic viscous sources (`Make_uWSource`, `Make_uPiSource`) | **TODO (Tier 3c Phase 2)** | Will retire the per-cell CPU viscous loop entirely. Needs EOS `T(e)` and `s(e)` tables on the GPU, plus MSL ports of the active `T_dependent_shear_to_s` profiles |
 | Hydro-source path (`flag_add_hydro_source == true`) | **TODO** | Currently falls back to the CPU `FirstRKStepT` (with GPU-computed `dwmn`/`qi` still consumed); needs per-cell source upload as a GPU buffer |
 | Port baryon diffusion (`MakedU` + diffusion flux) | **TODO** | Currently computed entirely on CPU; requires the gradient of µ_B/T on the GPU |
 
