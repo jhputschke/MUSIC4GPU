@@ -420,35 +420,45 @@ resolves normally on the target.)
 - `__ldg`, `--use_fast_math`, the occupancy-tuned block sizing, and the
   256-thread blocks are all architecture-agnostic.
 
-### Optional — for *peak* discrete performance (not correctness)
+### Memory back-end: explicit device buffers + pinned staging (implemented)
 
-The one real architectural caveat: every SoA buffer is allocated with
-`cudaMallocManaged` (`GPUGrid_cuda.cu`). On the coherent GB10 that is ideal —
-the GPU reads host-written buffers in place. On a **discrete** GPU it means the
-per-step AoS→SoA pack writes managed pages on the host, which then **migrate
-over PCIe** to the device on first kernel touch (and back on copy-back) every
-substep. It runs correctly — the driver handles the migration — but PCIe
-migration is the slow path.
+The SoA snapshot buffers use **two memory back-ends, chosen at runtime** from
+the device's coherence capability (`cudaDevAttrPageableMemoryAccess` /
+`prop.integrated`, surfaced as `g_cuda_coherent`):
 
-The Phase 4 prefetch mitigates this (it stages the snapshots on the copy stream
-ahead of compute), but the *fully* optimal discrete design — scaffolded via
-`copy_stream_` but **not** wired — is:
+- **Coherent (GB10):** snapshots are `cudaMallocManaged`; `copy_to_gpu` packs
+  AoS→SoA straight into them and the kernels read in place — zero copy.
+- **Discrete (A100/RTX/H100):** snapshots are device-resident `cudaMalloc`;
+  `copy_to_gpu` packs into **pinned** host staging (`cudaHostAlloc`), and the
+  data moves by explicit `cudaMemcpyAsync` — H2D on `copy_stream_` in
+  `upload_snapshots_async` (gated to the compute stream via the event), D2H in
+  the copy-back. This avoids the per-fault managed-memory migration over PCIe
+  that the all-managed design would otherwise incur every substep.
 
-1. Allocate the SoA snapshot buffers with `cudaMalloc` (device-resident) instead
-   of `cudaMallocManaged`.
-2. Allocate **pinned** host staging buffers (`cudaHostAlloc`) for the packed
-   SoA data so transfers run at full PCIe bandwidth.
-3. Pack AoS→SoA into the pinned staging buffer (CPU/OpenMP), then
-   `cudaMemcpyAsync(H2D)` on `copy_stream_`, and `cudaMemcpyAsync(D2H)` for the
-   copy-back; gate the compute stream on the copy event (the handshake is
-   already in `upload_snapshots_async`).
-4. Select this path at runtime behind the existing `coherent_memory_` flag, so
-   GB10 keeps its zero-copy managed path and discrete GPUs get explicit DMA.
+The non-snapshot scratch/output buffers (`dwmn`, `qi_out`, `uwrhs_out`,
+`uprhs_out`, `qi_source_buf`, `theta`/`a`/`sigma`, EOS tables) stay
+`cudaMallocManaged` in both modes: they are device-resident in the fully-GPU
+path (never host-touched, so they migrate once and stay) yet remain
+host-accessible for the partial-GPU fallback configurations. The snapshots —
+the bulk of the per-step host↔device traffic — are what the discrete path
+optimizes.
 
-This was deferred because implementing it on top of the managed-memory design
-would have regressed the coherent GB10 target. It is the recommended first step
-if profiling on a discrete GPU shows the managed-memory migration dominating —
-which, given the host-bound finding above, is the likely outcome.
+The selection is automatic; **no flag or code change is needed on a discrete
+GPU**. The hydro-source pre-pass (which reads the cell 4-velocity on the host)
+uses `host_readable_u_curr()`, returning the pinned staging on the discrete path
+and refreshing it after a snapshot rotation (`refresh_u_curr_stage`).
+
+**Validation.** A diagnostic override `MUSIC_CUDA_FORCE_DISCRETE=1` forces the
+discrete path on coherent hardware so it can be tested where no discrete GPU is
+available. On GB10 the forced-discrete path is **bit-identical** to the
+zero-copy path (max rel `eps_max` error vs coherent = 0.0e0; vs CPU = 2.7e-5,
+PASS across all 3D grids) — confirming the device-buffer + DMA plumbing is
+correct. On a true discrete GPU this is the path that runs by default.
+
+```bash
+# exercise the discrete memory path explicitly (e.g. for testing on GB10):
+MUSIC_CUDA_FORCE_DISCRETE=1 OMP_NUM_THREADS=$(nproc) bash tests/cuda_vs_cpu_bench_3d.sh
+```
 
 ### Recommended workflow on a discrete GPU
 
@@ -458,9 +468,11 @@ which, given the host-bound finding above, is the likely outcome.
 2. Measure per-step cost: `bash tests/cuda_perstep_bench.sh`.
 3. Profile to confirm where the time goes:
    `nsys profile --stats=true ./build_cuda/src/MUSIChydro <input>`.
-   If kernels are a small fraction of wall (as on GB10) and the timeline shows
-   significant host↔device migration, implement the explicit
-   device-buffer + pinned-staging path above. A discrete GPU also has far more
-   FP32 throughput than GB10, so the Phase-5 fast-math win on `delta_qi` (and
-   the compute-bound kernels generally) should translate into a larger share of
-   the end-to-end speedup there than it does on the host-bound GB10.
+   The explicit device-buffer + pinned-staging path is already selected
+   automatically on a discrete GPU (no managed-memory migration on the
+   snapshots). A discrete GPU also has far more FP32 throughput than GB10, so
+   the Phase-5 fast-math win on `delta_qi` (and the compute-bound kernels
+   generally) should translate into a larger share of the end-to-end speedup
+   there than it does on the host-bound GB10. If profiling still shows host↔
+   device cost dominating, the next lever is the scratch/EOS buffers (currently
+   managed) and keeping evolving state GPU-resident across timesteps.

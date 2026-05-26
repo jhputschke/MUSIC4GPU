@@ -212,16 +212,18 @@ void Advance::AdvanceIt(const double tau,
         // and skipped the CPU copy-back, rotate snapshot pointer aliases
         // (snap_prev ← snap_curr ← snap_future) and skip the AoS→SoA
         // upload entirely.  Otherwise fall back to the standard upload path.
+        bool gpu_rotated = false;
         if (gpu_state_authoritative_) {
             gpu_grid_.rotate_snapshots();
             gpu_state_authoritative_ = false;
+            gpu_rotated = true;
         } else {
             gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
             gpu_grid_.copy_to_gpu(arena_prev,    gpu_grid_.snap_prev);
 #if defined(USE_CUDA)
-            // Phase 4: stage the freshly-packed snapshots to the device on the
-            // copy stream (dual-stream handshake; a residency hint on coherent
-            // unified memory).
+            // Phase 4: move the freshly-packed snapshots to the device on the
+            // copy stream (explicit H2D DMA on a discrete GPU; no-op on coherent
+            // unified memory, where copy_to_gpu wrote the managed buffers).
             GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
 #endif
         }
@@ -243,7 +245,15 @@ void Advance::AdvanceIt(const double tau,
             const int Ncells = Nx * Ny * Neta;
             float* src_buf   = gpu_grid_.qi_source_buf;
             const int rhob_on = gp.has_rhob_source;
-            const float* u_soa = gpu_grid_.snap_curr.u;   // fresh after copy or rotate
+#if defined(USE_CUDA)
+            // On the discrete-GPU path snap_curr.u is device-only; after a
+            // rotation its pinned staging is stale, so refresh it before the
+            // host reads the 4-velocity below.  No-op on coherent / Metal.
+            if (gpu_rotated) gpu_grid_.refresh_u_curr_stage();
+#endif
+            // Host-readable 4-velocity: the managed buffer (coherent) or the
+            // pinned staging just packed/refreshed (discrete).
+            const float* u_soa = gpu_grid_.host_readable_u_curr();
 
             #pragma omp parallel for collapse(3) schedule(guided)
             for (int ieta = 0; ieta < Neta; ieta++)

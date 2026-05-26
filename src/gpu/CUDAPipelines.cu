@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 #include "CUDAPipelines.h"
 #include "GPUGrid.h"
 #include "gpu_types.h"
@@ -12,6 +13,9 @@
 
 // Selected device id, shared with GPUGrid_cuda.cu for prefetch hints.
 int g_cuda_device_id = 0;
+// Coherence flag, shared with GPUGrid_cuda.cu to pick its memory back-end.
+// Set in initialize() before GPUGrid::allocate() runs.
+bool g_cuda_coherent = false;
 
 // Factor a target thread count into a 3-D block adapted to the grid's eta
 // extent.  The eta dimension is capped at 4 (matching the original Metal
@@ -103,9 +107,20 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
     cudaDeviceGetAttribute(&pageable_access,
                            cudaDevAttrPageableMemoryAccess, device_id_);
     coherent_memory_ = (pageable_access != 0) || (prop.integrated != 0);
+    // Test/diagnostic override: force the discrete (device-buffer + pinned
+    // staging) path even on coherent hardware, to validate it where no discrete
+    // GPU is available.  Set MUSIC_CUDA_FORCE_DISCRETE=1.
+    if (const char* e = getenv("MUSIC_CUDA_FORCE_DISCRETE")) {
+        if (e[0] == '1') {
+            coherent_memory_ = false;
+            fprintf(stderr, "[MUSIC-GPU] MUSIC_CUDA_FORCE_DISCRETE=1: "
+                            "forcing discrete memory path\n");
+        }
+    }
+    g_cuda_coherent  = coherent_memory_;   // GPUGrid uses this to pick its allocator
     fprintf(stderr, "[MUSIC-GPU] coherent host memory: %s\n",
-            coherent_memory_ ? "yes (dual-stream prefetch skipped)"
-                             : "no (dual-stream prefetch active)");
+            coherent_memory_ ? "yes (managed buffers, zero-copy)"
+                             : "no (device buffers + pinned-staging DMA)");
 
     cudaStream_t stream = nullptr;
     err = cudaStreamCreate(&stream);
@@ -165,32 +180,28 @@ void CUDAPipelines::end_batch()   {}
 
 void CUDAPipelines::upload_snapshots_async(GPUGrid& gpu) {
     if (!ready_ || !copy_stream_) return;
-    // Coherent unified memory (GB10): the kernels read the packed buffers in
-    // place, so prefetching + gating only adds latency.  Skip it.
+    // Coherent unified memory (GB10): copy_to_gpu packed straight into the
+    // managed buffers the kernels read, so there is nothing to move.
     if (coherent_memory_) return;
+
+    // Discrete GPU: DMA the just-packed pinned staging buffers to the device
+    // snapshot buffers on the copy stream, then gate the compute stream on
+    // completion so kernels never read before the upload lands.  This is the
+    // host→device transfer overlapped onto its own stream.
     auto cs = static_cast<cudaStream_t>(copy_stream_);
     const size_t nc = static_cast<size_t>(gpu.Ncells());
-
-    cudaMemLocation loc{};
-    loc.type = cudaMemLocationTypeDevice;
-    loc.id   = device_id_;
-    auto pf = [&](void* p, size_t bytes) {
-        if (p) cudaMemPrefetchAsync(p, bytes, loc, 0, cs);
+    auto h2d = [&](float* dev, const float* host, size_t bytes) {
+        if (dev && host)
+            cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, cs);
     };
-    // Prefetch the two snapshots the kernels will read this substep onto the
-    // copy stream.  On a discrete GPU this is the host→device transfer; on the
-    // coherent GB10 it is a residency hint.
     const GPUSnapshot* snaps[2] = {&gpu.snap_curr, &gpu.snap_prev};
     for (const GPUSnapshot* s : snaps) {
-        pf(s->epsilon,      nc * sizeof(float));
-        pf(s->rhob,         nc * sizeof(float));
-        pf(s->u,        4 * nc * sizeof(float));
-        pf(s->Wmunu,   14 * nc * sizeof(float));
-        pf(s->pi_b,         nc * sizeof(float));
+        h2d(s->epsilon, s->epsilon_stage,      nc * sizeof(float));
+        h2d(s->rhob,    s->rhob_stage,         nc * sizeof(float));
+        h2d(s->u,       s->u_stage,        4 * nc * sizeof(float));
+        h2d(s->Wmunu,   s->Wmunu_stage,   14 * nc * sizeof(float));
+        h2d(s->pi_b,    s->pi_b_stage,         nc * sizeof(float));
     }
-    // Gate the compute stream on the prefetch so the first kernel does not read
-    // before the data is resident (correctness-neutral on coherent memory, but
-    // the textbook-correct dual-stream handshake on a discrete GPU).
     if (copy_event_) {
         cudaEventRecord(static_cast<cudaEvent_t>(copy_event_), cs);
         cudaStreamWaitEvent(static_cast<cudaStream_t>(compute_stream_),

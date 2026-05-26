@@ -24,6 +24,17 @@ struct GPUSnapshot {
     float* u        = nullptr;   // [GPU_U_COMPS * Ncells]
     float* Wmunu    = nullptr;   // [GPU_WMUNU_COMPS * Ncells]
     float* pi_b     = nullptr;   // [Ncells]
+
+    // Discrete-GPU only (CUDA): pinned host staging buffers.  When the device
+    // does NOT have coherent host-memory access, the pointers above are plain
+    // cudaMalloc device memory and these stage the AoS<->SoA packed data on the
+    // host for explicit cudaMemcpyAsync DMA.  All null on coherent / Metal
+    // builds, where the pointers above are themselves host-accessible.
+    float* epsilon_stage = nullptr;
+    float* rhob_stage    = nullptr;
+    float* u_stage       = nullptr;
+    float* Wmunu_stage   = nullptr;
+    float* pi_b_stage    = nullptr;
 };
 
 // Manages three grid snapshots (prev / current / future) and an output
@@ -71,6 +82,21 @@ public:
     // from CPU at the start of substep 1 when the previous substep already
     // produced complete fresh state in snap_future.
     void rotate_snapshots();
+
+    // Host-readable view of snap_curr.u (4 * Ncells).  In the discrete-GPU
+    // path snap_curr.u is device-only, so return the pinned staging copy that
+    // copy_to_gpu just packed; otherwise the buffer is itself host-accessible.
+    // Used by the hydro-source pre-pass, which evaluates j^alpha at each cell's
+    // 4-velocity on the CPU.
+    const float* host_readable_u_curr() const {
+        return snap_curr.u_stage ? snap_curr.u_stage : snap_curr.u;
+    }
+
+    // Discrete-GPU only: refresh snap_curr.u's pinned staging from the device
+    // buffer (no-op on the coherent / Metal path).  Needed before the host
+    // hydro-source pre-pass on a substep that reached the GPU via snapshot
+    // rotation rather than a fresh host pack.  Defined in GPUGrid_cuda.cu.
+    void refresh_u_curr_stage();
 
     // The three snapshots (prev, current, future).
     GPUSnapshot snap_prev;
