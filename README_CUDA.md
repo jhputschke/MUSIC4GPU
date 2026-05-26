@@ -481,25 +481,62 @@ Both regression tests pass unchanged on the new pipeline:
 Identical to the pre-Phase-6 numbers — the residency change is a transport
 reshuffle, not a numerical change.
 
+### Profile-driven follow-up: parallelize the every-step host diagnostic
+
+After Phase A+B landed, instrumenting the EvolveIt loop with a small
+opt-in profiler (`src/bench_timer.h`, activated by `MUSIC_PROFILE=1`)
+showed a surprise on RTX 3090, 64×64×32:
+
+| Section | ms/step | % of step |
+|---------|---:|---:|
+| `evolve.output_momentum_anisotropy_vs_tau` (host, every step) | 8.6 | **~52%** |
+| `evolve.AdvanceRK` (host-side GPU pipeline) | 4.7 | ~28% |
+| ├── `advance.d2h_copyback` | 2.0 | ~12% |
+| ├── `advance.dispatch_wait` (GPU kernels) | 0.9 | ~5% |
+| └── `advance.upload_or_rotate` | ~0 | (Phase A eliminated) |
+| `evolve.check_conservation_law` | 1.0 | ~6% |
+| `evolve.max_energy_density` (GPU reduce) | 0.08 | ~0.5% |
+
+The biggest single per-step cost was a **serial CPU loop** —
+`output_momentum_anisotropy_vs_tau` was the one every-step host diagnostic
+in `grid_info.cpp` that hadn't been OpenMP-reduced (unlike
+`check_conservation_law` and `compute_angular_momentum` which already were).
+A one-pragma fix — `#pragma omp parallel for collapse(2) reduction(+:…)` on
+both passes (centroid + moments), with the three `std::vector<double>`
+accumulators converted to plain C arrays so OpenMP 4.5 array-section
+reduction applies — drops the function from **8.6 ms → 0.74 ms per step
+(11.6×)** on 48 CPU threads, with the 1-thread vs 48-thread output
+bit-identical (2109 values, max abs diff 0.0).
+
+| Grid | Phase 6 only ms/step | + OpenMP fix ms/step | vs 48-thread CPU |
+|------|---------------------:|---------------------:|-----------------:|
+| 128×128×1 (2D) | 11.15 | **3.61** | 1.77× → **2.87×** |
+| 64×64×16 (3D) | 13.36 | **3.28** | 2.55× → **7.65×** |
+| 64×64×32 (3D, 131k) | 13.44 | **5.26** | 4.17× → **9.13×** |
+
+The CPU reference also benefited (56 → 48 ms/step at 64×64×32) since the
+same serial loop was the bottleneck there too; the GPU speedup ratio grows
+because the GPU side improved more than the CPU side did.
+
 ### Phase C — full D2H elimination (future)
 
-The plan's full vision (§3) is to also drop the per-step D2H copy-back and
-sync host arenas only when needed (output cadence, freeze-out).  This would
-cut another ~11 MB/step of PCIe traffic, but it is **not implemented yet**:
+The plan's full vision (§3) is to drop the per-step D2H copy-back and sync
+host arenas only when needed (output cadence, freeze-out).  After the
+OpenMP fix above, the profile says this is now worth roughly:
 
-- `output_momentum_anisotropy_vs_tau` is called **every step** in `EvolveIt`
-  and reads the full host arena.  With on-demand `sync_host_from_gpu`, it
-  would force a D2H copy on every step anyway — yielding no net saving versus
-  the current always-copy-back approach.
-- `check_conservation_law` (in non-boost-invariant runs) is the same story.
+- D2H copy-back per step: ~1.0 ms — i.e. an additional ~20% per-step win at
+  64×64×32 (5.26 → ~4.3 ms/step) if the every-step host arena reads can
+  also be eliminated.
+- `output_momentum_anisotropy_vs_tau` is no longer the blocker (0.74 ms/step
+  serial-equivalent, fits easily under a per-step sync budget).
+- `check_conservation_law` (3D-only): 0.45 ms/step, similar story.
 
-Phase C therefore requires either porting these every-step diagnostics to the
-GPU or frequency-gating them.  That is an evolve-loop refactor beyond the
-GPU kernel layer and is deferred to a follow-up.  All the *plumbing* needed
-for Phase C is already in place — `gpu_owns_state()`, the GPU max-reduction,
-and the `swap_curr_future()` mirror — so the change reduces to wiring an
-`Advance::sync_host_from_gpu(current[, prev])` call into the relevant
-`EvolveIt` blocks and removing the unconditional copy-back in `AdvanceIt`.
+So Phase C is now a modest, well-scoped optimization rather than an
+end-to-end blocker.  All the *plumbing* needed for it is already in place —
+`gpu_owns_state()`, the GPU max-reduction, and the `swap_curr_future()`
+mirror — so the change reduces to wiring an `Advance::sync_host_from_gpu(current[, prev])`
+call into the relevant `EvolveIt` blocks and removing the unconditional
+copy-back in `AdvanceIt`.  It remains deferred to a follow-up.
 
 ---
 
@@ -513,6 +550,7 @@ and the `swap_curr_future()` mirror — so the change reduces to wiring an
 | 4 | Dual-stream scaffolding (memory-model gated) | 4.90× (neutral) | no-op on coherent GB10 |
 | 5 | `--use_fast_math` | 5.29× | `delta_qi` −51% (2.04×) |
 | 6 | GPU-resident state (skip H2D re-upload) + GPU max-reduction | 4.17× (RTX 3090) | 27% per-step on discrete; ≈neutral on coherent GB10 |
+| 6b | OpenMP-parallelize `output_momentum_anisotropy_vs_tau` (profile-driven) | **9.13× (RTX 3090)** | host function 8.6 → 0.74 ms/step (11.6×); 1T=48T bit-identical |
 
 (Per-step figures carry ≈±10% run-to-run noise; the kernel-level `nsys` numbers
 are the reliable per-optimization signal.) Correctness holds throughout: max
@@ -532,24 +570,30 @@ baseline's speedup ratio.
 At production grid on a coherent Grace-Blackwell superchip, **MUSIC's hydro
 kernels are not the bottleneck** — they are ~5.5% of wall time.  The port is
 correct and the kernels are well-optimized (delta_qi halved, w_source tiled),
-so further end-to-end speedup required attacking the **host-side** cost: the
-per-step AoS↔SoA conversion and the CPU `eps_max` diagnostics, and keeping
-evolving state GPU-resident across timesteps so the grid is not repacked every
-step.  Phase 6 above implements Phases A+B of that restructure
+so further end-to-end speedup required attacking the **host-side** cost.
+Phase 6 implemented Phases A+B of the GPU-resident-state plan
 ([`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md)): the H2D
 re-upload at the start of each rk0 is eliminated, and `eps_max`/`rhob_max` are
-reduced on the GPU.  On the discrete RTX 3090 this delivers a measured 27%
-per-step win at 64×64×32 (3.22× → 4.17× vs 48-thread CPU).  On coherent GB10
-the same change is correctness-neutral and ≈ performance-neutral, because no
-PCIe transfer ever happened.
+reduced on the GPU.  On the discrete RTX 3090 this delivers a 27% per-step
+win at 64×64×32 (3.22× → 4.17× vs 48-thread CPU).  On coherent GB10 the same
+change is correctness-neutral and ≈ performance-neutral, because no PCIe
+transfer ever happened.
 
-The remaining piece, Phase C — eliminating the D2H copy-back too — is gated on
-moving every-step diagnostics (`output_momentum_anisotropy_vs_tau`,
-`check_conservation_law`) off the host or frequency-gating them, since they
-would otherwise force a per-step sync anyway.  The plumbing for that change
-(the `gpu_owns_state_` flag, the GPU reduction, the snapshot mirroring) is now
-all in place; the remaining work is in the `EvolveIt` diagnostic loop, not the
-GPU kernel layer.
+The bigger lesson from instrumenting the loop after Phase 6 was that the
+*next* bottleneck wasn't any GPU detail at all — it was a single serial
+host function, `output_momentum_anisotropy_vs_tau`, running ~8.6 ms/step
+(half the loop) while every other every-step diagnostic in the same file
+already had an OpenMP reduction.  Adding the same pragma there (and
+converting three `std::vector<double>` accumulators to plain arrays so
+OpenMP 4.5 array-section reduction applies) is a one-day-of-a-PhD-student
+change that drops the function 11.6× and the whole step 2.5× to **5.26
+ms/step, 9.13× vs CPU**.  Worth recording as a process point: GPU porting
+buys you nothing while a CPU diagnostic is single-threaded.
+
+Phase C — eliminating the D2H copy-back too — is now a modest follow-up
+worth ~20% per-step on top of the above, with all required plumbing
+(`gpu_owns_state()`, GPU reduction, `swap_curr_future()`) already in place.
+It is deferred but no longer load-bearing.
 
 **Multiple GPUs.** Scaling to several discrete GPUs is feasible — the structured
 grid suits η-slab domain decomposition with a 2-cell halo exchange — but it is
