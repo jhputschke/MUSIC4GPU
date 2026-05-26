@@ -460,6 +460,16 @@ correct. On a true discrete GPU this is the path that runs by default.
 MUSIC_CUDA_FORCE_DISCRETE=1 OMP_NUM_THREADS=$(nproc) bash tests/cuda_vs_cpu_bench_3d.sh
 ```
 
+> **Caveat — performance is unvalidated on real discrete hardware.** Only the
+> *correctness* of the discrete path has been verified, on GB10. Its *timing*
+> has **not** been measured on an actual discrete GPU. The forced-discrete runs
+> above still execute on GB10, where the `cudaMemcpyAsync` transfers traverse
+> the fast coherent NVLink-C2C link rather than PCIe — so their wall times are
+> **not representative** of discrete-GPU behavior and are not reported here. The
+> design avoids per-fault managed-memory migration by construction, but the
+> real PCIe-bound speedup on an A100/RTX/H100 remains to be benchmarked on that
+> hardware.
+
 ### Recommended workflow on a discrete GPU
 
 1. Build with the correct `CMAKE_CUDA_ARCHITECTURES` and run the correctness
