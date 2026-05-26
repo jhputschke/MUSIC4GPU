@@ -1673,11 +1673,12 @@ inline float gpu_zeta_over_s(float T_in_fm, constant MUSICGridParams& params) {
 // ── Make_uPiSource (port of Diss::Make_uPiSource) ────────────────────────────
 //
 // Returns the relaxation source SΠ for the bulk pressure pi_b.  Mirrors
-// the CPU formula with include_second_order_terms == 0 (so BB_term and
-// Coupling_to_Shear are zero) and zero net baryon (T(e), P(e), cs2(e)
-// taken from the rhob=0 tables).
+// the CPU formula with zero net baryon (T(e), P(e), cs2(e) from the rhob=0
+// tables).  Second-order Coupling_to_Shear term activates when
+// `params.include_second_order_terms == 1` — BB_term is unconditionally
+// zero in CPU (tau_bulkPibulkPi_coeff == 0) so it's omitted here.
 inline float gpu_uPi_source(float pi_b, float theta,
-                            float eps_src,
+                            float eps_src, float Wsigma_scalar,
                             device const float* P_tab,
                             device const float* dPde_tab,
                             device const float* T_tab,
@@ -1715,7 +1716,17 @@ inline float gpu_uPi_source(float pi_b, float theta,
     float NS_term  = -bulk_zeta * theta;
     float relax    = -pi_b - transport_coeff1 * theta * pi_b;
 
-    return (NS_term + relax) / tau_Pi;
+    // Coupling_to_Shear (second-order; CPU `transport_coeff2_s == 0`, so
+    // Shear_Shear_term ≡ 0 — we only keep the Wsigma-dependent piece).
+    float coupling_to_shear = 0.f;
+    if (params.include_second_order_terms == 1) {
+        const float lambda_bulkPipi = 8.f / 5.f;
+        float transport_coeff1_s =
+                lambda_bulkPipi * (1.f/3.f - cs2) * tau_Pi;
+        coupling_to_shear = -Wsigma_scalar * transport_coeff1_s;
+    }
+
+    return (NS_term + relax + coupling_to_shear) / tau_Pi;
 }
 
 // Dispatch on T_dependent_shear_to_s.  Mirrors get_eta_over_s() in
@@ -1748,14 +1759,22 @@ inline float gpu_eta_over_s(float T_in_fm, constant MUSICGridParams& params) {
 }
 
 // Algebraic Make_uWSource (port of Diss::Make_uWSource).
-// Returns S^{μν} = (NS_term + relaxation_term) / tau_pi.
+// Returns S^{μν} = (NS_term + relaxation_term + ... ) / tau_pi for a given
+// shear-stress index (mu, nu).
 //
-// Supports T-dependent shear viscosity (T_dep_shear_mode ∈ {0,1,2,3,11}).
-// Assumes muB_dependent_shear_to_s == 0 (entropy-based shear), no vorticity,
-// no second-order terms, no bulk coupling — host gate enforces all of these.
+// Supports T-dependent shear viscosity (T_dep_shear_mode ∈ {0,1,2,3,11})
+// and the second-order transport terms (Wsigma, WW, Coupling_to_Bulk) when
+// `params.include_second_order_terms == 1`.  Assumes
+// `muB_dependent_shear_to_s == 0` (entropy-based shear), no vorticity,
+// no baryon diffusion — host gate enforces those.
 inline float gpu_uW_source(
-        float W_mn, float sigma_mn, float theta,
-        float eps_src,
+        int mu, int nu,
+        thread const float W4[4][4],
+        thread const float s4[4][4],
+        thread const float u[4],
+        float pi_b,
+        float theta, float eps_src,
+        float Wsigma_scalar, float Wsquare,
         device const float* P_tab,
         device const float* s_tab,
         device const float* T_tab,
@@ -1773,16 +1792,69 @@ inline float gpu_uW_source(
     float tau_pi = params.shear_relax_time_factor * shear / epsP;
     tau_pi = min(10.f, max(3.f * delta_tau, tau_pi));
 
-    // delta_pipi_coeff = 4/3 — unconditional in CPU Make_uWSource (only
-    // the WW / Wsigma / Coupling_to_Bulk terms are gated on
-    // include_second_order_terms).
+    // delta_pipi_coeff = 4/3 — unconditional in CPU Make_uWSource (the
+    // higher-order Wsigma / WW / Coupling_to_Bulk terms are gated below).
     const float dpi_pi = 4.f / 3.f;
     float transport_coefficient2 = dpi_pi * tau_pi;
+
+    float W_mn      = W4[mu][nu];
+    float sigma_mn  = s4[mu][nu];
 
     float NS_term = -2.f * shear * sigma_mn;
     float relax   = -(1.f + transport_coefficient2 * theta) * W_mn;
 
-    return (NS_term + relax) / tau_pi;
+    // ── Second-order terms (Tier 3c Phase 6) ──────────────────────────────
+    // Wsigma_term and WW_term gate on `include_second_order_terms == 1`
+    // AND `Initial_profile != 0` (mirroring the CPU `if (...)` gate that
+    // sets `include_WWterm` / `include_Wsigma_term`).
+    float Wsigma_term = 0.f;
+    float WW_term     = 0.f;
+    if (params.include_second_order_terms == 1
+        && params.init_profile_zero == 0) {
+        // transport_coefficient  = phi7_coeff * tau_pi / shear * (4/5)
+        //                        = (9/70)*(4/5) * tau_pi / shear
+        const float phi7_45      = (9.f / 70.f) * (4.f / 5.f);
+        float transport_coeff_W  = phi7_45 * tau_pi / max(shear, 1.e-20f);
+        // transport_coefficient3 = tau_pipi_coeff * tau_pi = (10/7) * tau_pi
+        const float tau_pipi     = 10.f / 7.f;
+        float transport_coeff_Ws = tau_pipi * tau_pi;
+
+        float gmunu_uu  = ((mu == nu)
+                            ? ((mu == 0) ? -1.f : 1.f)
+                            : 0.f)
+                        + u[mu] * u[nu];
+
+        // Wsigma term — matches CPU term1_Wsigma + term2_Wsigma
+        float t1_Ws = (
+              -W4[mu][0]*s4[nu][0] - W4[nu][0]*s4[mu][0]
+              +W4[mu][1]*s4[nu][1] + W4[nu][1]*s4[mu][1]
+              +W4[mu][2]*s4[nu][2] + W4[nu][2]*s4[mu][2]
+              +W4[mu][3]*s4[nu][3] + W4[nu][3]*s4[mu][3]
+              ) * 0.5f;
+        float t2_Ws = -(1.f/3.f) * gmunu_uu * Wsigma_scalar;
+        Wsigma_term = -transport_coeff_Ws * (t1_Ws + t2_Ws);
+
+        // WW term — matches CPU term1_WW + term2_WW
+        float t1_WW = -W4[mu][0]*W4[nu][0]
+                     + W4[mu][1]*W4[nu][1]
+                     + W4[mu][2]*W4[nu][2]
+                     + W4[mu][3]*W4[nu][3];
+        float t2_WW = -(1.f/3.f) * gmunu_uu * Wsquare;
+        WW_term = -transport_coeff_W * (t1_WW + t2_WW);
+    }
+
+    // Coupling_to_Bulk — gates only on `include_second_order_terms == 1`.
+    // CPU has transport_coefficient2_b = 0, so the W_mn-coupled piece is
+    // omitted (Bulk_W_term ≡ 0).
+    float Coupling_to_Bulk = 0.f;
+    if (params.include_second_order_terms == 1) {
+        const float lambda_pibulkPi = 6.f / 5.f;
+        float transport_coeff_b = lambda_pibulkPi * tau_pi;
+        Coupling_to_Bulk = -pi_b * sigma_mn * transport_coeff_b;
+    }
+
+    return (NS_term + relax + Wsigma_term + WW_term + Coupling_to_Bulk)
+           / tau_pi;
 }
 
 // Algebraic Make_uWRHS geometric tail (the per-cell terms that depend on
@@ -1901,7 +1973,36 @@ kernel void gpu_first_rk_step_w_full(
     float sigma_vec[10];
     for (int m = 0; m < 10; m++) sigma_vec[m] = sigma_in[m * Ncells + c];
 
+    // σ^{μν} as a 4×4 matrix (mirrors the W4 unpacking).
+    float s4[4][4];
+    s4[0][0]=sigma_vec[0]; s4[0][1]=sigma_vec[1]; s4[0][2]=sigma_vec[2]; s4[0][3]=sigma_vec[3];
+    s4[1][0]=sigma_vec[1]; s4[1][1]=sigma_vec[4]; s4[1][2]=sigma_vec[5]; s4[1][3]=sigma_vec[6];
+    s4[2][0]=sigma_vec[2]; s4[2][1]=sigma_vec[5]; s4[2][2]=sigma_vec[7]; s4[2][3]=sigma_vec[8];
+    s4[3][0]=sigma_vec[3]; s4[3][1]=sigma_vec[6]; s4[3][2]=sigma_vec[8]; s4[3][3]=sigma_vec[9];
+
     float eps_src = (rkf == 0) ? epsilon_curr[c] : epsilon_prev[c];
+
+    // Current-cell pi_b — used by Coupling_to_Bulk in gpu_uW_source.  When
+    // bulk is disabled this is zero anyway, so the term collapses to 0.
+    float pi_c_curr = pi_b_curr[c];
+
+    // Scalar invariants (Wsigma = W^{μν} σ_{μν}, Wsquare = W^{μν} W_{μν})
+    // for the second-order terms.  Cheap once per cell; gates so we don't
+    // pay the cost when the second-order flag is off.
+    float Wsigma_scalar = 0.f;
+    float Wsquare       = 0.f;
+    if (params.include_second_order_terms == 1) {
+        Wsigma_scalar =
+              W4[0][0]*s4[0][0] + W4[1][1]*s4[1][1]
+            + W4[2][2]*s4[2][2] + W4[3][3]*s4[3][3]
+            - 2.f * (W4[0][1]*s4[0][1] + W4[0][2]*s4[0][2] + W4[0][3]*s4[0][3])
+            + 2.f * (W4[1][2]*s4[1][2] + W4[1][3]*s4[1][3] + W4[2][3]*s4[2][3]);
+        Wsquare =
+              W4[0][0]*W4[0][0] + W4[1][1]*W4[1][1]
+            + W4[2][2]*W4[2][2] + W4[3][3]*W4[3][3]
+            - 2.f * (W4[0][1]*W4[0][1] + W4[0][2]*W4[0][2] + W4[0][3]*W4[0][3])
+            + 2.f * (W4[1][2]*W4[1][2] + W4[1][3]*W4[1][3] + W4[2][3]*W4[2][3]);
+    }
 
     // ── Shear update for idx_1d in {4..8} ─────────────────────────────────
     float Wf[14];
@@ -1915,14 +2016,13 @@ kernel void gpu_first_rk_step_w_full(
         int mu  = MU_LIST[k];
         int nu  = NU_LIST[k];
         int id  = WMUNU_IDX[mu][nu];     // 4, 5, 6, 7, or 8
-        int sid = id;                    // VelocityShearVec uses same idx
 
-        float W_mn       = W4[mu][nu];
-        float sigma_mn   = sigma_vec[sid];
         float uwrhs_flux = uwrhs_in[k * Ncells + c];
 
         float SW = gpu_uW_source(
-                       W_mn, sigma_mn, theta, eps_src,
+                       mu, nu, W4, s4, u_c, pi_c_curr,
+                       theta, eps_src,
+                       Wsigma_scalar, Wsquare,
                        eos_P, eos_s, eos_T, eos_p, params, dt);
 
         float w_rhs_geom = gpu_uWRHS_geom(W4, u_c, a_loc, mu, nu,
@@ -1978,7 +2078,7 @@ kernel void gpu_first_rk_step_w_full(
                     + (-(u_c[0] * pi_c) / tau_now + theta * pi_c) * dt;
 
         // Source term (relaxation toward Navier-Stokes).
-        float SPi = gpu_uPi_source(pi_c, theta, eps_src,
+        float SPi = gpu_uPi_source(pi_c, theta, eps_src, Wsigma_scalar,
                                    eos_P, eos_dPde, eos_T, eos_p, params, dt);
 
         // RK mixing — mirrors the FirstRKStepW assembly.

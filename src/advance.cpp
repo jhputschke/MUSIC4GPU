@@ -141,6 +141,9 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     p.do_quest_revert         = (DATA.Initial_profile != 0
                                  && DATA.Initial_profile != 1) ? 1 : 0;
     p.quest_revert_strength   = static_cast<float>(DATA.quest_revert_strength);
+    // Second-order transport-term flags
+    p.include_second_order_terms = DATA.include_second_order_terms;
+    p.init_profile_zero          = (DATA.Initial_profile == 0) ? 1 : 0;
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -304,12 +307,11 @@ void Advance::AdvanceIt(const double tau,
             && gpu_finalize_active                            // ideal step + reconst on GPU
             && (DATA.viscosity_flag == 1)
             && (DATA.turn_on_shear == 1)
-            && (DATA.include_second_order_terms == 0)
             && T_dep_mode_supported
             && T_dep_bulk_supported                           // turn_on_bulk == 1 now allowed
             && (DATA.muB_dependent_shear_to_s == 0);
-        // QuestRevert (Initial_profile not in {0, 1}) is now handled by the
-        // gpu_first_rk_step_w_full kernel itself — no host-side restriction.
+        // include_second_order_terms is now honored by gpu_first_rk_step_w_full
+        // (Phase 6).  QuestRevert is handled inline by the kernel as well.
         if (gpu_w_full_active) {
             mp.dispatch_first_rk_step_w_full(gpu_grid_, gp);
         }

@@ -89,6 +89,19 @@ struct MUSICGridParams {
     // `Initial_profile != 0 && Initial_profile != 1`.
     int   do_quest_revert;
     float quest_revert_strength;   // DATA.quest_revert_strength
+
+    // Second-order transport terms (Tier 3c Phase 6).
+    //
+    //   In gpu_uW_source:
+    //     - Wsigma_term, WW_term activate when both flags are 1 (matching
+    //       CPU `include_second_order_terms == 1 && Initial_profile != 0`).
+    //     - Coupling_to_Bulk activates whenever second_order == 1.
+    //   In gpu_uPi_source:
+    //     - Coupling_to_Shear activates whenever second_order == 1.
+    //       (BB_term is unconditionally zero in CPU MUSIC because
+    //        tau_bulkPibulkPi_coeff == 0, so it's omitted on the GPU side.)
+    int include_second_order_terms;
+    int init_profile_zero;         // 1 if DATA.Initial_profile == 0
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
