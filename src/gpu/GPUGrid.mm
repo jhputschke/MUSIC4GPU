@@ -4,6 +4,9 @@
 #import <Metal/Metal.h>
 #include <cmath>
 #include <cstring>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "GPUGrid.h"
 #include "../grid.h"   // SCGrid, Cell_small
 
@@ -170,6 +173,7 @@ void GPUGrid::release() {
 
 void GPUGrid::copy_to_gpu(const SCGrid& src, GPUSnapshot& dst) const {
     const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
     for (int ieta = 0; ieta < Neta; ++ieta)
     for (int ix   = 0; ix   < Nx;   ++ix  )
     for (int iy   = 0; iy   < Ny;   ++iy  ) {
@@ -192,6 +196,7 @@ void GPUGrid::copy_to_gpu(const SCGrid& src, GPUSnapshot& dst) const {
 
 void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, SCGrid& dst) const {
     const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
     for (int ieta = 0; ieta < Neta; ++ieta)
     for (int ix   = 0; ix   < Nx;   ++ix  )
     for (int iy   = 0; iy   < Ny;   ++iy  ) {
@@ -204,8 +209,20 @@ void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, SCGrid& dst) const {
     }
 }
 
+void GPUGrid::rotate_snapshots() {
+    // GPUSnapshot is just a bundle of float* aliases into permanent Metal
+    // buffers — rotating the struct values renames the buffers' roles
+    // without touching any GPU memory.  Matches CPU arena rotation in
+    // evolve.cpp:310-317 after rk_flag = 0.
+    GPUSnapshot temp = snap_prev;
+    snap_prev   = snap_curr;
+    snap_curr   = snap_future;
+    snap_future = temp;
+}
+
 void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const {
     const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
     for (int ieta = 0; ieta < Neta; ++ieta)
     for (int ix   = 0; ix   < Nx;   ++ix  )
     for (int iy   = 0; iy   < Ny;   ++iy  ) {

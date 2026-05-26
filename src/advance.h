@@ -36,6 +36,11 @@ class Advance {
     GPUGrid    gpu_grid_;
     bool       gpu_ready_ = false;
     bool       metal_initialized_ = false;
+    // True when the previous AdvanceIt substep wrote a complete fresh state
+    // into gpu_grid_.snap_future and skipped the CPU copy-back.  The next
+    // AdvanceIt entry rotates GPU snapshots and skips the AoS→SoA upload
+    // instead of going through the CPU arena.
+    bool       gpu_state_authoritative_ = false;
     void       init_metal_if_needed(SCGrid &arena_current);
     void       make_gpu_params(double tau, int rk_flag,
                                MUSICGridParams &p) const;

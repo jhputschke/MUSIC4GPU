@@ -65,6 +65,13 @@ public:
     // pass reads them.
     void copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const;
 
+    // Rotate GPUSnapshot pointer aliases: snap_prev ← snap_curr ← snap_future
+    // ← (old snap_prev as scratch).  Matches the CPU arena rotation done in
+    // evolve.cpp after rk_flag = 0.  Avoids re-uploading primitives + Wmunu
+    // from CPU at the start of substep 1 when the previous substep already
+    // produced complete fresh state in snap_future.
+    void rotate_snapshots();
+
     // The three snapshots (prev, current, future).
     GPUSnapshot snap_prev;
     GPUSnapshot snap_curr;

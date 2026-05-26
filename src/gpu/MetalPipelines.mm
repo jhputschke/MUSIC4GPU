@@ -205,6 +205,25 @@ void MetalPipelines::wait() {
     cmd_buf_ = nullptr;
 }
 
+// ── batch_cb_ open/close ─────────────────────────────────────────────────────
+
+void MetalPipelines::begin_batch() {
+    if (!ready_ || batch_cb_) return;   // already open or not initialised
+    auto q  = (__bridge id<MTLCommandQueue>)cmd_queue_;
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    batch_cb_ = (__bridge_retained void*)cb;
+}
+
+void MetalPipelines::end_batch() {
+    if (!batch_cb_) return;
+    auto cb = (__bridge id<MTLCommandBuffer>)batch_cb_;
+    [cb commit];
+    // Transfer ownership of the retained CB to cmd_buf_ so wait() can join it.
+    if (cmd_buf_) CFRelease(cmd_buf_);
+    cmd_buf_  = batch_cb_;
+    batch_cb_ = nullptr;
+}
+
 // Reverse-lookup: given a float* that lives inside one of GPUGrid's Metal
 // shared buffers, return the corresponding MTLBuffer object.
 // On Apple Silicon the buffer's [contents] pointer IS the CPU-visible address,
@@ -246,7 +265,10 @@ void MetalPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& para
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>      cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -281,10 +303,11 @@ void MetalPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& para
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }
 
 // ── dispatch_delta_qi ─────────────────────────────────────────────────────────
@@ -305,7 +328,10 @@ void MetalPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& para
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -336,10 +362,11 @@ void MetalPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& para
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }
 
 // ── dispatch_finalize_ideal ──────────────────────────────────────────────────
@@ -360,7 +387,10 @@ void MetalPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -390,10 +420,11 @@ void MetalPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }
 
 // ── dispatch_uwrhs ───────────────────────────────────────────────────────────
@@ -413,7 +444,10 @@ void MetalPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params)
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -432,10 +466,11 @@ void MetalPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params)
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }
 
 // ── dispatch_make_du ─────────────────────────────────────────────────────────
@@ -455,7 +490,10 @@ void MetalPipelines::dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& param
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -476,10 +514,11 @@ void MetalPipelines::dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& param
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }
 
 // ── dispatch_first_rk_step_w_full ────────────────────────────────────────────
@@ -501,7 +540,10 @@ void MetalPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -540,10 +582,11 @@ void MetalPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }
 
 // ── dispatch_uprhs ───────────────────────────────────────────────────────────
@@ -563,7 +606,10 @@ void MetalPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params)
         return buffer_for_ptr(handles, n_handles, ptr);
     };
 
-    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    const bool own_cb = (batch_cb_ == nullptr);
+    id<MTLCommandBuffer> cb = own_cb
+        ? [q commandBuffer]
+        : (__bridge id<MTLCommandBuffer>)batch_cb_;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -581,8 +627,9 @@ void MetalPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params)
 
     [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
     [enc endEncoding];
-    [cb commit];
-
-    if (cmd_buf_) CFRelease(cmd_buf_);
-    cmd_buf_ = (__bridge_retained void*)cb;
+    if (own_cb) {
+        [cb commit];
+        if (cmd_buf_) CFRelease(cmd_buf_);
+        cmd_buf_ = (__bridge_retained void*)cb;
+    }
 }

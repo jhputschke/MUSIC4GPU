@@ -74,6 +74,13 @@ public:
     // Block until all pending GPU work is done.
     void wait();
 
+    // Batch mode: while a batch is open, all dispatch_* calls share a single
+    // command buffer (one commit, one wait).  Saves N-1 command-buffer
+    // allocations + commits per substep.  Outside a batch the dispatch_*
+    // methods retain their legacy one-buffer-per-dispatch behavior.
+    void begin_batch();
+    void end_batch();
+
 private:
     MetalPipelines() = default;
     ~MetalPipelines();
@@ -92,4 +99,5 @@ private:
     void*  pso_w_full_    = nullptr;  // id<MTLComputePipelineState>
     void*  pso_uprhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
+    void*  batch_cb_      = nullptr;  // open batch id<MTLCommandBuffer>, or null
 };

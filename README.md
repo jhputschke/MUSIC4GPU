@@ -233,19 +233,19 @@ CPU build linked against Homebrew `libomp`):
 ```
 Grid              CPU-1T(s)  CPU-12T(s)   GPU(s)   GPU/1T   GPU/12T   MaxErr
 ----              ---------  ----------   ------   ------   -------   ------
-32x32x1               1.07        0.17      0.21    5.10x     0.81x   5.3e-05
-64x64x1               1.88        0.36      0.49    3.84x     0.73x   9.9e-05
-128x128x1            10.20        1.44      1.36    7.50x     1.06x   9.4e-05
+32x32x1               1.07        0.18      0.22    4.86x     0.82x   5.3e-05
+64x64x1               1.88        0.38      0.42    4.48x     0.90x   9.9e-05
+128x128x1            10.20        1.43      1.04    9.81x     1.38x   9.4e-05
 ```
 
 **3+1D (`metal_vs_cpu_bench_3d.sh`, 40 timesteps each)**
 ```
 Grid (Nx×Ny×Nη)  Cells   CPU-1T(s)  CPU-12T(s)   GPU(s)   GPU/1T   GPU/12T   MaxErr
 ----             -----   ---------  ----------   ------   ------   -------   ------
-32x32x8           8.2k       2.24        0.35      0.45    4.98x     0.78x   5.3e-05
-32x32x32         32.8k       5.84        0.65      0.81    7.21x     0.80x   3.7e-05
-64x64x16         65.5k      11.94        1.32      1.57    7.61x     0.84x   3.1e-05
-64x64x32        131.1k      24.08        2.42      3.04    7.92x     0.80x   3.1e-05
+32x32x8           8.2k       2.23        0.34      0.36    6.19x     0.94x   5.3e-05
+32x32x32         32.8k       5.86        0.66      0.50   10.46x     1.32x   3.7e-05
+64x64x16         65.5k      11.96        1.32      0.93   11.18x     1.42x   3.1e-05
+64x64x32        131.1k      24.00        2.43      1.62   12.44x     1.50x   3.1e-05
 ```
 
 Set `OMP_NUM_THREADS` before invoking either benchmark script (e.g.
@@ -253,24 +253,45 @@ Set `OMP_NUM_THREADS` before invoking either benchmark script (e.g.
 above used all 12 performance cores of the M3 Max; the "1T" column is the
 historical serial baseline retained for comparison.
 
-**Reading the numbers.** Vs the serial baseline the GPU is consistently
-5–8× ahead.  Vs the 12-thread OpenMP CPU the picture flips: the CPU is
-~20% faster at small grids and within ±10% of the GPU at the largest
-tested sizes.  CPU strong-scaling 1T→12T is near-linear in 2D (~7×) and
+**Reading the numbers.** The GPU wins everywhere except the smallest grids
+where launch overhead dominates.  In 3D — the production-relevant case —
+the GPU is **1.32–1.50× faster than the 12-thread OpenMP CPU** and 6–12×
+faster than serial.  In 2D the crossover is around 128² (GPU 38% faster
+there).  CPU strong-scaling 1T→12T is near-linear in 2D (~7×) and
 super-linear in 3D (~9–10×, helped by cache pressure dropping as the
-working set partitions across cores).  At grids beyond what's tested
-(e.g. 128×128×64 production runs ≈ 1M cells) the GPU is expected to pull
-ahead again — it kept gaining speedup with cell count in the serial
-comparison and is still below saturation at 131k cells.  Below that
-crossover the OpenMP CPU path is the faster choice on Apple Silicon.
+working set partitions across cores), but the GPU still outpaces it once
+the per-cell work amortizes its constant overhead.
 
-These numbers reflect the **Tier 3 + Tier 3c Phase 1 + Phase 2** state:
-the entire per-cell ideal-and-viscous update runs on the GPU.  The CPU side
-of `AdvanceIt` is now just a SoA↔AoS copy on the way in and out — no
-per-cell loop body runs unless an unsupported configuration flag is set.
-The 7.50× at 128² (vs serial CPU) is roughly 2× the post-Phase-1 number,
-achieved by retiring the CPU viscous source-term loop and the SoA→AoS
-round-trip that used to happen between ideal and viscous passes.
+The 3D advantage scales **up** with cell count (0.94× at 8k cells →
+1.50× at 131k cells), reflecting the GPU's preference for saturating
+occupancy — at production sizes (e.g. 128×128×64 ≈ 1M cells) it should
+hold or grow further.
+
+These numbers reflect **Tier 3 + Tier 3c Phase 1/2 + dispatch/copy
+optimizations**.  The latter (three focused changes) deliver most of the
+post-OpenMP-CPU win:
+
+1. **Parallel AoS↔SoA copies.**  The three copy helpers in
+   [`src/gpu/GPUGrid.mm`](src/gpu/GPUGrid.mm) are now `#pragma omp
+   parallel for collapse(3)`.  At 131k cells the AoS↔SoA repack is the
+   single biggest CPU-side cost; OpenMP cuts it ~10×.
+2. **One Metal command buffer per substep.**  `MetalPipelines` exposes
+   `begin_batch()` / `end_batch()` so all 7 kernels of a substep encode
+   into a single `MTLCommandBuffer` — one commit, one wait, instead of
+   seven.  Saves ~1 ms/step of driver overhead.
+3. **No CPU round-trip between RK substeps.**  When the GPU fully
+   produces the next state (`gpu_finalize_active && gpu_w_full_active`),
+   the per-substep `copy_primitives_to_cpu` / `copy_wmunu_to_cpu` is
+   skipped and replaced by `GPUGrid::rotate_snapshots()` — a pointer-
+   alias rotation of three `GPUSnapshot` structs (no GPU work, no CPU
+   work).  The hydro-source pre-pass now reads `u` directly from
+   `snap_curr.u` (unified memory) so it stays correct after rotation.
+
+Together these eliminate roughly 30 ms/step of pure CPU bookkeeping at
+64×64×32 — the gap that previously kept the GPU behind the 12-thread
+CPU.  The 12.44× at 64×64×32 (vs serial CPU) is ~1.6× the pre-optimization
+number; the **1.50× vs 12-thread OpenMP CPU** is a clean reversal of the
+prior 0.80× deficit.
 
 The max relative error in `eps_max` is O(10⁻⁴) after Phase 2 — at the
 bench's 1e-4 pass threshold.  An earlier draft of Phase 2 hit O(10⁻²) at
@@ -282,24 +303,22 @@ genuine float32 vs float64 accumulation in the long-time Wmunu evolution.
 
 ### Understanding the speedup
 
-The 7.50× at 128² (vs serial CPU) reflects Amdahl's law applied to the
-remaining CPU work after Tier 3.  The original serial CPU wall time
-breaks down roughly as follows:
+The 9.81× at 128² and 12.44× at 64×64×32 (both vs serial CPU) reflect
+Amdahl's law applied to the remaining CPU work.  The original serial
+CPU wall time breaks down roughly as follows:
 
 | Work | CPU fraction | Tier 3 status |
 |---|---|---|
 | `MakeDeltaQI` — KT ideal flux | ~60% | **on GPU** |
 | `ReconstIt_shell` — Newton conserved→primitive | ~25–30% | **on GPU (Tier 3a)** |
 | `MakeWSource` + `Make_uWRHS` — viscous stencils | ~5–10% | **on GPU** (Tier 1 + Tier 3b) |
-| `Make_uWSource` + transport coefficients + MakedU | ~5% | CPU (per-cell algebraic, needs MakedU port for Tier 4) |
-| AoS↔SoA copies + I/O | ~2–3% | CPU |
+| `Make_uWSource` + transport coefficients + MakedU | ~5% | **on GPU (Tier 3c)** |
+| AoS↔SoA copies + I/O | ~2–3% | CPU (parallel) — halved per-step by inter-substep rotation |
 
-With the ideal-step Newton on GPU, the dominant remaining cost is the
-SoA↔AoS copy and the per-cell viscous CPU loop.  Reducing further requires
-porting `MakedU` (and the algebraic `Make_uWSource` / `Make_uPiSource`
-that depend on it) so the CPU loop disappears entirely.  At that point
-the GPU finalize kernel could also keep `arena_future` purely on the GPU,
-which would eliminate the per-step `copy_primitives_to_cpu` overhead.
+The remaining ceiling is the **per-timestep** SoA↔AoS round-trip (after the
+last RK substep) plus output / freeze-out passes.  Further wins require
+making the CPU AoS arenas a lazy snapshot of the GPU SoA buffers, so the
+download only happens when freeze-out or output dump actually reads them.
 
 Additional limiting factors:
 

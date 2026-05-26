@@ -208,9 +208,17 @@ void Advance::AdvanceIt(const double tau,
     bool         gpu_du_active       = false;
     bool         gpu_w_full_active   = false;
     if (gpu_ready_) {
-        // Copy arena_current and arena_prev into GPU SoA buffers (AoS→SoA).
-        gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
-        gpu_grid_.copy_to_gpu(arena_prev,    gpu_grid_.snap_prev);
+        // If the previous substep produced complete fresh state on the GPU
+        // and skipped the CPU copy-back, rotate snapshot pointer aliases
+        // (snap_prev ← snap_curr ← snap_future) and skip the AoS→SoA
+        // upload entirely.  Otherwise fall back to the standard upload path.
+        if (gpu_state_authoritative_) {
+            gpu_grid_.rotate_snapshots();
+            gpu_state_authoritative_ = false;
+        } else {
+            gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
+            gpu_grid_.copy_to_gpu(arena_prev,    gpu_grid_.snap_prev);
+        }
 
         MUSICGridParams gp;
         make_gpu_params(tau, rk_flag, gp);
@@ -229,6 +237,7 @@ void Advance::AdvanceIt(const double tau,
             const int Ncells = Nx * Ny * Neta;
             float* src_buf   = gpu_grid_.qi_source_buf;
             const int rhob_on = gp.has_rhob_source;
+            const float* u_soa = gpu_grid_.snap_curr.u;   // fresh after copy or rotate
 
             #pragma omp parallel for collapse(3) schedule(guided)
             for (int ieta = 0; ieta < Neta; ieta++)
@@ -240,7 +249,9 @@ void Advance::AdvanceIt(const double tau,
                 const int cell = Nx * (Ny * ieta + iy) + ix;
 
                 EnergyFlowVec j_mu = {0.};
-                FlowVec u_local = arena_current(ix, iy, ieta).u;
+                FlowVec u_local;
+                for (int m = 0; m < 4; ++m)
+                    u_local[m] = static_cast<double>(u_soa[m * Ncells + cell]);
                 hydro_source_terms_ptr->get_hydro_energy_source(
                         tau_rk, xl, yl, eta_s, u_local, j_mu);
                 for (int alpha = 0; alpha < 4; alpha++) {
@@ -262,6 +273,10 @@ void Advance::AdvanceIt(const double tau,
         gpu_finalize_active = true;  // hydro source now handled on GPU side
 
         auto& mp = MetalPipelines::instance();
+        // One command buffer per substep: all kernels encode into the same
+        // buffer, single commit + single wait.  Saves ~6 command-buffer
+        // allocations and round-trips through the Metal driver per substep.
+        mp.begin_batch();
         mp.dispatch_w_source(gpu_grid_, gp);
         mp.dispatch_delta_qi(gpu_grid_, gp);
         if (gpu_finalize_active) {
@@ -315,18 +330,33 @@ void Advance::AdvanceIt(const double tau,
         if (gpu_w_full_active) {
             mp.dispatch_first_rk_step_w_full(gpu_grid_, gp);
         }
-        mp.wait();   // synchronize – on Apple Silicon this is near-zero cost
+        mp.end_batch();   // single commit for all kernels in this substep
+        mp.wait();        // synchronize – on Apple Silicon this is near-zero cost
 
         gpu_dwmn = gpu_grid_.dwmn;   // CPU-readable (unified memory)
 
-        if (gpu_finalize_active) {
+        // snap_future has a complete authoritative state when ideal + viscous
+        // are both on the GPU (or viscosity is off).  In that case, if there
+        // is another RK substep coming, skip the SoA→AoS copy-back entirely:
+        // the next AdvanceIt entry will rotate snapshots and consume
+        // snap_future directly.  CPU paths that read primitives between
+        // substeps (e.g. the hydro-source pre-pass) already read from
+        // snap_curr instead of arena_current.
+        const bool snap_future_complete =
+               gpu_finalize_active
+            && (DATA.viscosity_flag == 0 || gpu_w_full_active);
+        const bool is_last_substep =
+               (rk_flag == DATA.rk_order - 1);
+        gpu_state_authoritative_ = snap_future_complete && !is_last_substep;
+
+        if (!gpu_state_authoritative_ && gpu_finalize_active) {
             // Propagate post-Newton primitives into arena_future for the
             // subsequent CPU viscous pass (or just for output if both passes
             // are on the GPU).
             gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future,
                                              arena_future);
         }
-        if (gpu_w_full_active) {
+        if (!gpu_state_authoritative_ && gpu_w_full_active) {
             // Propagate GPU-computed Wmunu + pi_b into arena_future so the
             // rest of evolve.cpp (output / freeze-out / next RK substep) can
             // consume them.
