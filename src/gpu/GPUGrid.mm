@@ -68,6 +68,11 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
                              buf_handles_, n_handles_);
     ok = ok && (qi_out != nullptr);
 
+    uwrhs_out = alloc_metal_buf(g_metal_device,
+                                5 * static_cast<size_t>(Ncells_) * sizeof(float),
+                                buf_handles_, n_handles_);
+    ok = ok && (uwrhs_out != nullptr);
+
     allocated_ = ok;
     return ok;
 }
@@ -105,10 +110,11 @@ void GPUGrid::release() {
     n_handles_ = 0;
     allocated_ = false;
     snap_prev = snap_curr = snap_future = GPUSnapshot{};
-    dwmn    = nullptr;
-    qi_out  = nullptr;
-    eos_P   = nullptr;
-    eos_dPde = nullptr;
+    dwmn      = nullptr;
+    qi_out    = nullptr;
+    uwrhs_out = nullptr;
+    eos_P     = nullptr;
+    eos_dPde  = nullptr;
     eos_params = {};
 }
 
@@ -147,5 +153,20 @@ void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, SCGrid& dst) const {
         cell.pi_b = static_cast<double>(src.pi_b[c]);
         for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
             cell.Wmunu[m] = static_cast<double>(src.Wmunu[m * Ncells_ + c]);
+    }
+}
+
+void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const {
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+        auto& cell = dst(ix, iy, ieta);
+
+        cell.epsilon = static_cast<double>(src.epsilon[c]);
+        cell.rhob    = static_cast<double>(src.rhob[c]);
+        for (int m = 0; m < GPU_U_COMPS; ++m)
+            cell.u[m] = static_cast<double>(src.u[m * Ncells_ + c]);
     }
 }

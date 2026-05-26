@@ -47,6 +47,15 @@ class Diss {
                    const int mu, const int nu, double &w_rhs,
                    const double theta_local, const DumuVec &a_local);
 
+    // Algebraic / geometric tail of Make_uWRHS only (the per-cell terms that
+    // depend on grid_pt, theta_local, a_local — no neighbor data).  Returns
+    // the value to be added to w_rhs after the stencil flux divergence has
+    // already been supplied (e.g. from a GPU pre-pass).
+    double Make_uWRHS_geom(const double tau, const Cell_small &grid_pt,
+                           const int mu, const int nu,
+                           const double theta_local,
+                           const DumuVec &a_local) const;
+
     int Make_uPRHS(const double tau, SCGrid &arena,
                    const int ix, const int iy, const int ieta,
                    double *p_rhs, const double theta_local);

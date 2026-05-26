@@ -145,10 +145,11 @@ code falls back to the CPU path with a warning and continues normally.
 | Kernel | Source | Status |
 |---|---|---|
 | `gpu_make_w_source` | `Diss::MakeWSource()` in `src/dissipative.cpp` | **Ported** — runs on GPU every RK stage |
-| `gpu_first_rk_step_w` | `Advance::FirstRKStepW()` in `src/advance.cpp` | Preliminary (flux RHS still on CPU) |
 | `gpu_make_delta_qi` | `Advance::MakeDeltaQI()` in `src/advance.cpp` | **Ported (Tier 2)** — see EOS caveat below |
-| `ReconstIt_velocity_Newton` | `src/reconst.cpp` | Permanent CPU — drives final Newton solve after GPU ideal step |
+| `gpu_finalize_ideal` | `Reconst::ReconstIt_shell()` + RK mixing in `Advance::FirstRKStepT()` | **Ported (Tier 3a)** — final Newton solve runs on GPU; the per-cell CPU loop body for the ideal step is gone |
+| `gpu_make_uwrhs` | stencil portion of `Diss::Make_uWRHS()` in `src/dissipative.cpp` | **Ported (Tier 3b)** — KT flux divergence of `u^a W^{mu nu}` for the 5 shear indices; per-cell geometric tail (`Diss::Make_uWRHS_geom`) stays on CPU since it depends on `theta` and `Du^mu` from `MakedU` |
 | Freeze-out / Cornelius | `src/freeze_pseudo.cpp` | Permanent CPU — irregular geometry |
+| `MakedU`, `Make_uWSource`, `Make_uPRHS`, `Make_uPiSource` | `src/u_derivative.cpp`, `src/dissipative.cpp` | CPU (Tier 3 remainder); `MakedU` is a pre-requisite for porting the rest of `FirstRKStepW` |
 
 #### EOS caveat for `gpu_make_delta_qi`
 
@@ -207,43 +208,53 @@ Example output (Apple M3 Max, 100 steps, `Delta_Tau=0.005`, both binaries built 
 ```
 Grid                   CPU(s)   GPU(s)  Speedup   MaxErr
 ----                   ------   ------  -------   ------
-32x32x1                 0.56s    0.40s    1.40x  8.5e-06
-64x64x1                 2.00s    1.27s    1.57x  5.3e-06
-128x128x1              10.69s    4.73s    2.26x  5.5e-06
+32x32x1                 0.90s    0.42s    2.14x  8.7e-06
+64x64x1                 1.91s    1.03s    1.85x  4.8e-06
+128x128x1              10.27s    3.45s    2.98x  5.5e-06
 ```
 
-These numbers reflect the **Tier 2** state (both `MakeWSource` and `MakeDeltaQI` offloaded).
-The max relative error in `eps_max` is O(10⁻⁶), consistent with float32 arithmetic in the
-GPU flux kernels feeding into the float64 Newton reconstruction on the CPU.
+These numbers reflect the **Tier 3** state: `MakeWSource`, `MakeDeltaQI`,
+`ReconstIt_shell` (final Newton solve), and the `Make_uWRHS` stencil are all
+on the GPU.  The per-cell CPU loop body for the ideal step has been
+eliminated — only the viscous source terms (`Make_uWSource`, `Make_uPiSource`)
+remain on the CPU, since they depend on `theta` and `Du^mu` from `MakedU`.
+
+The max relative error in `eps_max` is O(10⁻⁶), consistent with float32
+arithmetic in the GPU flux kernels feeding into the float32 Newton
+reconstruction on the GPU (which is then cast back to float64 in the AoS
+`arena_future` for the CPU viscous pass).
 
 ### Understanding the speedup
 
-The 2.26× at 128² is the expected result given Amdahl's law.  The original CPU-only wall
-time breaks down roughly as follows:
+The 2.98× at 128² reflects Amdahl's law applied to the remaining CPU work.
+The original CPU-only wall time breaks down roughly as follows:
 
-| Work | CPU fraction | Tier 2 status |
+| Work | CPU fraction | Tier 3 status |
 |---|---|---|
 | `MakeDeltaQI` — KT ideal flux | ~60% | **on GPU** |
-| `ReconstIt_shell` — Newton conserved→primitive | ~25–30% | permanent CPU |
-| `MakeWSource` + `FirstRKStepW` — viscous sector | ~10% | on GPU (Tier 1) |
-| Source terms, I/O, other | ~5% | CPU |
+| `ReconstIt_shell` — Newton conserved→primitive | ~25–30% | **on GPU (Tier 3a)** |
+| `MakeWSource` + `Make_uWRHS` — viscous stencils | ~5–10% | **on GPU** (Tier 1 + Tier 3b) |
+| `Make_uWSource` + transport coefficients + MakedU | ~5% | CPU (per-cell algebraic, needs MakedU port for Tier 4) |
+| AoS↔SoA copies + I/O | ~2–3% | CPU |
 
-If `ReconstIt_shell` takes ~2.7 s of the original 10.7 s and all other work
-collapses to zero, the theoretical ceiling is 10.7/2.7 ≈ **4×**.  The observed
-2.26× falls below that ceiling for two additional reasons:
+With the ideal-step Newton on GPU, the dominant remaining cost is the
+SoA↔AoS copy and the per-cell viscous CPU loop.  Reducing further requires
+porting `MakedU` (and the algebraic `Make_uWSource` / `Make_uPiSource`
+that depend on it) so the CPU loop disappears entirely.  At that point
+the GPU finalize kernel could also keep `arena_future` purely on the GPU,
+which would eliminate the per-step `copy_primitives_to_cpu` overhead.
+
+Additional limiting factors:
 
 1. **Grid too small to saturate the GPU.**  128×128×1 has only 16 384 cells.
    A production 3D run (e.g., 128×128×50) has 50× more independent cells and
    much better GPU occupancy.
 
-2. **Divergent Newton iteration inside `gpu_make_delta_qi`.**  The `gpu_reconst`
-   helper runs up to 60 Newton-Brent iterations per thread.  Cells with different
-   velocities and energy densities converge at different rates, causing SIMD
+2. **Divergent Newton iteration inside `gpu_make_delta_qi` and
+   `gpu_finalize_ideal`.**  The `gpu_reconst` helper runs up to 60
+   Newton-Brent iterations per thread.  Cells with different velocities
+   and energy densities converge at different rates, causing SIMD
    divergence and reducing effective throughput.
-
-The main Tier 3 target is porting `ReconstIt_shell` to the GPU (it uses the same
-Newton-Brent solver already implemented as `gpu_reconst`), which would eliminate
-the dominant remaining CPU bottleneck.
 
 ---
 
@@ -256,19 +267,20 @@ the dominant remaining CPU bottleneck.
 | [`CMakeLists.txt`](CMakeLists.txt) | Added `OBJCXX` to `LANGUAGES`; added `option(USE_METAL ...)` |
 | [`src/CMakeLists.txt`](src/CMakeLists.txt) | Metal source files, `xcrun` build commands for `.metallib`, `-framework Metal/Foundation` |
 | [`src/grid.h`](src/grid.h) | Added `const` overloads for `get()` and `getHalo()` (required by `copy_to_gpu(const SCGrid&)`) |
-| [`src/advance.h`](src/advance.h) | `#ifdef USE_METAL` guard; added `GPUGrid gpu_grid_`, `init_metal_if_needed()`, `make_gpu_params()`; extended `FirstRKStepT` signature with `gpu_qi_base` |
-| [`src/advance.cpp`](src/advance.cpp) | `init_metal_if_needed()` (+ EOS table sampling), `make_gpu_params()` (+ `minmod_theta`), double-dispatch in `AdvanceIt()`, GPU result reads in `FirstRKStepT()` for both dwmn and qi |
+| [`src/advance.h`](src/advance.h) | `#ifdef USE_METAL` guard; added `GPUGrid gpu_grid_`, `init_metal_if_needed()`, `make_gpu_params()` (now takes `rk_flag` + `tau_orig`); extended `FirstRKStepT` and `FirstRKStepW` signatures with GPU base pointers |
+| [`src/advance.cpp`](src/advance.cpp) | `init_metal_if_needed()` (+ EOS table sampling), `make_gpu_params()` fills `rk_flag` / `tau_orig`, quad-dispatch (`w_source` + `delta_qi` + `finalize_ideal` + `uwrhs`) in `AdvanceIt()`, batch `copy_primitives_to_cpu` after wait, CPU `FirstRKStepT` skipped when GPU finalize is active, `FirstRKStepW` consumes the GPU `uwrhs` flux |
+| [`src/dissipative.h`/`.cpp`](src/dissipative.h) | Added `Diss::Make_uWRHS_geom()` — the per-cell algebraic/geometric tail of `Make_uWRHS`, used after the GPU stencil pre-pass |
 
 ### New GPU files added
 
 | File | Purpose |
 |---|---|
-| [`src/gpu/gpu_types.h`](src/gpu/gpu_types.h) | `MUSICGridParams` (+ `minmod_theta`), `GPUEosParams`, `WMUNU_IDX` — shared between C++ host and Metal shaders |
-| [`src/gpu/GPUGrid.h`](src/gpu/GPUGrid.h) | `GPUSnapshot` / `GPUGrid` — SoA Metal shared buffers; added `eos_P`, `eos_dPde`, `qi_out` fields and `upload_eos()` |
-| [`src/gpu/GPUGrid.mm`](src/gpu/GPUGrid.mm) | `GPUGrid` implementation — buffer allocation, AoS↔SoA copy, `upload_eos()` |
-| [`src/gpu/MetalPipelines.h`](src/gpu/MetalPipelines.h) | Singleton `MetalPipelines` — device, queue, PSO objects; added `dispatch_delta_qi()` |
-| [`src/gpu/MetalPipelines.mm`](src/gpu/MetalPipelines.mm) | `MetalPipelines` implementation — library loading, PSO creation for both kernels, `dispatch_delta_qi()` |
-| [`src/gpu/music_kernels.metal`](src/gpu/music_kernels.metal) | MSL compute kernels: `gpu_make_w_source`, `gpu_first_rk_step_w`, `gpu_make_delta_qi` |
+| [`src/gpu/gpu_types.h`](src/gpu/gpu_types.h) | `MUSICGridParams` (+ `minmod_theta`, `rk_flag`, `tau_orig`), `GPUEosParams`, `WMUNU_IDX` — shared between C++ host and Metal shaders |
+| [`src/gpu/GPUGrid.h`](src/gpu/GPUGrid.h) | `GPUSnapshot` / `GPUGrid` — SoA Metal shared buffers; `eos_P`, `eos_dPde`, `qi_out`, `uwrhs_out` fields; `upload_eos()`, `copy_primitives_to_cpu()` |
+| [`src/gpu/GPUGrid.mm`](src/gpu/GPUGrid.mm) | `GPUGrid` implementation — buffer allocation, AoS↔SoA copy, primitives SoA→AoS, `upload_eos()` |
+| [`src/gpu/MetalPipelines.h`](src/gpu/MetalPipelines.h) | Singleton `MetalPipelines` — device, queue, PSO objects; `dispatch_w_source`, `dispatch_delta_qi`, `dispatch_finalize_ideal`, `dispatch_uwrhs` |
+| [`src/gpu/MetalPipelines.mm`](src/gpu/MetalPipelines.mm) | `MetalPipelines` implementation — library loading, PSO creation for all four kernels, all four dispatch helpers |
+| [`src/gpu/music_kernels.metal`](src/gpu/music_kernels.metal) | MSL compute kernels: `gpu_make_w_source`, `gpu_first_rk_step_w` (placeholder, unused), `gpu_make_delta_qi`, `gpu_finalize_ideal`, `gpu_make_uwrhs` |
 
 ### Test and benchmark files
 
@@ -284,14 +296,16 @@ the dominant remaining CPU bottleneck.
 The following items remain before the GPU backend can run a full timestep
 without CPU involvement.
 
-### Tier 3 — complete GPU timestep (no CPU involvement per cell)
+### Tier 3 — complete GPU timestep (partially done)
 
-| Task | Blocker | Notes |
+| Task | Status | Notes |
 |---|---|---|
-| Port `Make_uWRHS` stencil into `gpu_first_rk_step_w` | Currently the flux divergence of uWmunu is computed on the CPU inside `FirstRKStepW` and passed as a buffer placeholder | Stencil pattern is straightforward; only η-direction geometric terms need care |
-| Eliminate per-cell CPU loop in `AdvanceIt` | `FirstRKStepT` still loops over cells to read GPU qi, apply source terms, and call `ReconstIt_shell` | Requires porting `ReconstIt_shell` (final Newton solve) and source-term application to the GPU |
-| Port `ReconstIt_shell` | Iterative Newton-Brent solver; same algorithm as the half-cell solve already implemented in `gpu_make_delta_qi` | Can reuse `gpu_reconst()` helper from `music_kernels.metal` with an additional write-back pass |
-| Port baryon diffusion (`MakedU` + diffusion flux) | Currently computed entirely on CPU | Requires gradient of µ_B/T on the GPU |
+| Port `ReconstIt_shell` | **Done (Tier 3a)** | `gpu_finalize_ideal` runs the final Newton solve on the GPU and writes `snap_future.{epsilon, rhob, u}` directly |
+| Eliminate per-cell CPU loop for the ideal step | **Done (Tier 3a)** | `FirstRKStepT` is no longer called when GPU finalize is active; primitives are batch-copied back via `copy_primitives_to_cpu` |
+| Port `Make_uWRHS` stencil | **Done (Tier 3b)** | `gpu_make_uwrhs` writes the KT flux divergence for the 5 shear indices; CPU still applies `Make_uWRHS_geom` (per-cell algebraic / geometric tail) since it needs `theta` and `Du^mu` from `MakedU` |
+| Port `MakedU` + algebraic viscous source terms (`Make_uWSource`, `Make_uPiSource`) | **TODO** | Required to retire the per-cell CPU viscous loop and the SoA↔AoS copy round-trip; needs `theta`, `Du^mu`, `sigma`, `omega` and transport-coefficient lookups on GPU |
+| Hydro-source path (`flag_add_hydro_source == true`) | **TODO** | Currently falls back to the CPU `FirstRKStepT` (with GPU-computed `dwmn`/`qi` still consumed); needs per-cell source upload as a GPU buffer |
+| Port baryon diffusion (`MakedU` + diffusion flux) | **TODO** | Currently computed entirely on CPU; requires the gradient of µ_B/T on the GPU |
 
 ### Tier 4 — finite-muB EOS on GPU
 

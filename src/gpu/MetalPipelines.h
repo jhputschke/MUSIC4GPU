@@ -34,6 +34,20 @@ public:
     // Non-blocking: call wait() to ensure completion.
     void dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& params);
 
+    // Dispatch gpu_make_uwrhs over the full grid.
+    // Reads gpu.snap_curr.Wmunu and gpu.snap_curr.u; writes
+    // uwrhs_out[5 * Ncells] into gpu.uwrhs_out (one entry per shear index
+    // 4..8 per cell).  Non-blocking; sync with wait().
+    void dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params);
+
+    // Dispatch gpu_finalize_ideal over the full grid.
+    // Reads qi_out + dwmn (already produced by the two kernels above), the
+    // current and previous snapshots, and the EOS tables; writes the
+    // post-Newton primitives (epsilon, rhob, u) into gpu.snap_future.
+    // Must be called after dispatch_w_source AND dispatch_delta_qi for the
+    // same RK step; non-blocking, sync with wait().
+    void dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams& params);
+
     // Block until all pending GPU work is done.
     void wait();
 
@@ -49,5 +63,7 @@ private:
     void*  library_       = nullptr;  // id<MTLLibrary>
     void*  pso_w_source_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_delta_qi_  = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_finalize_  = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_uwrhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
 };

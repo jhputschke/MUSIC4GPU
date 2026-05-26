@@ -25,13 +25,15 @@ struct MUSICGridParams {
     float delta_y;
     float delta_eta;
     float delta_tau;
-    float tau;            // current tau (rk-corrected)
+    float tau;            // current tau (rk-corrected) = tau_orig + rk_flag*delta_tau
     int   boost_invariant;
     int   turn_on_bulk;
     int   turn_on_diff;   // baryon diffusion flag
     float cosh_deta;      // precomputed geometric factor
     float sinh_deta;      // precomputed geometric factor
     float minmod_theta;   // flux limiter parameter (used by gpu_make_delta_qi)
+    int   rk_flag;        // RK sub-step index (0 or 1); used by gpu_finalize_ideal
+    float tau_orig;       // tau at the start of this RK step (un-shifted)
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.

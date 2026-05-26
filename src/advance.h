@@ -37,7 +37,8 @@ class Advance {
     bool       gpu_ready_ = false;
     bool       metal_initialized_ = false;
     void       init_metal_if_needed(SCGrid &arena_current);
-    void       make_gpu_params(double tau_rk, MUSICGridParams &p) const;
+    void       make_gpu_params(double tau, int rk_flag,
+                               MUSICGridParams &p) const;
 #endif
 
  public:
@@ -63,6 +64,12 @@ class Advance {
                       const float* gpu_qi_base   = nullptr,
                       int Ncells = 0);
 
+    // gpu_uwrhs_base (optional): pointer to the first idx-component of the
+    // GPU-computed Make_uWRHS stencil flux for the current cell, layout
+    // [k * Ncells + cell] with k = idx_1d - 4 (k in [0..4] for the 5 shear
+    // indices).  If non-null, FirstRKStepW reads the flux part from this
+    // buffer and only computes the per-cell geometric / algebraic tail on
+    // the CPU.  Pass nullptr to fall back to Diss::Make_uWRHS().
     void FirstRKStepW(const double tau_it, SCGrid &arena_prev,
                       SCGrid &arena_current, SCGrid &arena_future,
                       const int rk_flag, const double theta_local,
@@ -70,7 +77,9 @@ class Advance {
                       const VelocityShearVec &sigma_local,
                       const VorticityVec &omega_local,
                       const DmuMuBoverTVec &baryon_diffusion_vector,
-                      const int ieta, const int ix, const int iy);
+                      const int ieta, const int ix, const int iy,
+                      const float* gpu_uwrhs_base = nullptr,
+                      int Ncells = 0);
 
     void UpdateTJbRK(const ReconstCell &grid_rk, Cell_small &grid_pt);
     void QuestRevert(const double tau, Cell_small *grid_pt,

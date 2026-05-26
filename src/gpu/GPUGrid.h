@@ -59,6 +59,12 @@ public:
     // Only Wmunu and pi_b are written back; epsilon/rhob/u stay on CPU.
     void copy_wmunu_to_cpu(const GPUSnapshot& src, SCGrid& dst) const;
 
+    // Copy the primitive variables (epsilon, rhob, u) from a GPUSnapshot into
+    // an SCGrid (AoS double).  Used after gpu_finalize_ideal to propagate the
+    // GPU-reconstructed primitives into arena_future before the CPU viscous
+    // pass reads them.
+    void copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const;
+
     // The three snapshots (prev, current, future).
     GPUSnapshot snap_prev;
     GPUSnapshot snap_curr;
@@ -75,6 +81,11 @@ public:
 
     // Output buffer: qi_out[5 * Ncells] produced by gpu_make_delta_qi.
     float* qi_out = nullptr;
+
+    // Output buffer: uwrhs_out[5 * Ncells] produced by gpu_make_uwrhs.
+    // Layout: [out_idx * Ncells + cell] where out_idx 0..4 maps to the 5
+    // shear-stress indices idx_1d = {4, 5, 6, 7, 8}.
+    float* uwrhs_out = nullptr;
 
     // Upload a pre-sampled EOS table (both P and dP/de) to GPU shared memory.
     // Must be called after allocate() and before the first dispatch_delta_qi.

@@ -859,3 +859,245 @@ kernel void gpu_make_delta_qi(
     for (int alpha = 0; alpha < 5; alpha++)
         qi_out[alpha * Ncells + c] = qi[alpha] + rhs[alpha];
 }
+
+// ── gpu_finalize_ideal ────────────────────────────────────────────────────────
+//
+// Performs the final per-cell ideal RK update on the GPU, replacing the CPU
+// loop body in Advance::FirstRKStepT().  For each cell:
+//   1. qi[alpha] = qi_buf[alpha]                              // (from gpu_make_delta_qi)
+//                  - dwmn_buf[alpha] * delta_tau              // (from gpu_make_w_source)
+//                  + rk_flag * tau_orig * T^{alpha,0}(prev)   // RK mixing term
+//   2. qi[alpha] *= 1 / (1 + rk_flag)
+//   3. Reconst at tau_next = tau_orig + delta_tau using the same Newton-Brent
+//      solve already used inside gpu_make_delta_qi (gpu_reconst()).
+//   4. Write results into snap_future.{epsilon, rhob, u}.
+//
+// Hydro source terms (when flag_add_hydro_source is true on the CPU side)
+// are NOT supported here — the CPU code path is used as a fallback in that
+// case, since per-cell source evaluation depends on host-only state.
+//
+// Buffer bindings (must match MetalPipelines::dispatch_finalize_ideal):
+//   0  qi_buf        [5*Ncells]   tau_rk * T^{a,0}(c) + KT flux update
+//   1  dwmn_buf      [5*Ncells]   viscous-source divergence
+//   2  epsilon_curr  [Ncells]     (Newton guess + revert fallback)
+//   3  u_curr        [4*Ncells]
+//   4  epsilon_prev  [Ncells]     RK mixing: T^{alpha,0}(prev)
+//   5  rhob_prev     [Ncells]
+//   6  u_prev        [4*Ncells]
+//   7  e_future      [Ncells]     output
+//   8  rhob_future   [Ncells]     output
+//   9  u_future      [4*Ncells]   output
+//  10  eos_P         [GPU_EOS_N]
+//  11  eos_dPde      [GPU_EOS_N]
+//  12  params        (constant struct)
+//  13  eos_p         (constant struct)
+
+kernel void gpu_finalize_ideal(
+    device const float*       qi_buf        [[buffer(0)]],
+    device const float*       dwmn_buf      [[buffer(1)]],
+    device const float*       epsilon_curr  [[buffer(2)]],
+    device const float*       u_curr        [[buffer(3)]],
+    device const float*       epsilon_prev  [[buffer(4)]],
+    device const float*       rhob_prev     [[buffer(5)]],
+    device const float*       u_prev        [[buffer(6)]],
+    device       float*       e_future      [[buffer(7)]],
+    device       float*       rhob_future   [[buffer(8)]],
+    device       float*       u_future      [[buffer(9)]],
+    device const float*       eos_P         [[buffer(10)]],
+    device const float*       eos_dPde      [[buffer(11)]],
+    constant MUSICGridParams& params        [[buffer(12)]],
+    constant GPUEosParams&    eos_p         [[buffer(13)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    int ix   = (int)gid.x;
+    int iy   = (int)gid.y;
+    int ieta = (int)gid.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const int   rkf      = params.rk_flag;
+    const float dt       = params.delta_tau;
+    const float tau_org  = params.tau_orig;
+    const float tau_next = tau_org + dt;
+    const float rk_norm  = 1.f / (1.f + (float)rkf);
+
+    // Pre-load prev cell for the RK mixing term (only used when rkf > 0).
+    float u0p   = u_prev[c];                 // u_prev[0*Ncells + c]
+    float e_p   = epsilon_prev[c];
+    float rho_p = rhob_prev[c];
+    float P_p   = (rkf > 0) ? gpu_P(e_p, eos_P, eos_p) : 0.f;
+
+    float qi[5];
+    for (int a = 0; a < 5; a++) {
+        float qv = qi_buf  [a * Ncells + c]
+                 - dwmn_buf[a * Ncells + c] * dt;
+
+        if (rkf > 0) {
+            float prev_TJb0;
+            if (a == 4) {
+                prev_TJb0 = rho_p * u0p;
+            } else if (a == 0) {
+                prev_TJb0 = (e_p + P_p) * u0p * u0p - P_p;
+            } else {
+                float ua_p = u_prev[a * Ncells + c];
+                prev_TJb0  = (e_p + P_p) * ua_p * u0p;
+            }
+            qv += (float)rkf * tau_org * prev_TJb0;
+        }
+        qi[a] = qv * rk_norm;
+    }
+
+    // Current cell primitives — used as Newton initial guess and revert fallback.
+    float u_c[4];
+    for (int m = 0; m < 4; m++) u_c[m] = u_curr[m * Ncells + c];
+    float e_c = epsilon_curr[c];
+
+    ReconstResult r = gpu_reconst(tau_next, qi, u_c, e_c, eos_P, eos_dPde, eos_p);
+
+    e_future   [c] = r.e;
+    rhob_future[c] = r.rhob;
+    for (int m = 0; m < 4; m++)
+        u_future[m * Ncells + c] = r.u[m];
+}
+
+// ── gpu_make_uwrhs ───────────────────────────────────────────────────────────
+//
+// Computes the Kurganov–Tadmor flux divergence of (u^a W^{mu nu}) used by
+// Diss::Make_uWRHS() in dissipative.cpp.  This is the stencil portion only —
+// the per-cell algebraic / geometric tail (which depends on theta and Du^mu
+// from MakedU) stays on the CPU since those quantities are not yet on the GPU.
+//
+// For each cell (ix, iy, ieta) and each of the 5 shear indices
+//   idx_1d ∈ {4, 5, 6, 7, 8}   (= W^{11}, W^{12}, W^{13}, W^{22}, W^{23})
+// the output is:
+//   uwrhs_flux[out_idx * Ncells + c] = -delta_tau * Σ_{direction} HW_{div,dir}
+// where
+//   HW_{div,dir} = (HW_{j+1/2} - HW_{j-1/2}) / delta[direction]
+// and HW_{j±1/2} = KT half-cell flux with minmod-limited left/right states.
+//
+// out_idx layout: 0..4 corresponds to idx_1d 4..8.
+//
+// Note: delta[eta] in this kernel uses params.delta_eta * params.tau
+// (the proper length), matching the CPU Make_uWRHS convention.
+//
+// Buffer bindings (must match MetalPipelines::dispatch_uwrhs):
+//   0  Wmunu_curr   [14*Ncells]
+//   1  u_curr       [4*Ncells]
+//   2  uwrhs_out    [5*Ncells]   output
+//   3  params       (constant struct)
+
+kernel void gpu_make_uwrhs(
+    device const float*       Wmunu_curr   [[buffer(0)]],
+    device const float*       u_curr       [[buffer(1)]],
+    device       float*       uwrhs_out    [[buffer(2)]],
+    constant MUSICGridParams& params       [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    int ix   = (int)gid.x;
+    int iy   = (int)gid.y;
+    int ieta = (int)gid.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const float delta[4] = {0.f,
+                            params.delta_x,
+                            params.delta_y,
+                            params.delta_eta * params.tau};
+    const float theta_l   = params.minmod_theta;
+    const float delta_tau = params.delta_tau;
+
+    // Stencil offsets in (x, y, eta) for the 3 directions
+    const int DX[3]   = {1, 0, 0};
+    const int DY[3]   = {0, 1, 0};
+    const int DETA[3] = {0, 0, 1};
+
+    // 5 shear indices: (1,1)=4, (1,2)=5, (1,3)=6, (2,2)=7, (2,3)=8
+    const int IDX_1D[5] = {4, 5, 6, 7, 8};
+
+    // Preload center-cell u
+    float u_c0 = u_curr[0 * Ncells + c];
+    float u_cd[3];   // u[1], u[2], u[3]
+    for (int d = 0; d < 3; d++) u_cd[d] = u_curr[(d + 1) * Ncells + c];
+
+    for (int k = 0; k < 5; k++) {
+        int idx_1d = IDX_1D[k];
+        float flux = 0.f;
+
+        for (int dir = 0; dir < 3; dir++) {
+            int direction = dir + 1;
+
+            int ip1 = clamped_cell(ix +   DX[dir], iy +   DY[dir],
+                                   ieta +   DETA[dir], Nx, Ny, Neta);
+            int ip2 = clamped_cell(ix + 2*DX[dir], iy + 2*DY[dir],
+                                   ieta + 2*DETA[dir], Nx, Ny, Neta);
+            int im1 = clamped_cell(ix -   DX[dir], iy -   DY[dir],
+                                   ieta -   DETA[dir], Nx, Ny, Neta);
+            int im2 = clamped_cell(ix - 2*DX[dir], iy - 2*DY[dir],
+                                   ieta - 2*DETA[dir], Nx, Ny, Neta);
+
+            // W^{mu nu}(c) and on neighbors
+            float W_c   = Wmunu_curr[idx_1d * Ncells + c];
+            float W_p1  = Wmunu_curr[idx_1d * Ncells + ip1];
+            float W_p2  = Wmunu_curr[idx_1d * Ncells + ip2];
+            float W_m1  = Wmunu_curr[idx_1d * Ncells + im1];
+            float W_m2  = Wmunu_curr[idx_1d * Ncells + im2];
+
+            // u^{direction} and u^0 on the same neighbors
+            float ud_c   = u_cd[dir];
+            float u0_c   = u_c0;
+            float ud_p1  = u_curr[direction * Ncells + ip1];
+            float u0_p1  = u_curr[0         * Ncells + ip1];
+            float ud_p2  = u_curr[direction * Ncells + ip2];
+            float u0_p2  = u_curr[0         * Ncells + ip2];
+            float ud_m1  = u_curr[direction * Ncells + im1];
+            float u0_m1  = u_curr[0         * Ncells + im1];
+            float ud_m2  = u_curr[direction * Ncells + im2];
+            float u0_m2  = u_curr[0         * Ncells + im2];
+
+            // f = W * u^direction,  g = W * u^0
+            float f_c   = W_c  * ud_c;    float g_c   = W_c  * u0_c;
+            float f_p1  = W_p1 * ud_p1;   float g_p1  = W_p1 * u0_p1;
+            float f_p2  = W_p2 * ud_p2;   float g_p2  = W_p2 * u0_p2;
+            float f_m1  = W_m1 * ud_m1;   float g_m1  = W_m1 * u0_m1;
+            float f_m2  = W_m2 * ud_m2;   float g_m2  = W_m2 * u0_m2;
+
+            // Half-cell uWmn (minmod-limited)
+            float uWphR = f_p1 - 0.5f * gpu_minmod_dx(f_p2, f_p1, f_c , theta_l);
+            float temp  = 0.5f * gpu_minmod_dx(f_p1, f_c , f_m1, theta_l);
+            float uWphL = f_c  + temp;
+            float uWmhR = f_c  - temp;
+            float uWmhL = f_m1 + 0.5f * gpu_minmod_dx(f_c , f_m1, f_m2, theta_l);
+
+            // Half-cell Wmn (minmod-limited)
+            float WphR = g_p1 - 0.5f * gpu_minmod_dx(g_p2, g_p1, g_c , theta_l);
+            float temp2 = 0.5f * gpu_minmod_dx(g_p1, g_c , g_m1, theta_l);
+            float WphL = g_c  + temp2;
+            float WmhR = g_c  - temp2;
+            float WmhL = g_m1 + 0.5f * gpu_minmod_dx(g_c , g_m1, g_m2, theta_l);
+
+            // Local wave speeds
+            float a   = fabs(ud_c ) / u0_c;
+            float ap1 = fabs(ud_p1) / u0_p1;
+            float am1 = fabs(ud_m1) / u0_m1;
+
+            float ax;
+            ax = max(a, ap1);
+            float HWph = ((uWphR + uWphL) - ax * (WphR - WphL)) * 0.5f;
+            ax = max(a, am1);
+            float HWmh = ((uWmhR + uWmhL) - ax * (WmhR - WmhL)) * 0.5f;
+
+            flux += -((HWph - HWmh) / delta[direction]);
+        }
+
+        uwrhs_out[k * Ncells + c] = flux * delta_tau;
+    }
+}

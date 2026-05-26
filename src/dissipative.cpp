@@ -491,6 +491,36 @@ int Diss::Make_uWRHS(const double tau, SCGrid &arena,
 }
 
 
+double Diss::Make_uWRHS_geom(const double tau, const Cell_small &grid_pt,
+                             const int mu, const int nu,
+                             const double theta_local,
+                             const DumuVec &a_local) const {
+    auto Wmunu_local = Util::UnpackVecToMatrix(grid_pt.Wmunu);
+
+    double tempf = (
+         - (DATA.gmunu[3][mu])*(Wmunu_local[0][nu])
+         - (DATA.gmunu[3][nu])*(Wmunu_local[0][mu])
+         + (DATA.gmunu[0][mu])*(Wmunu_local[3][nu])
+         + (DATA.gmunu[0][nu])*(Wmunu_local[3][mu])
+         + (Wmunu_local[3][nu])*(grid_pt.u[mu])*(grid_pt.u[0])
+         + (Wmunu_local[3][mu])*(grid_pt.u[nu])*(grid_pt.u[0])
+         - (Wmunu_local[0][nu])*(grid_pt.u[mu])*(grid_pt.u[3])
+         - (Wmunu_local[0][mu])*(grid_pt.u[nu])*(grid_pt.u[3]))
+         *(grid_pt.u[3]/tau);
+
+    for (int ic = 0; ic < 4; ic++) {
+        const double ic_fac = (ic == 0 ? -1.0 : 1.0);
+        tempf += (
+            (Wmunu_local[ic][nu])*(grid_pt.u[mu])*(a_local[ic])*ic_fac
+            + (Wmunu_local[ic][mu])*(grid_pt.u[nu])*(a_local[ic])*ic_fac);
+    }
+
+    return tempf*(DATA.delta_tau)
+           + (- (grid_pt.u[0]*Wmunu_local[mu][nu])/tau
+              + (theta_local*Wmunu_local[mu][nu]))*(DATA.delta_tau);
+}
+
+
 int Diss::Make_uPRHS(const double tau, SCGrid &arena,
                      const int ix, const int iy, const int ieta,
                      double *p_rhs, const double theta_local) {

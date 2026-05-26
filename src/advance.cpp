@@ -74,7 +74,9 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
     music_message.flush("info");
 }
 
-void Advance::make_gpu_params(double tau_rk, MUSICGridParams &p) const {
+void Advance::make_gpu_params(double tau, int rk_flag,
+                              MUSICGridParams &p) const {
+    const double tau_rk = tau + rk_flag * DATA.delta_tau;
     p.Nx     = DATA.nx;
     p.Ny     = DATA.ny;
     p.Neta   = DATA.neta;
@@ -88,6 +90,8 @@ void Advance::make_gpu_params(double tau_rk, MUSICGridParams &p) const {
     p.turn_on_bulk    = DATA.turn_on_bulk;
     p.turn_on_diff    = DATA.turn_on_diff;
     p.minmod_theta    = static_cast<float>(DATA.minmod_theta);
+    p.rk_flag         = rk_flag;
+    p.tau_orig        = static_cast<float>(tau);
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -132,28 +136,53 @@ void Advance::AdvanceIt(const double tau,
     const int grid_ny   = arena_current.nY();
 
 #ifdef USE_METAL
-    // ── Metal pre-pass: compute MakeWSource for all cells on GPU ─────────────
-    // This runs gpu_make_w_source asynchronously, producing dwmn[5*Ncells]
-    // in gpu_grid_.dwmn.  The GPU writes; CPU reads after wait().
+    // ── Metal pre-pass: compute the full per-cell ideal step on GPU ──────────
+    // Dispatches (in order):
+    //   1. gpu_make_w_source  -> dwmn[5*Ncells]
+    //   2. gpu_make_delta_qi  -> qi_out[5*Ncells]
+    //   3. gpu_finalize_ideal -> snap_future.{epsilon, rhob, u}  (Tier 3a)
+    //
+    // After GPU work, snap_future primitives are copied back into arena_future
+    // so the subsequent CPU viscous pass (FirstRKStepW) can consume them.
+    // The CPU FirstRKStepT call is skipped when gpu_finalize_active is true.
+    //
+    // When hydro source terms are active (flag_add_hydro_source), GPU finalize
+    // is bypassed for this RK step because per-cell source evaluation depends
+    // on host-only state.  In that case the CPU FirstRKStepT path is used,
+    // which still benefits from the GPU-computed dwmn and qi buffers.
     init_metal_if_needed(arena_current);
 
-    const float* gpu_dwmn = nullptr;
+    const float* gpu_dwmn        = nullptr;
+    bool         gpu_finalize_active = false;
     if (gpu_ready_) {
-        const double tau_rk = tau + rk_flag * DATA.delta_tau;
-
         // Copy arena_current and arena_prev into GPU SoA buffers (AoS→SoA).
         gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
         gpu_grid_.copy_to_gpu(arena_prev,    gpu_grid_.snap_prev);
 
         MUSICGridParams gp;
-        make_gpu_params(tau_rk, gp);
+        make_gpu_params(tau, rk_flag, gp);
+
+        gpu_finalize_active = !flag_add_hydro_source;
 
         auto& mp = MetalPipelines::instance();
         mp.dispatch_w_source(gpu_grid_, gp);
         mp.dispatch_delta_qi(gpu_grid_, gp);
+        if (gpu_finalize_active) {
+            mp.dispatch_finalize_ideal(gpu_grid_, gp);
+        }
+        if (DATA.viscosity_flag == 1 && DATA.turn_on_shear == 1) {
+            mp.dispatch_uwrhs(gpu_grid_, gp);
+        }
         mp.wait();   // synchronize – on Apple Silicon this is near-zero cost
 
         gpu_dwmn = gpu_grid_.dwmn;   // CPU-readable (unified memory)
+
+        if (gpu_finalize_active) {
+            // Propagate post-Newton primitives into arena_future for the
+            // subsequent CPU viscous pass.
+            gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future,
+                                             arena_future);
+        }
     }
 #endif  // USE_METAL
 
@@ -167,16 +196,20 @@ void Advance::AdvanceIt(const double tau,
         double y_local     = - DATA.y_size  /2. +   iy*DATA.delta_y;
 
 #ifdef USE_METAL
-        // Pass GPU-computed dwmn and qi_out pointers (null → CPU fallback).
-        // Component-major layout: field[alpha * Ncells + cell]; stride = Ncells.
-        const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;
-        const int Ncells_gpu = grid_nx * grid_ny * grid_neta;
-        const float* cell_dwmn = gpu_ready_ ? gpu_dwmn + cell : nullptr;
-        const float* cell_qi   = gpu_ready_ ? gpu_grid_.qi_out + cell : nullptr;
-        FirstRKStepT(tau, x_local, y_local, eta_s_local,
-                     arena_current, arena_future, arena_prev,
-                     ix, iy, ieta, rk_flag,
-                     cell_dwmn, cell_qi, Ncells_gpu);
+        // When GPU finalize was active, arena_future primitives are already
+        // populated — skip the CPU FirstRKStepT call entirely.
+        if (!gpu_finalize_active) {
+            // Pass GPU-computed dwmn and qi_out pointers (null → CPU fallback
+            // inside FirstRKStepT).  Layout: field[alpha * Ncells + cell].
+            const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;
+            const int Ncells_gpu = grid_nx * grid_ny * grid_neta;
+            const float* cell_dwmn = gpu_ready_ ? gpu_dwmn + cell : nullptr;
+            const float* cell_qi   = gpu_ready_ ? gpu_grid_.qi_out + cell : nullptr;
+            FirstRKStepT(tau, x_local, y_local, eta_s_local,
+                         arena_current, arena_future, arena_prev,
+                         ix, iy, ieta, rk_flag,
+                         cell_dwmn, cell_qi, Ncells_gpu);
+        }
 #else
         FirstRKStepT(tau, x_local, y_local, eta_s_local,
                      arena_current, arena_future, arena_prev,
@@ -204,9 +237,22 @@ void Advance::AdvanceIt(const double tau,
             DmuMuBoverTVec baryon_diffusion_vector;
             u_derivative_helper.get_DmuMuBoverTVec(baryon_diffusion_vector);
 
+#ifdef USE_METAL
+            const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;
+            const int Ncells_gpu = grid_nx * grid_ny * grid_neta;
+            const float* cell_uwrhs =
+                (gpu_ready_ && DATA.turn_on_shear == 1)
+                    ? gpu_grid_.uwrhs_out + cell
+                    : nullptr;
+            FirstRKStepW(tau, arena_prev, arena_current, arena_future, rk_flag,
+                         theta_local, a_local, sigma_local, omega_local,
+                         baryon_diffusion_vector, ieta, ix, iy,
+                         cell_uwrhs, Ncells_gpu);
+#else
             FirstRKStepW(tau, arena_prev, arena_current, arena_future, rk_flag,
                          theta_local, a_local, sigma_local, omega_local,
                          baryon_diffusion_vector, ieta, ix, iy);
+#endif
         }
     }
 }
@@ -316,7 +362,8 @@ void Advance::FirstRKStepW(const double tau, SCGrid &arena_prev,
                            const VelocityShearVec &sigma_local,
                            const VorticityVec &omega_local,
                            const DmuMuBoverTVec &baryon_diffusion_vector,
-                           const int ieta, const int ix, const int iy) {
+                           const int ieta, const int ix, const int iy,
+                           const float* gpu_uwrhs_base, int Ncells) {
 
     auto grid_pt_prev = &(arena_prev(ix, iy, ieta));
     auto grid_pt_c = &(arena_current(ix, iy, ieta));
@@ -340,8 +387,18 @@ void Advance::FirstRKStepW(const double tau, SCGrid &arena_prev,
             int mu = 0;
             int nu = 0;
             map_1d_idx_to_2d(idx_1d, mu, nu);
-            diss_helper.Make_uWRHS(tau_now, arena_current, ix, iy, ieta,
-                                   mu, nu, w_rhs, theta_local, a_local);
+            if (gpu_uwrhs_base && Ncells > 0) {
+                // GPU pre-pass: stencil flux for this idx; CPU does the
+                // per-cell algebraic / geometric tail only.
+                const int k = idx_1d - 4;
+                w_rhs = static_cast<double>(gpu_uwrhs_base[k * Ncells]);
+                w_rhs += diss_helper.Make_uWRHS_geom(
+                            tau_now, *grid_pt_c, mu, nu,
+                            theta_local, a_local);
+            } else {
+                diss_helper.Make_uWRHS(tau_now, arena_current, ix, iy, ieta,
+                                       mu, nu, w_rhs, theta_local, a_local);
+            }
             tempf = (
                   (1. - rk_flag)*(grid_pt_c->Wmunu[idx_1d]*grid_pt_c->u[0])
                 + rk_flag*(grid_pt_prev->Wmunu[idx_1d]*grid_pt_prev->u[0])

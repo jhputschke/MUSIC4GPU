@@ -21,6 +21,8 @@ MetalPipelines& MetalPipelines::instance() {
 }
 
 MetalPipelines::~MetalPipelines() {
+    if (pso_uwrhs_)    { CFRelease(pso_uwrhs_); }
+    if (pso_finalize_) { CFRelease(pso_finalize_); }
     if (pso_delta_qi_) { CFRelease(pso_delta_qi_); }
     if (pso_w_source_) { CFRelease(pso_w_source_); }
     if (library_)      { CFRelease(library_); }
@@ -110,6 +112,36 @@ bool MetalPipelines::initialize(const char* metallib_path) {
         return false;
     }
     pso_delta_qi_ = (__bridge_retained void*)pso_dqi;
+
+    // 6. Build pipeline state for gpu_finalize_ideal
+    id<MTLFunction> fn_fin = [lib newFunctionWithName:@"gpu_finalize_ideal"];
+    if (!fn_fin) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_finalize_ideal' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_fin =
+        [dev newComputePipelineStateWithFunction:fn_fin error:&err];
+    if (!pso_fin) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_finalize_ideal failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_finalize_ = (__bridge_retained void*)pso_fin;
+
+    // 7. Build pipeline state for gpu_make_uwrhs
+    id<MTLFunction> fn_uw = [lib newFunctionWithName:@"gpu_make_uwrhs"];
+    if (!fn_uw) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_uwrhs' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_uw =
+        [dev newComputePipelineStateWithFunction:fn_uw error:&err];
+    if (!pso_uw) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_uwrhs failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_uwrhs_ = (__bridge_retained void*)pso_uw;
 
     ready_ = true;
     return true;
@@ -246,6 +278,101 @@ void MetalPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& para
     [enc setBuffer:get_buf(gpu.qi_out)            offset:0 atIndex:5];
     [enc setBytes:&params          length:sizeof(params)          atIndex:6];
     [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:7];
+
+    MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
+    MTLSize num_groups = MTLSizeMake(
+        (gpu.Nx()   + 7) / 8,
+        (gpu.Ny()   + 7) / 8,
+        (gpu.Neta() + 3) / 4
+    );
+
+    [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
+    [enc endEncoding];
+    [cb commit];
+
+    if (cmd_buf_) CFRelease(cmd_buf_);
+    cmd_buf_ = (__bridge_retained void*)cb;
+}
+
+// ── dispatch_finalize_ideal ──────────────────────────────────────────────────
+//
+// Dispatches gpu_finalize_ideal: the final per-cell ideal-step RK update.
+// Reads qi_out + dwmn (filled by the two earlier kernels) and snap_prev +
+// snap_curr; writes primitive variables into snap_future.
+
+void MetalPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams& params) {
+    if (!ready_ || !pso_finalize_) return;
+
+    auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
+    auto pso = (__bridge id<MTLComputePipelineState>)pso_finalize_;
+
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    auto get_buf = [&](const float* ptr) -> id<MTLBuffer> {
+        return buffer_for_ptr(handles, n_handles, ptr);
+    };
+
+    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+
+    // Binding order — must match gpu_finalize_ideal in music_kernels.metal.
+    [enc setBuffer:get_buf(gpu.qi_out)              offset:0 atIndex:0];
+    [enc setBuffer:get_buf(gpu.dwmn)                offset:0 atIndex:1];
+    [enc setBuffer:get_buf(gpu.snap_curr.epsilon)   offset:0 atIndex:2];
+    [enc setBuffer:get_buf(gpu.snap_curr.u)         offset:0 atIndex:3];
+    [enc setBuffer:get_buf(gpu.snap_prev.epsilon)   offset:0 atIndex:4];
+    [enc setBuffer:get_buf(gpu.snap_prev.rhob)      offset:0 atIndex:5];
+    [enc setBuffer:get_buf(gpu.snap_prev.u)         offset:0 atIndex:6];
+    [enc setBuffer:get_buf(gpu.snap_future.epsilon) offset:0 atIndex:7];
+    [enc setBuffer:get_buf(gpu.snap_future.rhob)    offset:0 atIndex:8];
+    [enc setBuffer:get_buf(gpu.snap_future.u)       offset:0 atIndex:9];
+    [enc setBuffer:get_buf(gpu.eos_P)               offset:0 atIndex:10];
+    [enc setBuffer:get_buf(gpu.eos_dPde)            offset:0 atIndex:11];
+    [enc setBytes:&params          length:sizeof(params)          atIndex:12];
+    [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:13];
+
+    MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
+    MTLSize num_groups = MTLSizeMake(
+        (gpu.Nx()   + 7) / 8,
+        (gpu.Ny()   + 7) / 8,
+        (gpu.Neta() + 3) / 4
+    );
+
+    [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
+    [enc endEncoding];
+    [cb commit];
+
+    if (cmd_buf_) CFRelease(cmd_buf_);
+    cmd_buf_ = (__bridge_retained void*)cb;
+}
+
+// ── dispatch_uwrhs ───────────────────────────────────────────────────────────
+//
+// Dispatches gpu_make_uwrhs: the KT flux divergence of (u^a W^{mu nu}) for
+// the 5 shear-stress indices, used by the CPU viscous loop (FirstRKStepW).
+
+void MetalPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params) {
+    if (!ready_ || !pso_uwrhs_) return;
+
+    auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
+    auto pso = (__bridge id<MTLComputePipelineState>)pso_uwrhs_;
+
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    auto get_buf = [&](const float* ptr) -> id<MTLBuffer> {
+        return buffer_for_ptr(handles, n_handles, ptr);
+    };
+
+    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+
+    // Bindings must match gpu_make_uwrhs in music_kernels.metal.
+    [enc setBuffer:get_buf(gpu.snap_curr.Wmunu) offset:0 atIndex:0];
+    [enc setBuffer:get_buf(gpu.snap_curr.u)     offset:0 atIndex:1];
+    [enc setBuffer:get_buf(gpu.uwrhs_out)       offset:0 atIndex:2];
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
