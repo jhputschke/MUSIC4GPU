@@ -130,6 +130,20 @@ class Advance {
     // 1/fm^4 units (same as Cell_small::epsilon).  Synchronizes before return.
     // No-op if GPU residency is not active.
     void reduce_max_gpu(double& eps_max, double& rhob_max);
+
+    // Bring snap_curr/snap_prev back into the host arenas if the GPU has
+    // been authoritative across the timestep boundary.  Two flavours:
+    //   - sync_arena_from_gpu          : also clears gpu_owns_state_, so
+    //                                    the next AdvanceIt rk0 will
+    //                                    re-upload.  Use when caller may
+    //                                    mutate the arena.
+    //   - sync_arena_from_gpu_readonly : leaves gpu_owns_state_ set, so the
+    //                                    next AdvanceIt rk0 skips its H2D.
+    //                                    Use for pure-read diagnostics.
+    void sync_arena_from_gpu(Fields &arenaFieldsPrev,
+                             Fields &arenaFieldsCurr);
+    void sync_arena_from_gpu_readonly(Fields &arenaFieldsPrev,
+                                      Fields &arenaFieldsCurr);
 #endif
 
     // gpu_dwmn_base: pointer to the first alpha-component of the GPU-computed

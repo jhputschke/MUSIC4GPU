@@ -316,20 +316,22 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
                          arenaFieldsCurr.nEta());
     if (!gpu_ready_) return false;  // init failed; init_metal_if_needed already warned
 
-    // Upload host arenas into the GPU snapshots — unless the previous
-    // substep's result is already resident on GPU (gpu_state_authoritative_),
-    // in which case Evolve::AdvanceRK has already rotated/swapped the GPU
-    // snapshot aliases to match the host pointer roles.
+    // Upload host arenas into the GPU snapshots — UNLESS the snapshots are
+    // already authoritative from a previous substep/step:
+    //   - gpu_state_authoritative_  : snap_future from the previous substep
+    //                                 has been rotated into snap_curr by
+    //                                 rotate_snapshots_gpu() (intra-substep
+    //                                 residency, within an AdvanceRK call).
+    //   - gpu_owns_state_           : snap_curr survived across the
+    //                                 timestep boundary because the last rk1
+    //                                 substep skipped its D2H — host arenas
+    //                                 are stale until sync_arena_from_gpu().
     //
-    // This residency optimisation matters in two ways:
-    //   1. Skips ~7 MB of H2D upload per substep at 64x64x32 (kernel
-    //      throughput-bound, this is most of the per-substep cost).
-    //   2. Skips the double→float→double round-trip that would otherwise
-    //      truncate every cell to single precision on every substep —
-    //      without it, eps_max accumulates ~1e-2 drift over 100 steps;
-    //      with it, drift stays at the kernel-internal float32 noise
-    //      level (~1e-4).
-    if (!gpu_state_authoritative_) {
+    // Either path lets us skip the H2D, which avoids the float64→float32
+    // truncation of every cell every step.  Without it, eps_max drifts
+    // ~1e-2 over 100 steps; with it, drift stays at the kernel's
+    // intrinsic single-precision noise level (~1e-4).
+    if (!gpu_state_authoritative_ && !gpu_owns_state_) {
         gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_curr);
         if (rk_flag > 0) {
             gpu_grid_.copy_to_gpu(arenaFieldsPrev, gpu_grid_.snap_prev);
@@ -369,28 +371,62 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     mp.end_batch();
     mp.wait();
 
-    // Decide whether to keep state on GPU (skip D2H) or sync back to
-    // arenaFieldsNext now.  We can stay on GPU iff another RK substep
-    // will follow in this AdvanceRK call — that substep will inherit
-    // the state through rotate_snapshots_gpu() / swap_curr_future_gpu().
-    // On the final substep, EvolveIt needs CPU-side arena data for
-    // diagnostics, freeze-out, and the next outer step's setup, so we
-    // sync back unconditionally.
+    // Decide how state crosses the substep / step boundary.
+    //
+    //   Intra-substep (rk0 → rk1): snap_future contains rk0 result.
+    //     AdvanceRK's host 3-way rotation will be mirrored on the GPU side
+    //     via rotate_snapshots_gpu(), so the rk1 substep just reads from
+    //     snap_curr / snap_prev with no H2D.  Set gpu_state_authoritative_.
+    //
+    //   Inter-step (rk1 → next outer step's rk0): snap_future contains
+    //     rk1 result; AdvanceRK's host 2-way swap will be mirrored via
+    //     swap_curr_future_gpu(), so snap_curr ends up as the latest
+    //     state.  We set gpu_owns_state_ to advertise that the host
+    //     Fields objects are now STALE — EvolveIt must call
+    //     sync_arena_from_gpu() before any code that reads them, and the
+    //     next AdvanceIt's rk0 substep skips its H2D upload.
+    //
+    // We also skip the D2H copy-back in the inter-step path; CPU side
+    // catches up lazily via sync_arena_from_gpu() at the diagnostic
+    // call sites in evolve.cpp.  Eliminating the per-step round-trip
+    // is what closes both the perf and the precision gap to main_gpu.
     const bool last_substep = (rk_flag == DATA.rk_order - 1);
     if (last_substep) {
-        gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future,
-                                         arenaFieldsNext);
-        gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_future,
-                                         arenaFieldsNext);
-        gpu_state_authoritative_ = false;
+        gpu_state_authoritative_ = false;   // snap_curr lives in snap_future
+                                            // until swap_curr_future_gpu()
+                                            // runs in AdvanceRK
+        gpu_owns_state_          = true;
     } else {
-        // Result lives in snap_future; the host-side rk0 pointer rotation
-        // will be mirrored on GPU via rotate_snapshots_gpu() so that the
-        // next substep sees snap_curr = (this substep's) snap_future and
-        // snap_prev = (this substep's) snap_curr — no H2D needed.
-        gpu_state_authoritative_ = true;
+        gpu_state_authoritative_ = true;    // intra-substep residency
     }
     return true;
+}
+
+// On-demand D2H: bring snap_curr and snap_prev back into the host Fields
+// objects so CPU code (diagnostics, freezeout, output writers) can read
+// them.  Cheap no-op when the GPU isn't authoritative (i.e. CPU just ran
+// AdvanceIt, or GPU hasn't been used yet).
+//
+// After the sync, gpu_owns_state_ is cleared — but the GPU snapshots are
+// unchanged.  The next AdvanceIt's rk0 substep will see gpu_owns_state_
+// cleared and will re-upload, since the assumption is that the caller of
+// sync_arena_from_gpu may also write to the arena (in practice this is
+// rare — most call sites only read).  Sites that we know are
+// read-only can call sync_arena_from_gpu_readonly() instead to keep
+// gpu_owns_state_ set and avoid the next H2D.
+void Advance::sync_arena_from_gpu(Fields &arenaFieldsPrev,
+                                  Fields &arenaFieldsCurr) {
+    sync_arena_from_gpu_readonly(arenaFieldsPrev, arenaFieldsCurr);
+    gpu_owns_state_ = false;
+}
+
+void Advance::sync_arena_from_gpu_readonly(Fields &arenaFieldsPrev,
+                                           Fields &arenaFieldsCurr) {
+    if (!gpu_owns_state_ || !gpu_ready_) return;
+    gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_curr, arenaFieldsCurr);
+    gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, arenaFieldsCurr);
+    gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_prev, arenaFieldsPrev);
+    gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_prev, arenaFieldsPrev);
 }
 #endif  // MUSIC_USE_GPU
 
