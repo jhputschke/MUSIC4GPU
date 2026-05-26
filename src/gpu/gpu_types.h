@@ -56,8 +56,8 @@ struct MUSICGridParams {
     float shear_sims_at_kink;      // DATA.shear_3_at_kink
 
     // Bulk-viscosity inputs (Tier 3c Phase 3).  turn_on_bulk lives in the
-    // top section of this struct.  Only honored when T_dep_bulk_mode is a
-    // supported value (0, 1, 2, 3, 8, 9, 10).  Mode 7 falls back to CPU.
+    // top section of this struct.  Honored for all T-dependent bulk profiles
+    // (0, 1, 2, 3, 7, 8, 9, 10) — mode 7 (bigbroadP) is now ported too.
     int   T_dep_bulk_mode;         // DATA.T_dependent_bulk_to_s
     int   bulk_relaxation_type;    // DATA.bulk_relaxation_type
     float bulk_relax_time_factor;  // DATA.bulk_relax_time_factor
@@ -128,6 +128,11 @@ struct GPUEosParams {
 // Use as: WMUNU_IDX[alpha][direction]  for alpha in [0,4], direction in [0,3]
 #ifdef __METAL_VERSION__
 constant int WMUNU_IDX[5][4] = {
+#elif defined(__CUDACC__)
+// CUDA: place in per-TU constant memory.  `static` gives internal linkage so
+// the header can be included by several .cu translation units without a
+// duplicate-symbol link error; device code reads it as a broadcast constant.
+static __constant__ int WMUNU_IDX[5][4] = {
 #else
 static const int WMUNU_IDX[5][4] = {
 #endif
@@ -141,6 +146,8 @@ static const int WMUNU_IDX[5][4] = {
 // Metric g^{mu nu} = diag(-1,+1,+1,+1)
 #ifdef __METAL_VERSION__
 constant float GMUNU_DIAG[4] = {-1.f, 1.f, 1.f, 1.f};
+#elif defined(__CUDACC__)
+static __constant__ float GMUNU_DIAG[4] = {-1.f, 1.f, 1.f, 1.f};
 #else
 static const float GMUNU_DIAG[4] = {-1.f, 1.f, 1.f, 1.f};
 #endif
