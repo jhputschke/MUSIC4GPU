@@ -542,3 +542,61 @@ MUSIC_CUDA_FORCE_DISCRETE=1 OMP_NUM_THREADS=$(nproc) bash tests/cuda_vs_cpu_benc
    there than it does on the host-bound GB10. If profiling still shows host↔
    device cost dominating, the next lever is the scratch/EOS buffers (currently
    managed) and keeping evolving state GPU-resident across timesteps.
+
+---
+
+## Running independent events, one per GPU (event-level parallelism)
+
+For event-by-event production the simplest and best-scaling way to use multiple
+GPUs is **one independent MUSIC process per GPU** — no halo exchange, near-linear
+scaling, and **no code change**. Device selection uses the standard CUDA
+`CUDA_VISIBLE_DEVICES` variable: it exposes one physical GPU per process, which
+the binary's `cudaSetDevice(0)` then picks up. (Decomposing a *single* event
+across GPUs is a separate, heavier effort — see
+[`Plan-multi-GPU.md`](Plan-multi-GPU.md).)
+
+```bash
+# 1. See what GPUs are available
+nvidia-smi -L                 # lists "GPU 0: ...", "GPU 1: ...", with UUIDs
+
+# 2. Launch two independent events, pinned to different GPUs.
+#    - separate working dirs so their output files don't collide
+#    - split CPU cores so the host-side OpenMP work doesn't oversubscribe
+mkdir -p run_A run_B
+
+( cd run_A && CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=10 \
+    ../build_cuda/src/MUSIChydro ../input_eventA > log_A.txt 2>&1 ) &
+
+( cd run_B && CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=10 \
+    ../build_cuda/src/MUSIChydro ../input_eventB > log_B.txt 2>&1 ) &
+
+wait
+```
+
+Each process sees exactly one GPU (its assigned device, reported as logical
+"device 0") and runs a full, independent hydro evolution; the two never
+interact.
+
+**Notes**
+- **Choosing the GPU:** `CUDA_VISIBLE_DEVICES=N` makes physical GPU `N` the only
+  one visible to that process; the hardcoded `cudaSetDevice(0)` then selects it,
+  and `cudaGetDeviceCount` returns 1 inside the process. To target a specific
+  card by identity rather than index, use its UUID:
+  `CUDA_VISIBLE_DEVICES=GPU-xxxxxxxx-...`.
+- **Verify the pinning:** each process prints `[MUSIC-GPU] CUDA device: <name>`
+  at startup; `nvidia-smi` during the run shows one process on each GPU.
+- **Separate output directories** (`run_A` / `run_B` above): MUSIC writes output
+  into the working directory, so two instances in the same CWD would overwrite
+  each other.
+- **CPU oversubscription:** both processes use OpenMP for the host-side pack and
+  diagnostics. On an `M`-core node running `P` processes, set
+  `OMP_NUM_THREADS = M / P` (e.g. 20 cores, 2 processes → 10 each).
+- **More events than GPUs:** assign round-robin,
+  `CUDA_VISIBLE_DEVICES=$((i % NGPU))`, and keep `NGPU` events in flight (e.g.
+  via GNU `parallel` or any job queue). CUDA **MPS** is an alternative if you
+  want several events to share one GPU concurrently.
+
+> The hydro evolution does not saturate a single GPU at production grid sizes
+> (it is host-bound — see the host-bound finding above), so packing one event
+> per GPU is also a good way to raise aggregate GPU utilization on a multi-GPU
+> node.
