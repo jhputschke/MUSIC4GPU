@@ -28,6 +28,7 @@
 #endif
 #include "GPUGrid.h"
 #include "../grid.h"   // SCGrid, Cell_small
+#include "../fields.h" // Fields (XSCAPE SoA arena)
 
 // Set by CUDAPipelines::initialize() before GPUGrid::allocate() runs.
 extern int  g_cuda_device_id;
@@ -343,6 +344,100 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const 
         cell.rhob    = static_cast<double>(s_rhob[c]);
         for (int m = 0; m < GPU_U_COMPS; ++m)
             cell.u[m] = static_cast<double>(s_u[m * Ncells_ + c]);
+    }
+}
+
+// ── Fields (SoA double) overloads ───────────────────────────────────────────
+//
+// Mirror the SCGrid versions above for both the coherent and discrete-GPU
+// memory paths.  See GPUGrid.h and PORT_GPU.md §4.1 for the rhoq/rhos
+// limitation — those arrays are not uploaded to the device.
+
+void GPUGrid::copy_to_gpu(const Fields& src, GPUSnapshot& dst) const {
+    const bool disc = !g_cuda_coherent;
+    float* d_eps  = disc ? dst.epsilon_stage : dst.epsilon;
+    float* d_rhob = disc ? dst.rhob_stage    : dst.rhob;
+    float* d_u    = disc ? dst.u_stage       : dst.u;
+    float* d_W    = disc ? dst.Wmunu_stage   : dst.Wmunu;
+    float* d_pib  = disc ? dst.pi_b_stage    : dst.pi_b;
+
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+        d_eps [c] = static_cast<float>(src.e_     [c]);
+        d_rhob[c] = static_cast<float>(src.rhob_  [c]);
+        d_pib [c] = static_cast<float>(src.piBulk_[c]);
+
+        for (int m = 0; m < GPU_U_COMPS; ++m)
+            d_u[m * Ncells_ + c] = static_cast<float>(src.u_[m][c]);
+
+        for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
+            d_W[m * Ncells_ + c] = static_cast<float>(src.Wmunu_[m][c]);
+    }
+}
+
+void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const {
+    const float* s_W   = src.Wmunu;
+    const float* s_pib = src.pi_b;
+    if (!g_cuda_coherent) {
+        // Stream was already synchronized by CUDAPipelines::wait() in the
+        // caller; pull results back to pinned staging before unpacking.
+        cudaMemcpy(src.Wmunu_stage, src.Wmunu,
+                   GPU_WMUNU_COMPS * static_cast<size_t>(Ncells_) * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(src.pi_b_stage, src.pi_b,
+                   static_cast<size_t>(Ncells_) * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        s_W   = src.Wmunu_stage;
+        s_pib = src.pi_b_stage;
+    }
+
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+        dst.piBulk_[c] = static_cast<double>(s_pib[c]);
+        for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
+            dst.Wmunu_[m][c] = static_cast<double>(s_W[m * Ncells_ + c]);
+    }
+}
+
+void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const {
+    const float* s_eps  = src.epsilon;
+    const float* s_rhob = src.rhob;
+    const float* s_u    = src.u;
+    if (!g_cuda_coherent) {
+        const size_t nc = static_cast<size_t>(Ncells_);
+        cudaMemcpy(src.epsilon_stage, src.epsilon, nc * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(src.rhob_stage,    src.rhob,    nc * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(src.u_stage,       src.u,   GPU_U_COMPS * nc * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        s_eps  = src.epsilon_stage;
+        s_rhob = src.rhob_stage;
+        s_u    = src.u_stage;
+    }
+
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+        dst.e_   [c] = static_cast<double>(s_eps [c]);
+        dst.rhob_[c] = static_cast<double>(s_rhob[c]);
+        for (int m = 0; m < GPU_U_COMPS; ++m)
+            dst.u_[m][c] = static_cast<double>(s_u[m * Ncells_ + c]);
+        // rhoq_ / rhos_ intentionally left alone — see PORT_GPU.md §4.1.
     }
 }
 

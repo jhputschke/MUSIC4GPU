@@ -58,9 +58,33 @@ class Advance {
     // snap_curr/snap_prev are already current (maintained by swap_curr_future +
     // lockstep rotations).  Set on the first complete full-GPU step.
     bool       gpu_owns_state_ = false;
-    void       init_metal_if_needed(SCGrid &arena_current);
+    // Lazy GPU init.  Takes grid dimensions as plain ints so it can be called
+    // from any caller — Fields-based AdvanceIt today, SCGrid-based EvolveIt
+    // in the standalone path if/when that is re-introduced.
+    void       init_metal_if_needed(int Nx, int Ny, int Neta);
     void       make_gpu_params(double tau, int rk_flag,
                                MUSICGridParams &p) const;
+
+    // Predicate: is the current DATA configuration entirely supported by the
+    // GPU kernels?  Currently requires viscosity_flag==1, no baryon diffusion,
+    // no hydro source terms, no multi-charge (rhoq/rhos kept zero), and a
+    // CPU EOS that the GPU table samples adequately.  See PORT_GPU.md §4 for
+    // the full list.
+    bool       gpu_features_supported() const;
+
+    // Per-cell guard that scans the Fields arrays for non-zero rhoq/rhos.
+    // Returns false on the first non-zero entry.  Logged once per session
+    // when it fires.
+    bool       gpu_charges_ok(const Fields &arena) const;
+
+    // Run a single AdvanceIt substep entirely on the GPU.  Uploads from
+    // arenaFieldsCurr/arenaFieldsPrev, dispatches the kernel pipeline,
+    // syncs, and writes results into arenaFieldsNext.  Returns false when
+    // the configuration is not GPU-supported or initialization failed; the
+    // caller must run the CPU loop in that case.
+    bool       try_gpu_advance(double tau, Fields &arenaFieldsPrev,
+                               Fields &arenaFieldsCurr,
+                               Fields &arenaFieldsNext, int rk_flag);
 #endif
 
  public:

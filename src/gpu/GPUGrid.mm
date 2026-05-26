@@ -9,6 +9,7 @@
 #endif
 #include "GPUGrid.h"
 #include "../grid.h"   // SCGrid, Cell_small
+#include "../fields.h" // Fields (XSCAPE SoA arena)
 
 // Singleton Metal device (shared with MetalPipelines).
 extern id<MTLDevice> g_metal_device;
@@ -247,5 +248,67 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const 
         cell.rhob    = static_cast<double>(src.rhob[c]);
         for (int m = 0; m < GPU_U_COMPS; ++m)
             cell.u[m] = static_cast<double>(src.u[m * Ncells_ + c]);
+    }
+}
+
+// ── Fields (SoA double) overloads ───────────────────────────────────────────
+//
+// On Apple Silicon (coherent shared memory) the GPUSnapshot float* pointers
+// are themselves host-accessible, so the loops below write directly into
+// Metal-shared buffers — no staging path, no explicit DMA.
+//
+// Fields::getFieldIdx(ix,iy,ieta) returns ix + Nx*(iy + Ny*ieta), which is
+// algebraically identical to cell_idx().  We call cell_idx() to keep the
+// indexing convention textually unified across all copy routines.
+
+void GPUGrid::copy_to_gpu(const Fields& src, GPUSnapshot& dst) const {
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+        dst.epsilon[c] = static_cast<float>(src.e_     [c]);
+        dst.rhob   [c] = static_cast<float>(src.rhob_  [c]);
+        dst.pi_b   [c] = static_cast<float>(src.piBulk_[c]);
+
+        for (int m = 0; m < GPU_U_COMPS; ++m)
+            dst.u[m * Ncells_ + c] = static_cast<float>(src.u_[m][c]);
+
+        for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
+            dst.Wmunu[m * Ncells_ + c] = static_cast<float>(src.Wmunu_[m][c]);
+    }
+}
+
+void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const {
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+        dst.piBulk_[c] = static_cast<double>(src.pi_b[c]);
+        for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
+            dst.Wmunu_[m][c] = static_cast<double>(src.Wmunu[m * Ncells_ + c]);
+    }
+}
+
+void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const {
+    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int ix   = 0; ix   < Nx;   ++ix  )
+    for (int iy   = 0; iy   < Ny;   ++iy  ) {
+        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+        dst.e_   [c] = static_cast<double>(src.epsilon[c]);
+        dst.rhob_[c] = static_cast<double>(src.rhob   [c]);
+        for (int m = 0; m < GPU_U_COMPS; ++m)
+            dst.u_[m][c] = static_cast<double>(src.u[m * Ncells_ + c]);
+        // rhoq_ / rhos_ are intentionally untouched — the GPU snapshot does
+        // not carry them.  The caller must guarantee they are zero before
+        // dispatching, otherwise the multi-charge contribution will be lost.
     }
 }

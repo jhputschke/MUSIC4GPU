@@ -9,6 +9,7 @@
 #pragma once
 
 #include "../grid.h"   // SCGrid = GridT<Cell_small>
+#include "../fields.h" // Fields (SoA arena used by the XSCAPE entry point)
 #include "gpu_types.h" // GPUEosParams, GPU_EOS_N
 
 // Number of components per field
@@ -75,6 +76,20 @@ public:
     // GPU-reconstructed primitives into arena_future before the CPU viscous
     // pass reads them.
     void copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const;
+
+    // ── Fields (SoA double) overloads, used by the XSCAPE entry point ──────
+    //
+    // Fields stores each quantity in a separate std::vector<double> indexed by
+    // ix + Nx*(iy + Ny*ieta), which is algebraically identical to cell_idx().
+    // The copies are therefore a per-component float-cast pass with no
+    // AoS gather/scatter.
+    //
+    // Limitation: GPUSnapshot only carries rhob.  Fields' rhoq_ / rhos_ are
+    // NOT uploaded; the caller is responsible for falling back to the CPU
+    // path when either is non-zero.  See PORT_GPU.md §4.1.
+    void copy_to_gpu(const Fields& src, GPUSnapshot& dst) const;
+    void copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const;
+    void copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const;
 
     // Rotate GPUSnapshot pointer aliases: snap_prev ← snap_curr ← snap_future
     // ← (old snap_prev as scratch).  Matches the CPU arena rotation done in

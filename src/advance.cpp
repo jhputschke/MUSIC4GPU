@@ -24,7 +24,7 @@ using Util::hbarc;
 
 // ── Metal helpers (compiled only when USE_METAL is defined) ───────────────────
 #ifdef MUSIC_USE_GPU
-void Advance::init_metal_if_needed(SCGrid &arena_current) {
+void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
 
@@ -35,9 +35,7 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
         gpu_ready_ = false;
         return;
     }
-    if (!gpu_grid_.allocate(arena_current.nX(),
-                            arena_current.nY(),
-                            arena_current.nEta())) {
+    if (!gpu_grid_.allocate(Nx, Ny, Neta)) {
         music_message << "[MUSIC-GPU] GPU buffer allocation failed.";
         music_message.flush("warning");
         gpu_ready_ = false;
@@ -85,9 +83,7 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
 
     gpu_ready_ = true;
     music_message << "[MUSIC-GPU] GPU grid allocated ("
-                  << arena_current.nX() << "x"
-                  << arena_current.nY() << "x"
-                  << arena_current.nEta() << " cells).";
+                  << Nx << "x" << Ny << "x" << Neta << " cells).";
     music_message.flush("info");
 }
 
@@ -166,6 +162,123 @@ void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
     if (!gpu_owns_state_ || !gpu_ready_) { eps_max = rhob_max = 0.0; return; }
     GPUPipelines::instance().reduce_max(gpu_grid_, eps_max, rhob_max);
 }
+
+// ── Feature support predicate ────────────────────────────────────────────────
+//
+// Gate the GPU dispatch on the configuration falling inside the support matrix
+// that the kernels actually implement.  Anything outside this set falls back
+// to the CPU loop.  Each guard mirrors a kernel-side assumption documented in
+// the .metal / .cu sources and PORT_GPU.md §4.
+//
+// The check is configuration-only (DATA flags); per-cell state checks (rhoq /
+// rhos non-zero, finite-muB EOS effects) are done in gpu_charges_ok().
+bool Advance::gpu_features_supported() const {
+    if (DATA.viscosity_flag != 1)         return false;
+    if (DATA.turn_on_diff)                return false;
+    if (DATA.muB_dependent_shear_to_s != 0) return false;
+    if (flag_add_hydro_source)            return false;  // CPU pre-pass not wired
+    if (DATA.whichEOS > 9)                return false;  // finite-muB EOS
+    return true;
+}
+
+bool Advance::gpu_charges_ok(const Fields &arena) const {
+    // GPU snapshot only carries rhob; if rhoq_/rhos_ are populated, the kernel
+    // would silently miss the multi-charge contribution to T^{tau alpha}.
+    const auto &rhoq = arena.rhoq_;
+    const auto &rhos = arena.rhos_;
+    const size_t N = rhoq.size();
+    for (size_t i = 0; i < N; ++i) {
+        if (rhoq[i] != 0.0 || rhos[i] != 0.0) return false;
+    }
+    return true;
+}
+
+// ── Full-GPU AdvanceIt substep (Fields path) ─────────────────────────────────
+//
+// Mirrors the kernel sequence used by the SCGrid path before the XSCAPE merge:
+//   1. Upload curr+prev to snap_curr / snap_prev
+//   2. dispatch_make_du     (viscous geometry: theta, a, sigma)
+//   3. dispatch_uwrhs       (KT flux divergence of u^a W^{kl})
+//   4. dispatch_w_source    (partial_a W^{a mu})
+//   5. dispatch_uprhs       (KT flux of u^a pi_b)         — turn_on_bulk only
+//   6. dispatch_delta_qi    (KT flux of T^{tau alpha} + geom)
+//   7. dispatch_finalize_ideal       (Newton solve -> snap_future primitives)
+//   8. dispatch_first_rk_step_w_full (second-order Wmunu / pi_b -> snap_future)
+//   9. wait()
+//  10. Copy snap_future primitives + Wmunu + pi_b back into arenaFieldsNext.
+//
+// Residency optimisation (gpu_owns_state_ / gpu_state_authoritative_) is NOT
+// enabled on the Fields path in this first cut — every substep does a fresh
+// upload at rk_flag==0.  See PORT_GPU.md §7 (open questions) — JETSCAPE may
+// mutate the Fields between AdvanceIt calls, which would invalidate any
+// residency assumption.
+bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
+                              Fields &arenaFieldsCurr,
+                              Fields &arenaFieldsNext, int rk_flag) {
+    static bool charge_warning_logged = false;
+    static bool feature_warning_logged = false;
+
+    if (!gpu_features_supported()) {
+        if (!feature_warning_logged) {
+            music_message << "[MUSIC-GPU] Fields path: configuration outside "
+                             "GPU support matrix, using CPU.";
+            music_message.flush("info");
+            feature_warning_logged = true;
+        }
+        return false;
+    }
+    if (!gpu_charges_ok(arenaFieldsCurr)) {
+        if (!charge_warning_logged) {
+            music_message << "[MUSIC-GPU] Fields path: non-zero rhoq/rhos "
+                             "detected, falling back to CPU "
+                             "(see PORT_GPU.md §4.1).";
+            music_message.flush("warning");
+            charge_warning_logged = true;
+        }
+        return false;
+    }
+
+    init_metal_if_needed(arenaFieldsCurr.nX(),
+                         arenaFieldsCurr.nY(),
+                         arenaFieldsCurr.nEta());
+    if (!gpu_ready_) return false;  // init failed; init_metal_if_needed already warned
+
+    // Upload host arenas into the GPU snapshots.
+    gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_curr);
+    if (rk_flag > 0) {
+        gpu_grid_.copy_to_gpu(arenaFieldsPrev, gpu_grid_.snap_prev);
+    } else {
+        // At rk_flag == 0, prev == curr (initial state of the substep).
+        gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_prev);
+    }
+
+    MUSICGridParams p;
+    make_gpu_params(tau, rk_flag, p);
+    // Mark hydro source as inactive — the CPU pre-pass that populates
+    // qi_source_buf is not wired for the Fields path, and we already
+    // bail out above when flag_add_hydro_source is true.
+    p.has_hydro_source = 0;
+    p.has_rhob_source  = 0;
+
+    auto& mp = GPUPipelines::instance();
+    mp.begin_batch();
+      mp.dispatch_make_du(gpu_grid_, p);
+      mp.dispatch_uwrhs  (gpu_grid_, p);
+      mp.dispatch_w_source(gpu_grid_, p);
+      if (p.turn_on_bulk == 1) mp.dispatch_uprhs(gpu_grid_, p);
+      mp.dispatch_delta_qi(gpu_grid_, p);
+      mp.dispatch_finalize_ideal(gpu_grid_, p);
+      mp.dispatch_first_rk_step_w_full(gpu_grid_, p);
+    mp.end_batch();
+    mp.wait();
+
+    // Bring the post-step state back into arenaFieldsNext.  rhoq_/rhos_ in
+    // arenaFieldsNext stay at whatever the caller left them (gpu_charges_ok
+    // ensured they're zero, and the kernels don't write them).
+    gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_future, arenaFieldsNext);
+    gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_future, arenaFieldsNext);
+    return true;
+}
 #endif  // MUSIC_USE_GPU
 
 Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
@@ -192,6 +305,16 @@ Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
 void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
                         Fields &arenaFieldsCurr, Fields &arenaFieldsNext,
                         const int rk_flag) {
+#ifdef MUSIC_USE_GPU
+    // Try the full-GPU path first.  If it returns true the substep is done;
+    // otherwise (unsupported config, GPU init failed, etc.) fall through to
+    // the CPU triple loop below.  See PORT_GPU.md §5 Phase 2.
+    if (try_gpu_advance(tau, arenaFieldsPrev,
+                        arenaFieldsCurr, arenaFieldsNext, rk_flag)) {
+        return;
+    }
+#endif
+
     const int grid_neta = arenaFieldsCurr.nEta();
     const int grid_nx   = arenaFieldsCurr.nX();
     const int grid_ny   = arenaFieldsCurr.nY();
