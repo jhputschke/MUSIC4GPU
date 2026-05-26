@@ -330,6 +330,7 @@ void Advance::AdvanceIt(const double tau,
             || (DATA.T_dependent_bulk_to_s == 1)
             || (DATA.T_dependent_bulk_to_s == 2)
             || (DATA.T_dependent_bulk_to_s == 3)
+            || (DATA.T_dependent_bulk_to_s == 7)
             || (DATA.T_dependent_bulk_to_s == 8)
             || (DATA.T_dependent_bulk_to_s == 9)
             || (DATA.T_dependent_bulk_to_s == 10);

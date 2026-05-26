@@ -1351,6 +1351,22 @@ DFI float gpu_zeta_over_s_asym_gaussian(
     return B_norm * expf(-Tdiff * Tdiff);
 }
 
+// Mode 7 — "bigbroadP" (arXiv:1901.04378, 1908.06212): a broad Lorentzian above
+// the peak, a narrow Gaussian below.  Fixed parameters (no DATA dependence).
+DFI float gpu_zeta_over_s_bigbroadP(float T_in_fm) {
+    float T_in_GeV = T_in_fm * GPU_HBARC;
+    const float B_norm  = 0.24f;
+    const float B_width = 1.5f;
+    const float Tpeak   = 0.165f;
+    float Ttilde = (T_in_GeV / Tpeak - 1.f) / B_width;
+    float bulk   = B_norm / (Ttilde * Ttilde + 1.f);
+    if (T_in_GeV < Tpeak) {
+        float Tdiff = (T_in_GeV - Tpeak) / 0.01f;
+        bulk = B_norm * expf(-Tdiff * Tdiff);
+    }
+    return bulk;
+}
+
 DFI float gpu_zeta_over_s(float T_in_fm, const MUSICGridParams& params) {
     float zoverS = 0.f;
     switch (params.T_dep_bulk_mode) {
@@ -1372,6 +1388,9 @@ DFI float gpu_zeta_over_s(float T_in_fm, const MUSICGridParams& params) {
                                           params.bulk_sims_width_GeV,
                                           params.bulk_sims_T_peak_GeV,
                                           params.bulk_sims_lambda);
+            break;
+        case 7:
+            zoverS = gpu_zeta_over_s_bigbroadP(T_in_fm);
             break;
         case 8:
             zoverS = gpu_zeta_over_s_asym_gaussian(

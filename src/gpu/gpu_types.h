@@ -56,8 +56,8 @@ struct MUSICGridParams {
     float shear_sims_at_kink;      // DATA.shear_3_at_kink
 
     // Bulk-viscosity inputs (Tier 3c Phase 3).  turn_on_bulk lives in the
-    // top section of this struct.  Only honored when T_dep_bulk_mode is a
-    // supported value (0, 1, 2, 3, 8, 9, 10).  Mode 7 falls back to CPU.
+    // top section of this struct.  Honored for all T-dependent bulk profiles
+    // (0, 1, 2, 3, 7, 8, 9, 10) — mode 7 (bigbroadP) is now ported too.
     int   T_dep_bulk_mode;         // DATA.T_dependent_bulk_to_s
     int   bulk_relaxation_type;    // DATA.bulk_relaxation_type
     float bulk_relax_time_factor;  // DATA.bulk_relax_time_factor
