@@ -51,6 +51,49 @@ guard.
 
 ---
 
+## Physics support matrix (CUDA)
+
+The CUDA back-end is a direct port of the Metal kernels and shares the same host
+dispatch gates in `advance.cpp` (via the `MUSIC_USE_GPU` / `GPUPipelines`
+indirection), so its physics coverage is **identical to the Metal back-end**.
+The hydro evolution runs entirely on the GPU when the configuration falls inside
+the supported matrix; anything outside it transparently falls back to the
+existing CPU code path (per-cell), so results stay correct — just slower.
+
+**Fully on the GPU (no per-cell CPU loop):**
+
+| Capability | GPU kernel(s) | Notes |
+|------------|---------------|-------|
+| Ideal hydro: KT flux + conserved→primitive Newton reconstruction | `gpu_make_delta_qi`, `gpu_finalize_ideal` | the per-cell `FirstRKStepT` is skipped entirely |
+| Viscous source divergence ∂(τWᵐⁿ) | `gpu_make_w_source` (tiled) | |
+| Shear stress πᵐⁿ full 2nd-order IS update | `gpu_make_uwrhs`, `gpu_make_du`, `gpu_first_rk_step_w_full` | `turn_on_shear == 1` |
+| Bulk pressure Π update | `gpu_make_uprhs`, `gpu_first_rk_step_w_full` | `turn_on_bulk == 1` |
+| Velocity gradients θ, aᵘ, σᵘᵛ | `gpu_make_du` | |
+| T-dependent η/s | in `gpu_first_rk_step_w_full` | modes **0, 1, 2, 3, 11** |
+| T-dependent ζ/s | in `gpu_first_rk_step_w_full` | modes **0, 1, 2, 3, 8, 9, 10** |
+| 2nd-order coupling terms (W·σ, W·W, π↔Π) | in `gpu_first_rk_step_w_full` | `include_second_order_terms == 1` |
+| QuestRevert regulator | in `gpu_first_rk_step_w_full` | active when `Initial_profile ∉ {0,1}` |
+| Hydro source terms jᵘ (energy + baryon) | `gpu_finalize_ideal` | source **evaluated on CPU** into `qi_source_buf`, integrated on GPU |
+| Boost-invariant (2D) and full 3+1D | all | |
+
+**Falls back to the CPU path (correct, not yet ported):**
+
+| Capability | Gate that forces CPU | What it would take to port |
+|------------|----------------------|----------------------------|
+| Baryon diffusion qᵘ | `turn_on_diff == 1` (disables `gpu_make_du`/`w_full`) | port `Make_uqRHS`/`Make_uqSource`; the diffusion components (idx 10–13) are currently zeroed on the GPU |
+| Vorticity terms | `include_vorticity_terms == 1` | port the kinetic-vorticity tensor (`dUoverTsup`/`dUTsup`) into `gpu_make_du` |
+| Finite net-baryon EOS / μ_B-dependent shear | `muB_dependent_shear_to_s != 0` | the GPU EOS tables are sampled at **rhob = 0**; needs a 2-D P(e, ρ_B) table + μ_B(e, ρ_B) and the diffusion sector |
+| ζ/s mode 7 (bigbroadP) | `T_dependent_bulk_to_s == 7` | add the profile to `gpu_zeta_over_s` |
+| η/s modes outside {0,1,2,3,11} | `T_dependent_shear_to_s` other | add the profile to `gpu_eta_over_s` |
+
+**Not GPU work at all (host, by design):** initial-condition construction
+(`init.cpp`), Cooper–Frye freeze-out / Cornelius surface finding, evolution
+output, and the per-step diagnostics. The per-step `eps_max`/`T_max` reduction
+in particular is the host dependency targeted by the GPU-resident-state plan
+below.
+
+---
+
 ## Phase 1 — Direct port (correctness first)
 
 A line-for-line translation of the Metal Shading Language kernels to CUDA C++,
@@ -380,6 +423,12 @@ but further end-to-end speedup on this hardware requires attacking the
 diagnostics, and keeping evolving state GPU-resident across timesteps so the
 grid is not repacked every step. Those are evolve-loop changes beyond the GPU
 kernel layer and are the recommended next step.
+
+This restructure is specified in **[`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md)**
+— a standalone plan (current flow, proposed flow, file-by-file changes,
+validation, sequencing) intended to be picked up later, ideally with a discrete
+GPU on hand where its payoff is largest. It is the single highest-value
+remaining optimization.
 
 ---
 
