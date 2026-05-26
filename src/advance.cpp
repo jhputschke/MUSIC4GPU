@@ -193,6 +193,7 @@ Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
 void Advance::AdvanceIt(const double tau,
                         SCGrid &arena_prev, SCGrid &arena_current,
                         SCGrid &arena_future, const int rk_flag) {
+    bench::Timer _bt_advit("advance.advanceit_total");
     const int grid_neta = arena_current.nEta();
     const int grid_nx   = arena_current.nX();
     const int grid_ny   = arena_current.nY();
@@ -211,7 +212,8 @@ void Advance::AdvanceIt(const double tau,
     // When hydro source terms are active (flag_add_hydro_source), the per-cell
     // source j^alpha is pre-computed on the CPU into gpu_grid_.qi_source_buf
     // and consumed inside gpu_finalize_ideal — no per-cell CPU loop needed.
-    init_metal_if_needed(arena_current);
+    { bench::Timer _bt_init("advance.init_oneshot");
+      init_metal_if_needed(arena_current); }
 
     const float* gpu_dwmn        = nullptr;
     bool         gpu_finalize_active = false;
@@ -258,6 +260,7 @@ void Advance::AdvanceIt(const double tau,
         // are active.  Source models stay on the CPU; this is the only
         // per-cell CPU work in source-driven runs.
         if (gp.has_hydro_source) {
+            bench::Timer _bt_src("advance.hydro_source_prepass");
             const double tau_rk = tau + rk_flag * DATA.delta_tau;
             const int Nx     = grid_nx;
             const int Ny     = grid_ny;
