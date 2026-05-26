@@ -380,3 +380,87 @@ but further end-to-end speedup on this hardware requires attacking the
 diagnostics, and keeping evolving state GPU-resident across timesteps so the
 grid is not repacked every step. Those are evolve-loop changes beyond the GPU
 kernel layer and are the recommended next step.
+
+---
+
+## Running on a discrete GPU (A100 / RTX / H100)
+
+The port was developed and benchmarked on a coherent-memory GB10. Everything
+here also targets ordinary **discrete** NVIDIA GPUs. **No source changes are
+required to run correctly** — the kernels are architecture-agnostic (sm_70+)
+and all buffers use `cudaMallocManaged`, which is supported on every CUDA GPU.
+
+### Required: pick the target architecture
+
+`CMAKE_CUDA_ARCHITECTURES` defaults to `native`, which detects the GPU **at
+configure time** — correct only if you build *on* the discrete-GPU machine. If
+you cross-compile (e.g. on a login node without the GPU attached), set it
+explicitly:
+
+```bash
+cmake -S . -B build_cuda -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES=80      # 80=A100, 86=RTX30xx, 89=RTX40xx, 90=H100
+cmake --build build_cuda -j$(nproc)
+```
+
+(The `-DCMAKE_DISABLE_FIND_PACKAGE_GSL=ON` flag used elsewhere in this document
+was only a workaround for this machine's conda include path — drop it if GSL
+resolves normally on the target.)
+
+### Works automatically — nothing to change
+
+- **Phase 4 dual-stream activates by itself.** The runtime coherence check
+  (`cudaDevAttrPageableMemoryAccess` / `prop.integrated`) returns *false* on a
+  discrete GPU, so `coherent_memory_ = false` and `upload_snapshots_async()`
+  runs its prefetch + event-gate path (skipped on GB10). This is exactly the
+  case the dual-stream scaffolding was built for.
+- **Shared-memory tiling fits.** The tiled `gpu_make_w_source` caps at 45.6 KB
+  of dynamic shared memory (3-D worst case, `(8+2)(8+2)(4+2)` × 19 floats),
+  under the 48 KB default carveout on every architecture — no opt-in needed.
+- `__ldg`, `--use_fast_math`, the occupancy-tuned block sizing, and the
+  256-thread blocks are all architecture-agnostic.
+
+### Optional — for *peak* discrete performance (not correctness)
+
+The one real architectural caveat: every SoA buffer is allocated with
+`cudaMallocManaged` (`GPUGrid_cuda.cu`). On the coherent GB10 that is ideal —
+the GPU reads host-written buffers in place. On a **discrete** GPU it means the
+per-step AoS→SoA pack writes managed pages on the host, which then **migrate
+over PCIe** to the device on first kernel touch (and back on copy-back) every
+substep. It runs correctly — the driver handles the migration — but PCIe
+migration is the slow path.
+
+The Phase 4 prefetch mitigates this (it stages the snapshots on the copy stream
+ahead of compute), but the *fully* optimal discrete design — scaffolded via
+`copy_stream_` but **not** wired — is:
+
+1. Allocate the SoA snapshot buffers with `cudaMalloc` (device-resident) instead
+   of `cudaMallocManaged`.
+2. Allocate **pinned** host staging buffers (`cudaHostAlloc`) for the packed
+   SoA data so transfers run at full PCIe bandwidth.
+3. Pack AoS→SoA into the pinned staging buffer (CPU/OpenMP), then
+   `cudaMemcpyAsync(H2D)` on `copy_stream_`, and `cudaMemcpyAsync(D2H)` for the
+   copy-back; gate the compute stream on the copy event (the handshake is
+   already in `upload_snapshots_async`).
+4. Select this path at runtime behind the existing `coherent_memory_` flag, so
+   GB10 keeps its zero-copy managed path and discrete GPUs get explicit DMA.
+
+This was deferred because implementing it on top of the managed-memory design
+would have regressed the coherent GB10 target. It is the recommended first step
+if profiling on a discrete GPU shows the managed-memory migration dominating —
+which, given the host-bound finding above, is the likely outcome.
+
+### Recommended workflow on a discrete GPU
+
+1. Build with the correct `CMAKE_CUDA_ARCHITECTURES` and run the correctness
+   guard: `OMP_NUM_THREADS=$(nproc) bash tests/cuda_vs_cpu_bench.sh`
+   (accept < 1e-3).
+2. Measure per-step cost: `bash tests/cuda_perstep_bench.sh`.
+3. Profile to confirm where the time goes:
+   `nsys profile --stats=true ./build_cuda/src/MUSIChydro <input>`.
+   If kernels are a small fraction of wall (as on GB10) and the timeline shows
+   significant host↔device migration, implement the explicit
+   device-buffer + pinned-staging path above. A discrete GPU also has far more
+   FP32 throughput than GB10, so the Phase-5 fast-math win on `delta_qi` (and
+   the compute-bound kernels generally) should translate into a larger share of
+   the end-to-end speedup there than it does on the host-bound GB10.
