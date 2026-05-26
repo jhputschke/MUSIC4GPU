@@ -191,10 +191,9 @@ void Advance::AdvanceIt(const double tau,
     // so the subsequent CPU viscous pass (FirstRKStepW) can consume them.
     // The CPU FirstRKStepT call is skipped when gpu_finalize_active is true.
     //
-    // When hydro source terms are active (flag_add_hydro_source), GPU finalize
-    // is bypassed for this RK step because per-cell source evaluation depends
-    // on host-only state.  In that case the CPU FirstRKStepT path is used,
-    // which still benefits from the GPU-computed dwmn and qi buffers.
+    // When hydro source terms are active (flag_add_hydro_source), the per-cell
+    // source j^alpha is pre-computed on the CPU into gpu_grid_.qi_source_buf
+    // and consumed inside gpu_finalize_ideal — no per-cell CPU loop needed.
     init_metal_if_needed(arena_current);
 
     const float* gpu_dwmn        = nullptr;
@@ -208,8 +207,52 @@ void Advance::AdvanceIt(const double tau,
 
         MUSICGridParams gp;
         make_gpu_params(tau, rk_flag, gp);
+        gp.has_hydro_source = flag_add_hydro_source ? 1 : 0;
+        gp.has_rhob_source  = (flag_add_hydro_source
+                               && DATA.turn_on_rhob == 1) ? 1 : 0;
 
-        gpu_finalize_active = !flag_add_hydro_source;
+        // CPU pre-pass: fill qi_source_buf for all cells when hydro sources
+        // are active.  Source models stay on the CPU; this is the only
+        // per-cell CPU work in source-driven runs.
+        if (gp.has_hydro_source) {
+            const double tau_rk = tau + rk_flag * DATA.delta_tau;
+            const int Nx     = grid_nx;
+            const int Ny     = grid_ny;
+            const int Neta   = grid_neta;
+            const int Ncells = Nx * Ny * Neta;
+            float* src_buf   = gpu_grid_.qi_source_buf;
+            const int rhob_on = gp.has_rhob_source;
+
+            #pragma omp parallel for collapse(3) schedule(guided)
+            for (int ieta = 0; ieta < Neta; ieta++)
+            for (int ix   = 0; ix   < Nx;   ix++  )
+            for (int iy   = 0; iy   < Ny;   iy++  ) {
+                const double eta_s = -DATA.eta_size/2. + ieta*DATA.delta_eta;
+                const double xl    = -DATA.x_size  /2. +   ix*DATA.delta_x;
+                const double yl    = -DATA.y_size  /2. +   iy*DATA.delta_y;
+                const int cell = Nx * (Ny * ieta + iy) + ix;
+
+                EnergyFlowVec j_mu = {0.};
+                FlowVec u_local = arena_current(ix, iy, ieta).u;
+                hydro_source_terms_ptr->get_hydro_energy_source(
+                        tau_rk, xl, yl, eta_s, u_local, j_mu);
+                for (int alpha = 0; alpha < 4; alpha++) {
+                    src_buf[alpha * Ncells + cell] =
+                        static_cast<float>(tau_rk * j_mu[alpha]);
+                }
+                if (rhob_on) {
+                    const double rhob_src =
+                        hydro_source_terms_ptr->get_hydro_rhob_source(
+                                tau_rk, xl, yl, eta_s, u_local);
+                    src_buf[4 * Ncells + cell] =
+                        static_cast<float>(tau_rk * rhob_src);
+                } else {
+                    src_buf[4 * Ncells + cell] = 0.f;
+                }
+            }
+        }
+
+        gpu_finalize_active = true;  // hydro source now handled on GPU side
 
         auto& mp = MetalPipelines::instance();
         mp.dispatch_w_source(gpu_grid_, gp);
@@ -254,7 +297,7 @@ void Advance::AdvanceIt(const double tau,
             || (DATA.T_dependent_bulk_to_s == 10);
         gpu_w_full_active =
                gpu_du_active                                  // already ensures vort=0, diff=0
-            && gpu_finalize_active                            // ensures hydro_source path is off
+            && gpu_finalize_active                            // ideal step + reconst on GPU
             && (DATA.viscosity_flag == 1)
             && (DATA.turn_on_shear == 1)
             && (DATA.include_second_order_terms == 0)

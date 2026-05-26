@@ -94,6 +94,14 @@ public:
     // Consumed by gpu_first_rk_step_w_full when turn_on_bulk == 1.
     float* uprhs_out = nullptr;
 
+    // Input buffer: qi_source[5 * Ncells] populated by the CPU when
+    // flag_add_hydro_source is true.  Layout matches qi_out:
+    //   qi_source[alpha * Ncells + cell] = tau_rk * j^alpha(τ, x, u_cell)
+    // (i.e. pre-multiplied by tau_rk, matching the CPU formula in
+    // Advance::FirstRKStepT before the delta_tau integration step).
+    // Consumed by gpu_finalize_ideal only when params.has_hydro_source == 1.
+    float* qi_source_buf = nullptr;
+
     // Output buffers produced by gpu_make_du (per-cell viscous geometry):
     //   theta_buf [Ncells]      — expansion rate θ
     //   a_buf     [4 * Ncells]  — a^μ = u^ν ∂_ν u^μ

@@ -379,6 +379,7 @@ void MetalPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams
     [enc setBuffer:get_buf(gpu.eos_dPde)            offset:0 atIndex:11];
     [enc setBytes:&params          length:sizeof(params)          atIndex:12];
     [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:13];
+    [enc setBuffer:get_buf(gpu.qi_source_buf)       offset:0 atIndex:14];
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(

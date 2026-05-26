@@ -907,6 +907,7 @@ kernel void gpu_finalize_ideal(
     device const float*       eos_dPde      [[buffer(11)]],
     constant MUSICGridParams& params        [[buffer(12)]],
     constant GPUEosParams&    eos_p         [[buffer(13)]],
+    device const float*       qi_source_in  [[buffer(14)]],
     uint3 gid [[thread_position_in_grid]])
 {
     int ix   = (int)gid.x;
@@ -931,10 +932,17 @@ kernel void gpu_finalize_ideal(
     float rho_p = rhob_prev[c];
     float P_p   = (rkf > 0) ? gpu_P(e_p, eos_P, eos_p) : 0.f;
 
+    const int has_src = params.has_hydro_source;
+
     float qi[5];
     for (int a = 0; a < 5; a++) {
         float qv = qi_buf  [a * Ncells + c]
                  - dwmn_buf[a * Ncells + c] * dt;
+
+        // CPU-precomputed hydro source: tau_rk * j^alpha (already tau-scaled)
+        if (has_src) {
+            qv += qi_source_in[a * Ncells + c] * dt;
+        }
 
         if (rkf > 0) {
             float prev_TJb0;

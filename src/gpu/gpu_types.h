@@ -75,6 +75,14 @@ struct MUSICGridParams {
     float bulk_asym10_width_low;   // DATA.bulk_10_width_low   (GeV)
     float bulk_asym10_width_high;  // DATA.bulk_10_width_high  (GeV)
     float bulk_asym10_Tpeak;       // DATA.bulk_10_Tpeak       (GeV)
+
+    // Hydro source-term path (Tier 3c Phase 4).  When non-zero,
+    // gpu_finalize_ideal adds tau_rk * j^alpha * delta_tau to qi[alpha];
+    // the per-cell source is pre-computed on the CPU and uploaded into
+    // GPUGrid::qi_source_buf before the dispatch.  Source models stay on
+    // the CPU (strings / AMPT / TATB).
+    int   has_hydro_source;        // 1 if the CPU pre-filled qi_source_buf
+    int   has_rhob_source;         // 1 if qi_source_buf[4] is populated too
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
