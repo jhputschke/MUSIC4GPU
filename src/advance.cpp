@@ -218,6 +218,12 @@ void Advance::AdvanceIt(const double tau,
         } else {
             gpu_grid_.copy_to_gpu(arena_current, gpu_grid_.snap_curr);
             gpu_grid_.copy_to_gpu(arena_prev,    gpu_grid_.snap_prev);
+#if defined(USE_CUDA)
+            // Phase 4: stage the freshly-packed snapshots to the device on the
+            // copy stream (dual-stream handshake; a residency hint on coherent
+            // unified memory).
+            GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
+#endif
         }
 
         MUSICGridParams gp;

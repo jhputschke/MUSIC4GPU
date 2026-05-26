@@ -50,6 +50,15 @@ public:
     void begin_batch();
     void end_batch();
 
+    // Phase 4 (dual-stream): prefetch the freshly-packed snap_curr / snap_prev
+    // SoA buffers to the device on a dedicated copy stream, then gate the
+    // compute stream on completion via an event.  On a discrete GPU this moves
+    // the host→device transfer onto its own stream so it can overlap prior
+    // compute; on a coherent unified-memory part (GB10) it is a cheap hint.
+    // Safe no-op for the Metal back-end (this method only exists here and is
+    // called under a USE_CUDA guard in advance.cpp).
+    void upload_snapshots_async(GPUGrid& gpu);
+
 private:
     CUDAPipelines() = default;
     ~CUDAPipelines();
@@ -59,6 +68,15 @@ private:
     // cudaStream_t kept as void* so this header stays free of CUDA headers
     // and can be included by the host C++ compiler (advance.cpp).
     void* compute_stream_ = nullptr;
+    // Phase 4 dual-stream: a dedicated copy stream + completion event used to
+    // move/prefetch SoA snapshot data independently of the compute stream.
+    void* copy_stream_ = nullptr;
+    void* copy_event_  = nullptr;
+    // True when the GPU can access host/managed memory coherently (integrated
+    // or NVLink-C2C parts such as GB10).  On such platforms there is no
+    // discrete transfer to overlap, so the dual-stream prefetch+gate is skipped
+    // (it would only add migration latency).  Kept active on discrete GPUs.
+    bool  coherent_memory_ = false;
     // Occupancy-tuned upper bound on threads per block (Phase 2).  The 3-D
     // block is factored from this at dispatch time, adapting to Neta so 2-D
     // (Neta==1) grids don't waste the eta thread dimension.

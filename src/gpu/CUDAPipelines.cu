@@ -53,6 +53,14 @@ CUDAPipelines& CUDAPipelines::instance() {
 }
 
 CUDAPipelines::~CUDAPipelines() {
+    if (copy_event_) {
+        cudaEventDestroy(static_cast<cudaEvent_t>(copy_event_));
+        copy_event_ = nullptr;
+    }
+    if (copy_stream_) {
+        cudaStreamDestroy(static_cast<cudaStream_t>(copy_stream_));
+        copy_stream_ = nullptr;
+    }
     if (compute_stream_) {
         cudaStreamDestroy(static_cast<cudaStream_t>(compute_stream_));
         compute_stream_ = nullptr;
@@ -88,6 +96,17 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
                 prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
     }
 
+    // Detect coherent host-memory access (integrated GPU or NVLink-C2C parts).
+    // On these the unified buffers are read in place, so the Phase-4 dual-stream
+    // prefetch is unnecessary (and the gate would only add latency).
+    int pageable_access = 0;
+    cudaDeviceGetAttribute(&pageable_access,
+                           cudaDevAttrPageableMemoryAccess, device_id_);
+    coherent_memory_ = (pageable_access != 0) || (prop.integrated != 0);
+    fprintf(stderr, "[MUSIC-GPU] coherent host memory: %s\n",
+            coherent_memory_ ? "yes (dual-stream prefetch skipped)"
+                             : "no (dual-stream prefetch active)");
+
     cudaStream_t stream = nullptr;
     err = cudaStreamCreate(&stream);
     if (err != cudaSuccess) {
@@ -96,6 +115,17 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
         return false;
     }
     compute_stream_ = static_cast<void*>(stream);
+
+    // Phase 4: dedicated copy stream + completion event for the dual-stream
+    // data-movement path.  Non-fatal if creation fails — upload_snapshots_async
+    // simply becomes a no-op then.
+    cudaStream_t cstream = nullptr;
+    if (cudaStreamCreate(&cstream) == cudaSuccess) {
+        copy_stream_ = static_cast<void*>(cstream);
+        cudaEvent_t ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess)
+            copy_event_ = static_cast<void*>(ev);
+    }
 
     // Occupancy-tuned block size for the heaviest kernel (gpu_make_delta_qi,
     // ~60% of runtime: Newton-Brent solve + 12 reconstructions per cell).  Its
@@ -130,6 +160,43 @@ void CUDAPipelines::wait() {
 // Batch mode is implicit for a single stream — these are no-ops.
 void CUDAPipelines::begin_batch() {}
 void CUDAPipelines::end_batch()   {}
+
+// ── dual-stream snapshot upload ──────────────────────────────────────────────
+
+void CUDAPipelines::upload_snapshots_async(GPUGrid& gpu) {
+    if (!ready_ || !copy_stream_) return;
+    // Coherent unified memory (GB10): the kernels read the packed buffers in
+    // place, so prefetching + gating only adds latency.  Skip it.
+    if (coherent_memory_) return;
+    auto cs = static_cast<cudaStream_t>(copy_stream_);
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+
+    cudaMemLocation loc{};
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id   = device_id_;
+    auto pf = [&](void* p, size_t bytes) {
+        if (p) cudaMemPrefetchAsync(p, bytes, loc, 0, cs);
+    };
+    // Prefetch the two snapshots the kernels will read this substep onto the
+    // copy stream.  On a discrete GPU this is the host→device transfer; on the
+    // coherent GB10 it is a residency hint.
+    const GPUSnapshot* snaps[2] = {&gpu.snap_curr, &gpu.snap_prev};
+    for (const GPUSnapshot* s : snaps) {
+        pf(s->epsilon,      nc * sizeof(float));
+        pf(s->rhob,         nc * sizeof(float));
+        pf(s->u,        4 * nc * sizeof(float));
+        pf(s->Wmunu,   14 * nc * sizeof(float));
+        pf(s->pi_b,         nc * sizeof(float));
+    }
+    // Gate the compute stream on the prefetch so the first kernel does not read
+    // before the data is resident (correctness-neutral on coherent memory, but
+    // the textbook-correct dual-stream handshake on a discrete GPU).
+    if (copy_event_) {
+        cudaEventRecord(static_cast<cudaEvent_t>(copy_event_), cs);
+        cudaStreamWaitEvent(static_cast<cudaStream_t>(compute_stream_),
+                            static_cast<cudaEvent_t>(copy_event_), 0);
+    }
+}
 
 // ── dispatch_w_source ─────────────────────────────────────────────────────────
 

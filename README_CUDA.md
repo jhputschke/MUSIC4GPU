@@ -245,3 +245,55 @@ Amdahl, since the two compute-bound kernels (`delta_qi` + `w_full` ≈ 57%) are
 untouched by tiling. This is the honest ceiling for tiling on this workload;
 the remaining headroom is in the Newton solver (Phase 5) and host↔device
 overlap (Phase 4).
+
+---
+
+## Phase 4 — Dual-stream parallelism (and the host-bound finding)
+
+### What the profile actually says
+
+The most important measurement of the whole port: at 64×64×32, summing the
+kernel times gives **~39 ms of GPU work over a ~710 ms run — the GPU is busy
+only ~5.5% of wall time** (≈22% of the evolution phase once the ~0.53 s fixed
+init is excluded). The run is **host-bound**: the AoS↔SoA conversion
+(`copy_to_gpu` / copy-back, FP64↔FP32 over the whole grid) and the per-step CPU
+diagnostics dominate, not the kernels.
+
+`nsys` also reports **no GPU memory-transfer data at all** — GB10 is a
+Grace-Blackwell superchip with a **coherent** CPU/GPU address space over
+NVLink-C2C, so `cudaMallocManaged` buffers are read in place with no discrete
+PCIe migration.
+
+### Consequence for the plan's Phase 4
+
+The plan's Phase 4 — pinned host staging + `cudaMemcpyAsync` H2D overlapped with
+compute — is designed for a **discrete** GPU. On GB10 there is no transfer to
+overlap, and an early experiment confirmed the hazard: issuing a
+`cudaMemPrefetchAsync` + `cudaStreamWaitEvent` gate before each substep
+*regressed* the production grid (13.1 vs 10.8 ms/step) by forcing a migration
+onto the critical path that coherent access did not need.
+
+### What was implemented
+
+The dual-stream architecture is implemented as the plan specifies — a dedicated
+`copy_stream_` + completion event, and `upload_snapshots_async()` which
+prefetches the freshly-packed `snap_curr`/`snap_prev` onto the copy stream and
+gates the compute stream — but it is **guarded by a runtime memory-model check**
+(`cudaDevAttrPageableMemoryAccess` / `prop.integrated`). On a coherent part
+(GB10 → "coherent host memory: yes") the prefetch+gate is skipped, so Phase 4 is
+a correctness- and performance-neutral no-op there; on a discrete GPU (A100, the
+plan's target) the path stays active and moves the SoA upload onto its own
+stream so it can overlap the previous substep's compute.
+
+### Performance
+
+| Grid | Phase 3 ms/step | Phase 4 ms/step | Speedup vs CPU |
+|------|----------------:|----------------:|---------------:|
+| 64×64×32 (131k) | 10.79 | 11.48 | 4.90× |
+
+Within run-to-run noise (≈±10%), Phase 4 is neutral on GB10 — the intended
+outcome given coherent memory. The takeaway recorded for future work: on this
+class of hardware the lever is **not** transfer overlap but reducing host-side
+per-step cost (keeping evolving state GPU-resident across timesteps, moving the
+`eps_max` reduction onto the GPU) and speeding the dominant compute-bound
+kernel (Phase 5).
