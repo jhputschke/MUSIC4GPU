@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cmath>
 #include <memory>
+#include <vector>
 
 #include "util.h"
 #include "data.h"
@@ -42,6 +43,29 @@ void Advance::init_metal_if_needed(SCGrid &arena_current) {
         gpu_ready_ = false;
         return;
     }
+
+    // Sample P(e) and dP/de(e) at rhob=0 on a uniform grid for the GPU EOS.
+    // This covers the standard zero-net-baryon case.
+    {
+        const int    N_EOS   = GPU_EOS_N;
+        double       eps_max = eos.get_eps_max();
+        if (eps_max <= 0.0) eps_max = 1.0e4;
+        const double de = eps_max / static_cast<double>(N_EOS - 1);
+        std::vector<float> P_data(N_EOS), dPde_data(N_EOS);
+        for (int i = 0; i < N_EOS; i++) {
+            const double e = i * de;
+            P_data[i]    = static_cast<float>(eos.get_pressure(e, 0.0));
+            dPde_data[i] = static_cast<float>(eos.get_dpde(e, 0.0));
+        }
+        if (!gpu_grid_.upload_eos(P_data.data(), dPde_data.data(),
+                                  N_EOS, 0.0f, static_cast<float>(eps_max))) {
+            music_message << "[MUSIC-GPU] EOS table upload failed.";
+            music_message.flush("warning");
+            gpu_ready_ = false;
+            return;
+        }
+    }
+
     gpu_ready_ = true;
     music_message << "[MUSIC-GPU] GPU grid allocated ("
                   << arena_current.nX() << "x"
@@ -63,6 +87,7 @@ void Advance::make_gpu_params(double tau_rk, MUSICGridParams &p) const {
     p.boost_invariant = DATA.boost_invariant ? 1 : 0;
     p.turn_on_bulk    = DATA.turn_on_bulk;
     p.turn_on_diff    = DATA.turn_on_diff;
+    p.minmod_theta    = static_cast<float>(DATA.minmod_theta);
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -125,6 +150,7 @@ void Advance::AdvanceIt(const double tau,
 
         auto& mp = MetalPipelines::instance();
         mp.dispatch_w_source(gpu_grid_, gp);
+        mp.dispatch_delta_qi(gpu_grid_, gp);
         mp.wait();   // synchronize – on Apple Silicon this is near-zero cost
 
         gpu_dwmn = gpu_grid_.dwmn;   // CPU-readable (unified memory)
@@ -141,16 +167,16 @@ void Advance::AdvanceIt(const double tau,
         double y_local     = - DATA.y_size  /2. +   iy*DATA.delta_y;
 
 #ifdef USE_METAL
-        // Pass the GPU-computed dwmn pointer (null → CPU fallback inside
-        // FirstRKStepT) and cell index.
-        const int cell = grid_nx * (grid_ny * ieta + iy) + ix;
-        const float* cell_dwmn = gpu_ready_
-                                 ? gpu_dwmn + cell  // base ptr; stride = Ncells
-                                 : nullptr;
+        // Pass GPU-computed dwmn and qi_out pointers (null → CPU fallback).
+        // Component-major layout: field[alpha * Ncells + cell]; stride = Ncells.
+        const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;
+        const int Ncells_gpu = grid_nx * grid_ny * grid_neta;
+        const float* cell_dwmn = gpu_ready_ ? gpu_dwmn + cell : nullptr;
+        const float* cell_qi   = gpu_ready_ ? gpu_grid_.qi_out + cell : nullptr;
         FirstRKStepT(tau, x_local, y_local, eta_s_local,
                      arena_current, arena_future, arena_prev,
                      ix, iy, ieta, rk_flag,
-                     cell_dwmn, grid_nx * grid_ny * grid_neta);
+                     cell_dwmn, cell_qi, Ncells_gpu);
 #else
         FirstRKStepT(tau, x_local, y_local, eta_s_local,
                      arena_current, arena_future, arena_prev,
@@ -192,12 +218,25 @@ void Advance::FirstRKStepT(
         const double eta_s_local,
         SCGrid &arena_current, SCGrid &arena_future, SCGrid &arena_prev,
         const int ix, const int iy, const int ieta, const int rk_flag,
-        const float* gpu_dwmn_base, int Ncells) {
+        const float* gpu_dwmn_base, const float* gpu_qi_base, int Ncells) {
     // this advances the ideal part
     double tau_rk = tau + rk_flag*(DATA.delta_tau);
 
     TJbVec qi = {0};
-    MakeDeltaQI(tau_rk, arena_current, ix, iy, ieta, qi, rk_flag);
+#ifdef USE_METAL
+    if (gpu_qi_base && Ncells > 0) {
+        // Component-major layout: qi_out[alpha * Ncells + cell]
+        // gpu_qi_base points to qi_out[0 * Ncells + cell]; stride = Ncells.
+        for (int alpha = 0; alpha < 5; alpha++)
+            qi[alpha] = static_cast<double>(gpu_qi_base[alpha * Ncells]);
+
+
+    } else {
+#endif
+        MakeDeltaQI(tau_rk, arena_current, ix, iy, ieta, qi, rk_flag);
+#ifdef USE_METAL
+    }
+#endif
 
     TJbVec qi_source = {0.0};
 

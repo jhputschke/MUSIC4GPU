@@ -9,6 +9,7 @@
 #pragma once
 
 #include "../grid.h"   // SCGrid = GridT<Cell_small>
+#include "gpu_types.h" // GPUEosParams, GPU_EOS_N
 
 // Number of components per field
 static const int GPU_WMUNU_COMPS = 14;
@@ -66,6 +67,21 @@ public:
     // Output buffer: dwmn[5 * Ncells] produced by gpu_make_w_source.
     float* dwmn = nullptr;
 
+    // EOS table (sampled at rhob=0 on a uniform grid; see GPUEosParams).
+    // Uploaded once at init time via upload_eos().
+    float*       eos_P    = nullptr;   // pressure table    [GPU_EOS_N]
+    float*       eos_dPde = nullptr;   // dP/de table       [GPU_EOS_N]
+    GPUEosParams eos_params = {};
+
+    // Output buffer: qi_out[5 * Ncells] produced by gpu_make_delta_qi.
+    float* qi_out = nullptr;
+
+    // Upload a pre-sampled EOS table (both P and dP/de) to GPU shared memory.
+    // Must be called after allocate() and before the first dispatch_delta_qi.
+    // n_pts must be <= GPU_EOS_N.
+    bool upload_eos(const float* P_data, const float* dPde_data,
+                    int n_pts, float e_min, float e_max);
+
 private:
     // Allocate one snapshot's worth of Metal shared buffers.
     bool alloc_snapshot(GPUSnapshot& s, int Ncells);
@@ -78,6 +94,7 @@ private:
 
     // Opaque MTLBuffer handles kept alive via CF-bridged __bridge_retained.
     // Stored as void* to keep this header free of ObjC.
-    void* buf_handles_[3 * 5 + 1];  // 3 snapshots × 5 fields + dwmn
+    // 3 snapshots × 5 fields + dwmn + eos_P + eos_dPde + qi_out = 19 max
+    void* buf_handles_[24];
     int   n_handles_ = 0;
 };

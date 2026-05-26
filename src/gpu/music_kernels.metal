@@ -388,3 +388,474 @@ kernel void gpu_first_rk_step_w(
     for (int m = 0; m < 14; ++m)
         Wmunu_future[m * Ncells + c] = Wf[m];
 }
+
+// ── gpu_make_delta_qi ─────────────────────────────────────────────────────────
+//
+// Ideal KT flux kernel: GPU port of Advance::MakeDeltaQI() in advance.cpp.
+//
+// For each cell, computes:
+//   qi[alpha] = tau * T^{alpha,0}(c)
+//             + sum_dir KT_flux_divergence[alpha,dir] * delta_tau
+//             + longitudinal_geometric_terms * delta_tau
+//
+// EOS requirement (Tier 2): uses pre-sampled P(e) and dP/de(e) tables at
+// rhob=0 (stored in eos_P / eos_dPde buffers).  This covers the standard
+// zero-net-baryon case.  For finite-muB EOS the CPU path is used as fallback.
+//
+// Buffer bindings (must match MetalPipelines::dispatch_delta_qi):
+//   0  epsilon_curr [Ncells]
+//   1  rhob_curr    [Ncells]
+//   2  u_curr       [4*Ncells]
+//   3  eos_P        [GPU_EOS_N]   pressure table, rhob=0
+//   4  eos_dPde     [GPU_EOS_N]   dP/de  table, rhob=0
+//   5  qi_out       [5*Ncells]    output
+//   6  params
+//   7  eos_p
+
+// ── EOS table helpers ─────────────────────────────────────────────────────────
+
+inline float gpu_eos_interp(device const float* table, float e,
+                             constant GPUEosParams& ep) {
+    e = clamp(e, ep.e_min, ep.e_max);
+    float fe  = (e - ep.e_min) / ep.delta_e;
+    int   idx = min((int)fe, ep.n_pts - 2);
+    idx = max(0, idx);
+    float frac = fe - (float)idx;
+    return table[idx] * (1.f - frac) + table[idx + 1] * frac;
+}
+
+inline float gpu_P(float e, device const float* P_tab,
+                   constant GPUEosParams& ep) {
+    return max(1.e-20f, gpu_eos_interp(P_tab, e, ep));
+}
+
+inline float gpu_dPde(float e, device const float* dPde_tab,
+                      constant GPUEosParams& ep) {
+    return gpu_eos_interp(dPde_tab, e, ep);
+}
+
+// Speed of sound squared, clamped to physical range [0.01, 1/3].
+// dP/drhob = 0 assumed (rhob=0 EOS table).
+inline float gpu_cs2(float e, device const float* P_tab,
+                     device const float* dPde_tab, constant GPUEosParams& ep) {
+    return clamp(gpu_dPde(e, dPde_tab, ep), 0.01f, 0.333333f);
+}
+
+// ── minmod slope limiter ──────────────────────────────────────────────────────
+
+inline float gpu_minmod_dx(float up1, float u, float um1, float theta) {
+    float diffup   = (up1 - u)   * theta;
+    float diffdown = (u   - um1) * theta;
+    float diffmid  = (up1 - um1) * 0.5f;
+    if (diffup == 0.f) return 0.f;
+    return diffup * max(0.f, min(1.f, min(diffdown / diffup, diffmid / diffup)));
+}
+
+// ── T^{alpha,0} from SoA cell ─────────────────────────────────────────────────
+
+// Returns T^{alpha,0}(cell c) * tau, using stored epsilon/rhob/u.
+inline float gpu_TJb0(int alpha, int c, int Ncells,
+                      device const float* eps_buf,
+                      device const float* rhob_buf,
+                      device const float* u_buf,
+                      device const float* P_tab,
+                      constant GPUEosParams& ep) {
+    float u0 = u_buf[0 * Ncells + c];
+    if (alpha == 4) return rhob_buf[c] * u0;
+    float e = eps_buf[c];
+    float P = gpu_P(e, P_tab, ep);
+    if (alpha == 0) return (e + P) * u0 * u0 - P;
+    return (e + P) * u_buf[alpha * Ncells + c] * u0;
+}
+
+// ── Newton-Brent reconstruction helpers ──────────────────────────────────────
+
+struct ReconstResult {
+    float e;
+    float rhob;
+    float u[4];
+};
+
+// f(v) and df/dv for the velocity Newton solve.
+// Assumes dP/drhob = 0 (rhob=0 EOS table).
+inline void gpu_vel_fdf(float v, float T00, float M, float J0,
+                        thread float& fv, thread float& dfdv,
+                        device const float* P_tab,
+                        device const float* dPde_tab,
+                        constant GPUEosParams& ep) {
+    float eps  = T00 - v * M;
+    // For the 1D (rhob=0) EOS, dP/drhob=0 so the J0 / rho terms vanish.
+    float P    = gpu_P(eps, P_tab, ep);
+    float dPde = gpu_dPde(eps, dPde_tab, ep);
+    float t1   = T00 + P;
+    fv   = v - M / t1;
+    dfdv = 1.f - M * M * dPde / (t1 * t1);
+    (void)J0;
+}
+
+// Hybrid Newton-Brent root-finder for the velocity.
+inline float gpu_solve_v(float v_guess, float T00, float M, float J0,
+                          device const float* P_tab,
+                          device const float* dPde_tab,
+                          constant GPUEosParams& ep) {
+    const float ABS_ERR = 1.e-7f;
+    float fv_l, dfdv_l, fv_h, dfdv_h;
+    float v_l = 0.f, v_h = 1.f;
+    gpu_vel_fdf(v_l, T00, M, J0, fv_l, dfdv_l, P_tab, dPde_tab, ep);
+    gpu_vel_fdf(v_h, T00, M, J0, fv_h, dfdv_h, P_tab, dPde_tab, ep);
+
+    if (abs(fv_l) < ABS_ERR) return v_l;
+    if (abs(fv_h) < ABS_ERR) return v_h;
+    if (fv_l * fv_h > 0.f) return 0.f;
+
+    float dv_prev = v_h - v_l;
+    float dv_curr = dv_prev;
+    float v_root  = (v_h + v_l) * 0.5f;
+    float fv, dfdv;
+    gpu_vel_fdf(v_root, T00, M, J0, fv, dfdv, P_tab, dPde_tab, ep);
+
+    for (int it = 0; it < 60; it++) {
+        if (((v_root - v_h) * dfdv - fv) * ((v_root - v_l) * dfdv - fv) > 0.f
+            || abs(2.f * fv) > abs(dv_prev * dfdv)) {
+            dv_prev = dv_curr;
+            dv_curr = (v_h - v_l) * 0.5f;
+            v_root  = v_l + dv_curr;
+        } else {
+            dv_prev = dv_curr;
+            dv_curr = fv / dfdv;
+            v_root  = v_root - dv_curr;
+        }
+        gpu_vel_fdf(v_root, T00, M, J0, fv, dfdv, P_tab, dPde_tab, ep);
+        if (fv * fv_l < 0.f) { v_h = v_root; fv_h = fv; }
+        else                  { v_l = v_root; fv_l = fv; }
+        if (abs(dv_curr) < ABS_ERR) break;
+    }
+    return v_root;
+}
+
+// f(u0) and df/du0 for the high-velocity Newton solve.
+inline void gpu_u0_fdf(float u0, float T00, float K00, float M, float J0,
+                        thread float& fu0, thread float& dfdu0,
+                        device const float* P_tab,
+                        device const float* dPde_tab,
+                        constant GPUEosParams& ep) {
+    const float ABS_ERR = 1.e-10f;
+    float v       = sqrt(max(0.f, 1.f - 1.f / (u0 * u0)));
+    float epsilon = T00 - v * M;
+    float dedu0   = -M / (u0 * u0 * u0 * v + ABS_ERR);
+    float P       = gpu_P(epsilon, P_tab, ep);
+    float dPde    = gpu_dPde(epsilon, dPde_tab, ep);
+    float temp1   = (T00 + P) * (T00 + P) - K00;
+    float den1    = sqrt(max(0.f, temp1));
+    float temp    = (T00 + P) / max(den1, ABS_ERR);
+    fu0    = u0 - temp;
+    dfdu0  = 1.f + dedu0 * dPde * K00 / max(temp1 * den1, ABS_ERR);
+}
+
+inline float gpu_solve_u0(float u0_guess, float T00, float K00, float M, float J0,
+                           device const float* P_tab,
+                           device const float* dPde_tab,
+                           constant GPUEosParams& ep) {
+    const float ABS_ERR = 1.e-7f;
+    float u0_l = max(1.f, 0.5f * u0_guess);
+    float u0_h = min(1.e4f, 1.5f * u0_guess);
+    if (u0_h < 1.f + ABS_ERR) u0_h = 2.f;
+
+    float fu0_l, dfdu0_l, fu0_h, dfdu0_h;
+    gpu_u0_fdf(u0_l, T00, K00, M, J0, fu0_l, dfdu0_l, P_tab, dPde_tab, ep);
+    gpu_u0_fdf(u0_h, T00, K00, M, J0, fu0_h, dfdu0_h, P_tab, dPde_tab, ep);
+
+    if (abs(fu0_l) < ABS_ERR) return u0_l;
+    if (abs(fu0_h) < ABS_ERR) return u0_h;
+    if (fu0_l * fu0_h > 0.f)  return u0_guess;  // no bracket; return guess
+
+    float du0_prev = u0_h - u0_l;
+    float du0_curr = du0_prev;
+    float u0_root  = (u0_h + u0_l) * 0.5f;
+    float fu0, dfdu0;
+    gpu_u0_fdf(u0_root, T00, K00, M, J0, fu0, dfdu0, P_tab, dPde_tab, ep);
+
+    for (int it = 0; it < 60; it++) {
+        if (((u0_root - u0_h) * dfdu0 - fu0) * ((u0_root - u0_l) * dfdu0 - fu0) > 0.f
+            || abs(2.f * fu0) > abs(du0_prev * dfdu0)) {
+            du0_prev = du0_curr;
+            du0_curr = (u0_h - u0_l) * 0.5f;
+            u0_root  = u0_l + du0_curr;
+        } else {
+            du0_prev = du0_curr;
+            du0_curr = fu0 / dfdu0;
+            u0_root  = u0_root - du0_curr;
+        }
+        gpu_u0_fdf(u0_root, T00, K00, M, J0, fu0, dfdu0, P_tab, dPde_tab, ep);
+        if (fu0 * fu0_l < 0.f) { u0_h = u0_root; fu0_h = fu0; }
+        else                    { u0_l = u0_root; fu0_l = fu0; }
+        if (abs(du0_curr) < ABS_ERR) break;
+    }
+    return u0_root;
+}
+
+// ── Main reconstruction (matches Reconst::ReconstIt_shell on CPU) ─────────────
+
+// tauq[5] = tau * {T^{00}, T^{10}, T^{20}, T^{30}, J^0} at a half-interface.
+// prev_u[4], prev_eps: full center-cell 4-velocity and energy used for Newton
+// initial guess and for the revert fallback (matches revert_grid on CPU).
+ReconstResult gpu_reconst(float tau, float tauq[5],
+                           thread const float prev_u[4], float prev_eps,
+                           device const float* P_tab,
+                           device const float* dPde_tab,
+                           constant GPUEosParams& ep) {
+    const float ABS_ERR = 1.e-8f;
+
+    ReconstResult res;
+    res.rhob   = 0.f;
+    res.u[0]   = 1.f;  res.u[1] = 0.f;  res.u[2] = 0.f;  res.u[3] = 0.f;
+
+    // Convert tau*q → q (matching ReconstIt_shell)
+    float q[5];
+    for (int i = 0; i < 5; i++) q[i] = tauq[i] / tau;
+
+    float K00 = q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+    float M   = sqrt(K00);
+    float T00 = q[0];
+    float J0  = q[4];
+
+    // Low energy: regulate (return small e, u=rest frame)
+    if (T00 < ABS_ERR) {
+        res.e = ABS_ERR;
+        return res;
+    }
+    // Can't invert: revert to previous cell state (full 4-velocity, matches revert_grid)
+    if (T00 < M) {
+        res.e    = prev_eps;
+        res.u[0] = prev_u[0];
+        res.u[1] = prev_u[1];
+        res.u[2] = prev_u[2];
+        res.u[3] = prev_u[3];
+        return res;
+    }
+
+    float v_guess = sqrt(max(0.f, 1.f - 1.f / (prev_u[0] * prev_u[0] + ABS_ERR)));
+    float v_sol   = gpu_solve_v(v_guess, T00, M, J0, P_tab, dPde_tab, ep);
+
+    float u0      = 1.f / (sqrt(max(0.f, 1.f - v_sol * v_sol)) + v_sol * ABS_ERR);
+    float epsilon = T00 - v_sol * M;
+    float rhob    = J0 / u0;
+
+    // High-velocity branch (v > 0.563624)
+    if (v_sol > 0.563624f) {
+        float u0_sol = gpu_solve_u0(u0, T00, K00, M, J0, P_tab, dPde_tab, ep);
+        if (u0_sol >= 1.f) {
+            u0      = u0_sol;
+            epsilon = T00 - sqrt(max(0.f, (1.f - 1.f / (u0 * u0)) * K00));
+            rhob    = J0 / u0;
+        }
+    }
+
+    res.e    = epsilon;
+    res.rhob = rhob;
+
+    float P       = gpu_P(epsilon, P_tab, ep);
+    float vel_inv = u0 / (T00 + P);
+    res.u[0]  = u0;
+    res.u[1]  = q[1] * vel_inv;
+    res.u[2]  = q[2] * vel_inv;
+    res.u[3]  = q[3] * vel_inv;
+
+    // Enforce unit-norm: u^mu u_mu = -1 (metric -,+,+,+)
+    float u_sp_sq = res.u[1]*res.u[1] + res.u[2]*res.u[2] + res.u[3]*res.u[3];
+    if (abs(u0*u0 - u_sp_sq - 1.f) > ABS_ERR) {
+        float scale = sqrt(max(0.f, (u0*u0 - 1.f) / (u_sp_sq + ABS_ERR)));
+        res.u[1] *= scale;
+        res.u[2] *= scale;
+        res.u[3] *= scale;
+    }
+    return res;
+}
+
+// ── MaxSpeed (matches Advance::MaxSpeed on CPU) ───────────────────────────────
+
+inline float gpu_max_speed(float tau, int direction, ReconstResult r,
+                            device const float* P_tab,
+                            device const float* dPde_tab,
+                            constant GPUEosParams& ep) {
+    // g-factor: g[dir-1] = {1, 1, 1/tau} for direction {1,2,3}
+    float gfac = (direction == 3) ? 1.f / tau : 1.f;
+
+    float utau    = r.u[0];
+    float ux      = abs(r.u[direction]);
+    float utau2   = utau * utau;
+    float ut2mux2 = utau2 - ux * ux;
+
+    float cs2    = gpu_cs2(r.e, P_tab, dPde_tab, ep);
+    float num_sq = (ut2mux2 - (ut2mux2 - 1.f) * cs2) * cs2;
+    float num;
+    if (num_sq >= 0.f) {
+        num = utau * ux * (1.f - cs2) + sqrt(num_sq);
+    } else {
+        float dPde = gpu_dPde(r.e, dPde_tab, ep);
+        float P    = gpu_P(r.e, P_tab, ep);
+        float h    = P + r.e;
+        num = (dPde < 0.001f)
+              ? sqrt(max(0.f, -(h*dPde*h*(dPde*(-1.f + ut2mux2) - ut2mux2))))
+                - h*(-1.f + dPde)*utau*ux
+              : 1.f;   // fallback for unphysical case
+    }
+    float den = utau2 * (1.f - cs2) + cs2;
+    float f   = num / max(den, 1.e-20f);
+    f = clamp(f, ux / utau, 1.f);
+    return f * gfac;
+}
+
+// ── T^{alpha,direction} from a ReconstResult ─────────────────────────────────
+
+// Returns T^{alpha,nu} * tau_fac where tau_fac = {0,tau,tau,1}[nu].
+// Matches Advance::get_TJb(ReconstCell, 0, alpha, nu).
+inline float gpu_get_TJb_reconst(ReconstResult r, int alpha, int direction,
+                                  float tau_fac,
+                                  device const float* P_tab,
+                                  constant GPUEosParams& ep) {
+    float u_nu = r.u[direction];
+    if (alpha == 4) return r.rhob * u_nu * tau_fac;
+    float P    = gpu_P(r.e, P_tab, ep);
+    float gfac = 0.f;
+    float u_mu;
+    if (alpha == direction) {
+        u_mu = u_nu;
+        gfac = (alpha == 0) ? -1.f : 1.f;
+    } else {
+        u_mu = r.u[alpha];
+    }
+    return ((r.e + P) * u_mu * u_nu + P * gfac) * tau_fac;
+}
+
+// ── gpu_make_delta_qi kernel ──────────────────────────────────────────────────
+
+kernel void gpu_make_delta_qi(
+    device const float*       epsilon_curr [[buffer(0)]],
+    device const float*       rhob_curr    [[buffer(1)]],
+    device const float*       u_curr       [[buffer(2)]],
+    device const float*       eos_P        [[buffer(3)]],
+    device const float*       eos_dPde     [[buffer(4)]],
+    device       float*       qi_out       [[buffer(5)]],
+    constant MUSICGridParams& params       [[buffer(6)]],
+    constant GPUEosParams&    eos_p        [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    int ix   = (int)gid.x;
+    int iy   = (int)gid.y;
+    int ieta = (int)gid.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+    const float tau  = params.tau;
+    const float theta = params.minmod_theta;
+
+    const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    // Center-cell values (used for Newton initial guess and revert fallback)
+    float e_c    = epsilon_curr[c];
+    float u_c[4];
+    for (int m = 0; m < 4; m++) u_c[m] = u_curr[m * Ncells + c];
+
+    // qi[alpha] = tau * T^{alpha,0}(c)
+    float qi[5];
+    for (int alpha = 0; alpha < 5; alpha++)
+        qi[alpha] = tau * gpu_TJb0(alpha, c, Ncells,
+                                   epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+
+    const float delta[4]   = {0.f, params.delta_x, params.delta_y, params.delta_eta};
+    const float tau_fac[4] = {0.f, tau, tau, 1.f};
+
+    float rhs[5]     = {0.f, 0.f, 0.f, 0.f, 0.f};
+    float T_eta_m[4] = {0.f, 0.f, 0.f, 0.f};
+    float T_eta_p[4] = {0.f, 0.f, 0.f, 0.f};
+
+    // Stencil offsets: dir=0→x, dir=1→y, dir=2→eta
+    const int DX[3]   = {1, 0, 0};
+    const int DY[3]   = {0, 1, 0};
+    const int DETA[3] = {0, 0, 1};
+
+    for (int dir = 0; dir < 3; dir++) {
+        int direction = dir + 1;   // 1, 2, or 3
+
+        int ip1 = clamped_cell(ix+  DX[dir], iy+  DY[dir], ieta+  DETA[dir], Nx, Ny, Neta);
+        int ip2 = clamped_cell(ix+2*DX[dir], iy+2*DY[dir], ieta+2*DETA[dir], Nx, Ny, Neta);
+        int im1 = clamped_cell(ix-  DX[dir], iy-  DY[dir], ieta-  DETA[dir], Nx, Ny, Neta);
+        int im2 = clamped_cell(ix-2*DX[dir], iy-2*DY[dir], ieta-2*DETA[dir], Nx, Ny, Neta);
+
+        // Build minmod-limited half-state conserved vectors
+        float qiphL[5], qiphR[5], qimhL[5], qimhR[5];
+        for (int alpha = 0; alpha < 5; alpha++) {
+            float gc  = qi[alpha];   // tau * T^{alpha,0}(c) — already computed
+            float gp1 = tau * gpu_TJb0(alpha, ip1, Ncells,
+                                       epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float gp2 = tau * gpu_TJb0(alpha, ip2, Ncells,
+                                       epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float gm1 = tau * gpu_TJb0(alpha, im1, Ncells,
+                                       epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float gm2 = tau * gpu_TJb0(alpha, im2, Ncells,
+                                       epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+
+            float fphL =  0.5f * gpu_minmod_dx(gp1, gc,  gm1, theta);
+            float fphR = -0.5f * gpu_minmod_dx(gp2, gp1, gc,  theta);
+            float fmhL =  0.5f * gpu_minmod_dx(gc,  gm1, gm2, theta);
+            float fmhR = -fphL;   // symmetric: -(1/2)*minmod_dx(gp1, gc, gm1)
+
+            qiphL[alpha] = gc  + fphL;
+            qiphR[alpha] = gp1 + fphR;
+            qimhL[alpha] = gm1 + fmhL;
+            qimhR[alpha] = gc  + fmhR;
+        }
+
+        // Reconstruct primitive variables at all four half-interfaces
+        ReconstResult r_phL = gpu_reconst(tau, qiphL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_mhR = gpu_reconst(tau, qimhR, u_c, e_c, eos_P, eos_dPde, eos_p);
+
+        // Local propagation speeds (KT upwinding)
+        float aiph_L = gpu_max_speed(tau, direction, r_phL, eos_P, eos_dPde, eos_p);
+        float aiph_R = gpu_max_speed(tau, direction, r_phR, eos_P, eos_dPde, eos_p);
+        float aimh_L = gpu_max_speed(tau, direction, r_mhL, eos_P, eos_dPde, eos_p);
+        float aimh_R = gpu_max_speed(tau, direction, r_mhR, eos_P, eos_dPde, eos_p);
+        float aiph   = max(aiph_L, aiph_R);
+        float aimh   = max(aimh_L, aimh_R);
+
+        float tf = tau_fac[direction];
+        float dx = delta[direction];
+
+        // KT numerical flux H_{j+1/2} = (F^+ + F^-)/2 - a*(u^+ - u^-)/2
+        for (int alpha = 0; alpha < 5; alpha++) {
+            float FiphL = gpu_get_TJb_reconst(r_phL, alpha, direction, tf, eos_P, eos_p);
+            float FiphR = gpu_get_TJb_reconst(r_phR, alpha, direction, tf, eos_P, eos_p);
+            float FimhL = gpu_get_TJb_reconst(r_mhL, alpha, direction, tf, eos_P, eos_p);
+            float FimhR = gpu_get_TJb_reconst(r_mhR, alpha, direction, tf, eos_P, eos_p);
+
+            float Fiph = 0.5f * ((FiphL + FiphR) - aiph * (qiphR[alpha] - qiphL[alpha]));
+            float Fimh = 0.5f * ((FimhL + FimhR) - aimh * (qimhR[alpha] - qimhL[alpha]));
+
+            // Longitudinal direction: save for geometric terms below
+            if (direction == 3 && (alpha == 0 || alpha == 3)) {
+                T_eta_m[alpha] = Fimh;
+                T_eta_p[alpha] = Fiph;
+            } else {
+                rhs[alpha] += (Fimh - Fiph) / dx * params.delta_tau;
+            }
+        }
+    }  // dir loop
+
+    // Longitudinal geometric terms (boost-invariant or full 3+1)
+    float cd = params.cosh_deta;
+    float sd = params.sinh_deta;
+    rhs[0] += (  (T_eta_m[0] - T_eta_p[0]) * cd
+               - (T_eta_m[3] + T_eta_p[3]) * sd) * params.delta_tau;
+    rhs[3] += (  (T_eta_m[3] - T_eta_p[3]) * cd
+               - (T_eta_m[0] + T_eta_p[0]) * sd) * params.delta_tau;
+
+    // Write qi + rhs
+    for (int alpha = 0; alpha < 5; alpha++)
+        qi_out[alpha * Ncells + c] = qi[alpha] + rhs[alpha];
+}

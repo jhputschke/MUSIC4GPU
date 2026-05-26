@@ -27,6 +27,13 @@ public:
     // Non-blocking: call wait() to ensure completion.
     void dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& params);
 
+    // Dispatch gpu_make_delta_qi over the full grid.
+    // Reads from gpu.snap_curr (epsilon, rhob, u) and gpu.eos_P / gpu.eos_dPde.
+    // Writes qi_out[5 * Ncells] into gpu.qi_out.
+    // gpu.upload_eos() must have been called before the first dispatch.
+    // Non-blocking: call wait() to ensure completion.
+    void dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& params);
+
     // Block until all pending GPU work is done.
     void wait();
 
@@ -37,9 +44,10 @@ private:
     bool   ready_ = false;
 
     // Opaque pointers to Metal objects (avoid ObjC in header).
-    void*  device_       = nullptr;  // id<MTLDevice>
-    void*  cmd_queue_    = nullptr;  // id<MTLCommandQueue>
-    void*  library_      = nullptr;  // id<MTLLibrary>
-    void*  pso_w_source_ = nullptr;  // id<MTLComputePipelineState>
-    void*  cmd_buf_      = nullptr;  // last id<MTLCommandBuffer>
+    void*  device_        = nullptr;  // id<MTLDevice>
+    void*  cmd_queue_     = nullptr;  // id<MTLCommandQueue>
+    void*  library_       = nullptr;  // id<MTLLibrary>
+    void*  pso_w_source_  = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_delta_qi_  = nullptr;  // id<MTLComputePipelineState>
+    void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
 };

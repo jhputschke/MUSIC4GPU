@@ -31,6 +31,19 @@ struct MUSICGridParams {
     int   turn_on_diff;   // baryon diffusion flag
     float cosh_deta;      // precomputed geometric factor
     float sinh_deta;      // precomputed geometric factor
+    float minmod_theta;   // flux limiter parameter (used by gpu_make_delta_qi)
+};
+
+// EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
+// Covers the majority of use cases (zero net baryon density).
+// For finite-muB EOS the CPU fallback is used.
+#define GPU_EOS_N 8192
+
+struct GPUEosParams {
+    float e_min;    // lower bound (0)
+    float e_max;    // upper bound (eos.get_eps_max())
+    float delta_e;  // spacing = (e_max - e_min) / (n_pts - 1)
+    int   n_pts;    // number of sample points (GPU_EOS_N)
 };
 
 // Wmunu 2D->1D index table (same as Util::map_2d_idx_to_1d)

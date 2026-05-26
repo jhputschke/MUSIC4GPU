@@ -21,6 +21,7 @@ MetalPipelines& MetalPipelines::instance() {
 }
 
 MetalPipelines::~MetalPipelines() {
+    if (pso_delta_qi_) { CFRelease(pso_delta_qi_); }
     if (pso_w_source_) { CFRelease(pso_w_source_); }
     if (library_)      { CFRelease(library_); }
     if (cmd_queue_)    { CFRelease(cmd_queue_); }
@@ -94,6 +95,21 @@ bool MetalPipelines::initialize(const char* metallib_path) {
 
     fprintf(stderr, "[MUSIC-GPU] Initialized. max threads/group = %lu\n",
             (unsigned long)[pso maxTotalThreadsPerThreadgroup]);
+
+    // 5. Build pipeline state for gpu_make_delta_qi
+    id<MTLFunction> fn_dqi = [lib newFunctionWithName:@"gpu_make_delta_qi"];
+    if (!fn_dqi) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_delta_qi' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_dqi =
+        [dev newComputePipelineStateWithFunction:fn_dqi error:&err];
+    if (!pso_dqi) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_delta_qi failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_delta_qi_ = (__bridge_retained void*)pso_dqi;
 
     ready_ = true;
     return true;
@@ -176,6 +192,61 @@ void MetalPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& para
     [enc setBytes:&params length:sizeof(params) atIndex:7];
 
     // 3-D thread grid: one thread per cell (ix, iy, ieta)
+    MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
+    MTLSize num_groups = MTLSizeMake(
+        (gpu.Nx()   + 7) / 8,
+        (gpu.Ny()   + 7) / 8,
+        (gpu.Neta() + 3) / 4
+    );
+
+    [enc dispatchThreadgroups:num_groups threadsPerThreadgroup:threads_per_group];
+    [enc endEncoding];
+    [cb commit];
+
+    if (cmd_buf_) CFRelease(cmd_buf_);
+    cmd_buf_ = (__bridge_retained void*)cb;
+}
+
+// ── dispatch_delta_qi ─────────────────────────────────────────────────────────
+//
+// Dispatches gpu_make_delta_qi: the ideal KT flux kernel (port of MakeDeltaQI).
+// Buffer layout must match [[buffer(N)]] indices in music_kernels.metal.
+
+void MetalPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& params) {
+    if (!ready_) return;
+
+    auto dev = (__bridge id<MTLDevice>)              device_;
+    auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
+    auto pso = (__bridge id<MTLComputePipelineState>)pso_delta_qi_;
+
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    auto get_buf = [&](const float* ptr) -> id<MTLBuffer> {
+        return buffer_for_ptr(handles, n_handles, ptr);
+    };
+
+    id<MTLCommandBuffer>         cb  = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+
+    // Binding order (must match gpu_make_delta_qi in .metal):
+    //   0  epsilon_curr [Ncells]
+    //   1  rhob_curr    [Ncells]
+    //   2  u_curr       [4*Ncells]
+    //   3  eos_P        [GPU_EOS_N]
+    //   4  eos_dPde     [GPU_EOS_N]
+    //   5  qi_out       [5*Ncells]
+    //   6  params       (constant struct, passed inline)
+    //   7  eos_p        (constant struct, passed inline)
+    [enc setBuffer:get_buf(gpu.snap_curr.epsilon) offset:0 atIndex:0];
+    [enc setBuffer:get_buf(gpu.snap_curr.rhob)    offset:0 atIndex:1];
+    [enc setBuffer:get_buf(gpu.snap_curr.u)       offset:0 atIndex:2];
+    [enc setBuffer:get_buf(gpu.eos_P)             offset:0 atIndex:3];
+    [enc setBuffer:get_buf(gpu.eos_dPde)          offset:0 atIndex:4];
+    [enc setBuffer:get_buf(gpu.qi_out)            offset:0 atIndex:5];
+    [enc setBytes:&params          length:sizeof(params)          atIndex:6];
+    [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:7];
+
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
         (gpu.Nx()   + 7) / 8,

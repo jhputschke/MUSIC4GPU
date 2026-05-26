@@ -2,6 +2,7 @@
 // Handles Metal buffer allocation and AoS<->SoA conversion.
 
 #import <Metal/Metal.h>
+#include <cstring>
 #include "GPUGrid.h"
 #include "../grid.h"   // SCGrid, Cell_small
 
@@ -62,8 +63,36 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
                            buf_handles_, n_handles_);
     ok = ok && (dwmn != nullptr);
 
+    qi_out = alloc_metal_buf(g_metal_device,
+                             5 * static_cast<size_t>(Ncells_) * sizeof(float),
+                             buf_handles_, n_handles_);
+    ok = ok && (qi_out != nullptr);
+
     allocated_ = ok;
     return ok;
+}
+
+bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
+                         int n_pts, float e_min, float e_max) {
+    if (!g_metal_device || !allocated_) return false;
+
+    auto nc = static_cast<size_t>(n_pts);
+    eos_P    = alloc_metal_buf(g_metal_device, nc * sizeof(float),
+                                buf_handles_, n_handles_);
+    eos_dPde = alloc_metal_buf(g_metal_device, nc * sizeof(float),
+                                buf_handles_, n_handles_);
+    if (!eos_P || !eos_dPde) return false;
+
+    std::memcpy(eos_P,    P_data,    nc * sizeof(float));
+    std::memcpy(eos_dPde, dPde_data, nc * sizeof(float));
+
+    eos_params.e_min   = e_min;
+    eos_params.e_max   = e_max;
+    eos_params.n_pts   = n_pts;
+    eos_params.delta_e = (n_pts > 1)
+                         ? (e_max - e_min) / static_cast<float>(n_pts - 1)
+                         : 1.f;
+    return true;
 }
 
 void GPUGrid::release() {
@@ -76,7 +105,11 @@ void GPUGrid::release() {
     n_handles_ = 0;
     allocated_ = false;
     snap_prev = snap_curr = snap_future = GPUSnapshot{};
-    dwmn = nullptr;
+    dwmn    = nullptr;
+    qi_out  = nullptr;
+    eos_P   = nullptr;
+    eos_dPde = nullptr;
+    eos_params = {};
 }
 
 // ── AoS → SoA (double → float) ───────────────────────────────────────────────

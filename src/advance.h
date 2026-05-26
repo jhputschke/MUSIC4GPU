@@ -51,12 +51,16 @@ class Advance {
     // gpu_dwmn_base: pointer to the first alpha-component of the GPU-computed
     // dwmn buffer (component-major, stride = Ncells).  Pass nullptr to run
     // the CPU MakeWSource fallback.
+    // gpu_qi_base: pointer to the first alpha-component of the GPU-computed
+    // qi_out buffer (component-major, stride = Ncells).  Pass nullptr to run
+    // the CPU MakeDeltaQI fallback.
     void FirstRKStepT(const double tau, const double x_local,
                       const double y_local, const double eta_s_local,
                       SCGrid &arena_current, SCGrid &arena_future,
                       SCGrid &arena_prev, const int ix, const int iy,
                       const int ieta, const int rk_flag,
                       const float* gpu_dwmn_base = nullptr,
+                      const float* gpu_qi_base   = nullptr,
                       int Ncells = 0);
 
     void FirstRKStepW(const double tau_it, SCGrid &arena_prev,
