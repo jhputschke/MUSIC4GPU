@@ -17,6 +17,7 @@
 #include "eos.h"
 #include "evolve.h"
 #include "advance.h"
+#include "bench_timer.h"
 
 using Util::map_2d_idx_to_1d;
 using Util::map_1d_idx_to_2d;
@@ -222,6 +223,8 @@ void Advance::AdvanceIt(const double tau,
         // (snap_prev ← snap_curr ← snap_future) and skip the AoS→SoA
         // upload entirely.  Otherwise fall back to the standard upload path.
         bool gpu_rotated = false;
+        {
+            bench::Timer _bt_upload("advance.upload_or_rotate");
         if (gpu_state_authoritative_) {
             // rk0→rk1 intra-timestep: snap_future already has the complete
             // rk0 result; rotate so snap_curr points to it.
@@ -242,6 +245,7 @@ void Advance::AdvanceIt(const double tau,
             // unified memory, where copy_to_gpu wrote the managed buffers).
             GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
 #endif
+        }
         }
 
         MUSICGridParams gp;
@@ -308,6 +312,8 @@ void Advance::AdvanceIt(const double tau,
         // One command buffer per substep: all kernels encode into the same
         // buffer, single commit + single wait.  Saves ~6 command-buffer
         // allocations and round-trips through the Metal driver per substep.
+        {
+        bench::Timer _bt_dispatch("advance.dispatch_wait");
         mp.begin_batch();
         mp.dispatch_w_source(gpu_grid_, gp);
         mp.dispatch_delta_qi(gpu_grid_, gp);
@@ -365,6 +371,7 @@ void Advance::AdvanceIt(const double tau,
         }
         mp.end_batch();   // single commit for all kernels in this substep
         mp.wait();        // synchronize – on Apple Silicon this is near-zero cost
+        }   // close advance.dispatch_wait timer scope
 
         gpu_dwmn = gpu_grid_.dwmn;   // CPU-readable (unified memory)
 
@@ -390,6 +397,8 @@ void Advance::AdvanceIt(const double tau,
             gpu_owns_state_ = true;
         }
 
+        {
+        bench::Timer _bt_d2h("advance.d2h_copyback");
         if (!gpu_state_authoritative_ && gpu_finalize_active) {
             // Propagate post-Newton primitives into arena_future for the
             // subsequent CPU viscous pass (or just for output if both passes
@@ -403,6 +412,7 @@ void Advance::AdvanceIt(const double tau,
             // consume them.
             gpu_grid_.copy_wmunu_to_cpu(gpu_grid_.snap_future, arena_future);
         }
+        }   // close advance.d2h_copyback timer scope
     }
 #endif  // MUSIC_USE_GPU
 
