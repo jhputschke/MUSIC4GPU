@@ -165,6 +165,28 @@ slower:
 - μ_B-dependent shear multiplier (`muB_dependent_shear_to_s != 0`)
 - Cooper–Frye freeze-out / Cornelius surface finding, initial-condition construction, evolution output
 
+### Benchmarks (indicative)
+
+Production grid 64×64×32 (131k cells), `Initial_profile 0`, shear viscosity on:
+
+| Back-end | GPU | CPU baseline | Speedup @ 64×64×32 |
+|----------|-----|--------------|--------------------|
+| **Metal** | Apple M3 Max | 12-thread | **1.50×** (wall, 40 steps) |
+| **CUDA**  | NVIDIA GB10  | 20-thread | **2.40×** (wall, 40 steps) · **~5.8×** (per-step) |
+
+These are **not** a controlled head-to-head: the two back-ends run on different
+machines, different CPUs/thread counts, and (for CUDA) a different measurement
+methodology, so read each number as a speedup over *its own* host CPU, not as
+Metal-vs-CUDA. The "wall" figures are total run time (including ~0.5 s of
+one-time GPU init); the CUDA "per-step" figure isolates the evolution cost by
+differencing two step counts. The gap between CUDA's 2.4× wall and ~5.8×
+per-step reflects the key finding that at this grid the run is **host-bound**
+(GPU kernels are only ~5–6 % of wall time on GB10 — the AoS↔SoA conversion and
+per-step diagnostics dominate), so wall-clock understates the kernel speedup.
+Full per-phase and per-grid tables, the methodology, and the reproduction
+scripts (`tests/cuda_vs_cpu_bench*.sh`, `tests/cuda_perstep_bench.sh`) are in
+the per-back-end READMEs.
+
 See the per-back-end READMEs ([CUDA](README_CUDA.md), [Metal](README_Metal.md))
 for build instructions, kernel-level details, benchmarks, and the full support
 matrix with what each missing piece would take to port.
