@@ -1,8 +1,8 @@
 # Plan — GPU-Resident State Across Timesteps
 
-Status: **proposed, not started.** Deferred until a discrete GPU is available
-for performance validation (the win is largest on PCIe-attached parts; on the
-coherent GB10 the gain is the host-side pack/unpack cost only).
+Status: **Phase A + Phase B implemented and passing on RTX 3090.**
+Steps 1 and 2 of §8 are complete; Phase C (full D2H elimination) is deferred
+(every-step `output_momentum_anisotropy_vs_tau` would require a sync anyway).
 
 This is the highest-value remaining optimization identified during the CUDA
 port (see `README_CUDA.md` → "the host-bound finding"). It is an **evolve-loop**

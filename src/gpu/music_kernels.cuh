@@ -104,3 +104,14 @@ __global__ void gpu_first_rk_step_w_full(
     GPUEosParams eos_p,
     const float* __restrict__ epsilon_future,
     const float* __restrict__ rhob_future);
+
+// Block-parallel max-reduction over epsilon and rhob in snap_curr.
+// Each block reduces blockDim.x cells via shared memory; blocks collaborate
+// via atomicMax (IEEE-754 trick for non-negative floats).
+// out_eps and out_rhob must be initialized to 0 before the kernel is launched.
+__global__ void gpu_reduce_max_eps_rhob(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ rhob,
+    int Ncells,
+    float* out_eps,
+    float* out_rhob);

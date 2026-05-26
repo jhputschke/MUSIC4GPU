@@ -1826,3 +1826,47 @@ __global__ void gpu_first_rk_step_w_full(
         Wmunu_future[m * Ncells + c] = Wf[m];
     pi_b_future[c] = pi_b_out;
 }
+
+// ── Max-reduction over epsilon and rhob ───────────────────────────────────────
+//
+// Uses dynamic shared memory (2 * blockDim.x floats).
+// IEEE-754 trick: for non-negative floats, bit-casting to int preserves order,
+// so atomicMax on the integer representation gives the correct float maximum.
+
+__global__ void gpu_reduce_max_eps_rhob(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ rhob,
+    int Ncells,
+    float* out_eps,
+    float* out_rhob)
+{
+    extern __shared__ float sdata[];
+    float* s_eps  = sdata;
+    float* s_rhob = sdata + blockDim.x;
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    int       idx    = static_cast<int>(blockIdx.x * blockDim.x) + tid;
+    const int stride = static_cast<int>(blockDim.x * gridDim.x);
+
+    float le = 0.f, lr = 0.f;
+    for (; idx < Ncells; idx += stride) {
+        le = fmaxf(le, __ldg(&epsilon[idx]));
+        lr = fmaxf(lr, __ldg(&rhob[idx]));
+    }
+    s_eps[tid]  = le;
+    s_rhob[tid] = lr;
+    __syncthreads();
+
+    for (int s = static_cast<int>(blockDim.x) >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_eps[tid]  = fmaxf(s_eps[tid],  s_eps[tid + s]);
+            s_rhob[tid] = fmaxf(s_rhob[tid], s_rhob[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicMax(reinterpret_cast<int*>(out_eps),  __float_as_int(s_eps[0]));
+        atomicMax(reinterpret_cast<int*>(out_rhob), __float_as_int(s_rhob[0]));
+    }
+}

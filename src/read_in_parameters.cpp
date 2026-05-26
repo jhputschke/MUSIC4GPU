@@ -900,6 +900,18 @@ InitData read_in_parameters(std::string input_file) {
         istringstream(tempinput) >> temp_evo_N_tau;
     parameter_list.output_evolution_every_N_timesteps = temp_evo_N_tau;
 
+    // Per-step summary diagnostics in EvolveIt (momentum anisotropy /
+    // eccentricities / inverse-Reynolds; plus conservation-law check on 3D
+    // runs) are written every "output_diagnostics_every_N_timesteps" steps.
+    // Default 1 = every step (legacy).  Set e.g. 10 to amortize the cost over
+    // 10 hydro steps with no change to the evolution itself.
+    int temp_diag_N_tau = 1;
+    tempinput = Util::StringFind4(input_file,
+                                  "output_diagnostics_every_N_timesteps");
+    if (tempinput != "empty")
+        istringstream(tempinput) >> temp_diag_N_tau;
+    parameter_list.output_diagnostics_every_N_timesteps = temp_diag_N_tau;
+
     int temp_evo_N_x = 1;
     tempinput = Util::StringFind4(input_file, "output_evolution_every_N_x");
     if(tempinput != "empty") istringstream ( tempinput ) >> temp_evo_N_x;
@@ -1312,6 +1324,11 @@ void check_parameters(InitData &parameter_list, std::string input_file) {
 
     if (parameter_list.output_evolution_every_N_eta <= 0) {
         music_message.error("output_evolution_every_N_eta < 0!");
+        exit(1);
+    }
+
+    if (parameter_list.output_diagnostics_every_N_timesteps <= 0) {
+        music_message.error("output_diagnostics_every_N_timesteps < 1!");
         exit(1);
     }
 

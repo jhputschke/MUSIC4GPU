@@ -4,6 +4,7 @@
 // advance.cpp can be shared between the two back-ends.
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include "CUDAPipelines.h"
@@ -207,6 +208,31 @@ void CUDAPipelines::upload_snapshots_async(GPUGrid& gpu) {
         cudaStreamWaitEvent(static_cast<cudaStream_t>(compute_stream_),
                             static_cast<cudaEvent_t>(copy_event_), 0);
     }
+}
+
+// ── reduce_max ───────────────────────────────────────────────────────────────
+
+void CUDAPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max) {
+    if (!ready_ || !gpu.reduce_eps_out || !gpu.reduce_rhob_out) {
+        eps_max = rhob_max = 0.0;
+        return;
+    }
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+
+    cudaMemsetAsync(gpu.reduce_eps_out,  0, sizeof(float), stream);
+    cudaMemsetAsync(gpu.reduce_rhob_out, 0, sizeof(float), stream);
+
+    const int block = 256;
+    const int grid  = std::min((gpu.Ncells() + block - 1) / block, 1024);
+    const size_t smem = 2 * static_cast<size_t>(block) * sizeof(float);
+    gpu_reduce_max_eps_rhob<<<grid, block, smem, stream>>>(
+        gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.Ncells(),
+        gpu.reduce_eps_out, gpu.reduce_rhob_out);
+    check_launch("gpu_reduce_max_eps_rhob");
+
+    cudaStreamSynchronize(stream);
+    eps_max  = static_cast<double>(*gpu.reduce_eps_out);
+    rhob_max = static_cast<double>(*gpu.reduce_rhob_out);
 }
 
 // ── dispatch_w_source ─────────────────────────────────────────────────────────

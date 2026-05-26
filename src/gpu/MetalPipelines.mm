@@ -195,6 +195,24 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     return true;
 }
 
+// ── reduce_max ───────────────────────────────────────────────────────────────
+// Apple Silicon has coherent unified memory: snap_curr.epsilon / .rhob are
+// MTLStorageModeShared buffers, so the CPU can scan them directly after
+// wait() ensures the last kernel has finished writing.
+
+void MetalPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max) {
+    eps_max  = 0.0;
+    rhob_max = 0.0;
+    if (!ready_ || !gpu.snap_curr.epsilon || !gpu.snap_curr.rhob) return;
+    const int N         = gpu.Ncells();
+    const float* e      = gpu.snap_curr.epsilon;
+    const float* r      = gpu.snap_curr.rhob;
+    for (int i = 0; i < N; ++i) {
+        if (e[i] > static_cast<float>(eps_max))  eps_max  = static_cast<double>(e[i]);
+        if (r[i] > static_cast<float>(rhob_max)) rhob_max = static_cast<double>(r[i]);
+    }
+}
+
 // ── wait ──────────────────────────────────────────────────────────────────────
 
 void MetalPipelines::wait() {

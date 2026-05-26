@@ -17,6 +17,7 @@
 #include "u_derivative.h"
 #include "emoji.h"
 #include "util.h"
+#include "bench_timer.h"
 
 #ifndef _OPENMP
   #define omp_get_thread_num() 0
@@ -93,6 +94,7 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
     double eps_max_cur = -1.;
     const double max_allowed_e_increase_factor = 2.;
     for (it = 0; it <= itmax; it++) {
+        bench::Timer _bt_step("evolve.step_total");
         tau = tau0 + dt*it;
 
         if (hydro_source_terms_ptr) {
@@ -157,8 +159,12 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
             || it == iFreezeStart + 30 || it == iFreezeStart + 50) {
             grid_info.output_momentum_anisotropy_vs_etas(tau, *ap_current);
         }
-        grid_info.output_momentum_anisotropy_vs_tau(
-                                            tau, -0.5, 0.5, *ap_current);
+        // Gated by output_diagnostics_every_N_timesteps (default 1 = every step).
+        if (it % DATA.output_diagnostics_every_N_timesteps == 0) {
+            bench::Timer _bt_mom("evolve.output_momentum_anisotropy_vs_tau");
+            grid_info.output_momentum_anisotropy_vs_tau(
+                                                tau, -0.5, 0.5, *ap_current);
+        }
         if (DATA.Initial_profile == 13) {
             grid_info.output_average_phase_diagram_trajectory(
                                             tau, -0.5, 0.5, *ap_current);
@@ -174,8 +180,13 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
 
 
         // check energy conservation
-        if (!DATA.boost_invariant) {
+        // Gated by output_diagnostics_every_N_timesteps (default 1 = every step).
+        if (!DATA.boost_invariant
+                && it % DATA.output_diagnostics_every_N_timesteps == 0) {
+            {
+            bench::Timer _bt_cons("evolve.check_conservation_law");
             grid_info.check_conservation_law(*ap_current, *ap_prev, tau);
+            }
             if (DATA.output_vorticity) {
                 if (   fabs(tau -  1.0) < 1e-8 || fabs(tau -  2.0) < 1e-8
                     || fabs(tau -  5.0) < 1e-8 || fabs(tau - 10.0) < 1e-8) {
@@ -202,8 +213,34 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
         double emax_loc = 0.;
         double Tmax_curr = 0.;
         double nB_max_curr = 0.;
+        {
+        bench::Timer _bt_max("evolve.max_energy_density");
+#ifdef MUSIC_USE_GPU
+        if (advance.gpu_owns_state()) {
+            double eps_raw = 0., rhob_raw = 0.;
+            advance.reduce_max_gpu(eps_raw, rhob_raw);
+            emax_loc    = eps_raw  * Util::hbarc;   // 1/fm^4 → GeV/fm^3
+            nB_max_curr = rhob_raw;
+            // T(e) is monotone in e; use rhob=0 for the max-T approximation.
+            Tmax_curr = eos.get_temperature(eps_raw, 0.0) * Util::hbarc;
+            if (emax_loc > 1e5) {
+                music_message << "The maximum e = " << emax_loc
+                              << " GeV/fm^3 > 1e5 GeV/fm^3. Exiting.";
+                music_message.flush("error");
+                exit(1);
+            }
+            music_message << "eps_max = " << emax_loc << " GeV/fm^3, "
+                          << "rhob_max = " << nB_max_curr << " 1/fm^3, "
+                          << "T_max = " << Tmax_curr << " GeV.";
+            music_message.flush("info");
+        } else {
+#endif
         grid_info.get_maximum_energy_density(*ap_current, emax_loc,
                                              nB_max_curr, Tmax_curr);
+#ifdef MUSIC_USE_GPU
+        }
+#endif
+        }   // close evolve.max_energy_density timer scope
         if (tau > source_tau_max && it > 0) {
             if (eps_max_cur < 0.) {
                 eps_max_cur = emax_loc;
@@ -251,7 +288,10 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
 
         /* execute rk steps */
         // all the evolution are at here !!!
+        {
+        bench::Timer _bt_rk("evolve.AdvanceRK");
         AdvanceRK(tau, ap_prev, ap_current, ap_future);
+        }
 
         music_message << emoji::clock()
                       << " Done time step " << it << "/" << itmax
@@ -285,6 +325,7 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
     } else {
         music_message.warning("Maximum allowed time reached.");
     }
+    bench::dump();   // no-op unless MUSIC_PROFILE=1
     return 1;
 }
 
@@ -312,8 +353,16 @@ void Evolve::AdvanceRK(double tau, GridPointer &arena_prev, GridPointer &arena_c
             arena_prev    = std::move(arena_current);
             arena_current = std::move(arena_future);
             arena_future  = std::move(temp);
+            // GPU: rotate_snapshots() is called at the START of the next
+            // AdvanceIt call (when gpu_state_authoritative_ is set), so no
+            // explicit mirror is needed here for the rk0 3-cycle.
         } else {
             std::swap(arena_current, arena_future);
+#ifdef MUSIC_USE_GPU
+            // Mirror the host swap in GPU snapshot space so snap_curr stays
+            // aligned with arena_current across the timestep boundary.
+            advance.swap_curr_future_gpu();
+#endif
         }
     }  /* loop over rk_flag */
 }

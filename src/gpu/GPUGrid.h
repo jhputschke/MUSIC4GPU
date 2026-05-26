@@ -83,6 +83,12 @@ public:
     // produced complete fresh state in snap_future.
     void rotate_snapshots();
 
+    // Swap snap_curr ↔ snap_future (pointer-alias swap, no data move).
+    // Mirrors AdvanceRK's rk1 std::swap(arena_current, arena_future) so the
+    // GPU snapshot roles stay in lockstep with the host arena pointers across
+    // the timestep boundary.  Called from Evolve::AdvanceRK after the host swap.
+    void swap_curr_future();
+
     // Host-readable view of snap_curr.u (4 * Ncells).  In the discrete-GPU
     // path snap_curr.u is device-only, so return the pinned staging copy that
     // copy_to_gpu just packed; otherwise the buffer is itself host-accessible.
@@ -126,6 +132,11 @@ public:
     // KT flux divergence of (u^a * pi_b), pre-multiplied by delta_tau.
     // Consumed by gpu_first_rk_step_w_full when turn_on_bulk == 1.
     float* uprhs_out = nullptr;
+
+    // Managed device scalars written by CUDAPipelines::reduce_max.
+    // Initialized to 0 before each reduction; host-readable after stream sync.
+    float* reduce_eps_out  = nullptr;   // max epsilon across snap_curr [1]
+    float* reduce_rhob_out = nullptr;   // max rhob   across snap_curr [1]
 
     // Input buffer: qi_source[5 * Ncells] populated by the CPU when
     // flag_add_hydro_source is true.  Layout matches qi_out:
