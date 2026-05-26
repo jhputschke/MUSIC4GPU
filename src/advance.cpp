@@ -23,12 +23,12 @@ using Util::map_1d_idx_to_2d;
 using Util::hbarc;
 
 // ── Metal helpers (compiled only when USE_METAL is defined) ───────────────────
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
 void Advance::init_metal_if_needed(SCGrid &arena_current) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
 
-    auto& mp = MetalPipelines::instance();
+    auto& mp = GPUPipelines::instance();
     if (!mp.initialize()) {
         music_message << "[MUSIC-GPU] Metal init failed, falling back to CPU.";
         music_message.flush("warning");
@@ -157,7 +157,7 @@ void Advance::make_gpu_params(double tau, int rk_flag,
         p.sinh_deta = static_cast<float>(std::max(0.5, sd));
     }
 }
-#endif  // USE_METAL
+#endif  // MUSIC_USE_GPU
 
 Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
                  std::shared_ptr<HydroSourceBase> hydro_source_ptr_in) :
@@ -187,7 +187,7 @@ void Advance::AdvanceIt(const double tau,
     const int grid_nx   = arena_current.nX();
     const int grid_ny   = arena_current.nY();
 
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     // ── Metal pre-pass: compute the full per-cell ideal step on GPU ──────────
     // Dispatches (in order):
     //   1. gpu_make_w_source  -> dwmn[5*Ncells]
@@ -272,7 +272,7 @@ void Advance::AdvanceIt(const double tau,
 
         gpu_finalize_active = true;  // hydro source now handled on GPU side
 
-        auto& mp = MetalPipelines::instance();
+        auto& mp = GPUPipelines::instance();
         // One command buffer per substep: all kernels encode into the same
         // buffer, single commit + single wait.  Saves ~6 command-buffer
         // allocations and round-trips through the Metal driver per substep.
@@ -363,9 +363,9 @@ void Advance::AdvanceIt(const double tau,
             gpu_grid_.copy_wmunu_to_cpu(gpu_grid_.snap_future, arena_future);
         }
     }
-#endif  // USE_METAL
+#endif  // MUSIC_USE_GPU
 
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     // Both ideal and viscous fully on GPU: nothing left to do per cell.
     const bool cpu_loop_needed =
         !(gpu_finalize_active
@@ -384,7 +384,7 @@ void Advance::AdvanceIt(const double tau,
         double x_local     = - DATA.x_size  /2. +   ix*DATA.delta_x;
         double y_local     = - DATA.y_size  /2. +   iy*DATA.delta_y;
 
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
         // When GPU finalize was active, arena_future primitives are already
         // populated — skip the CPU FirstRKStepT call entirely.
         if (!gpu_finalize_active) {
@@ -412,7 +412,7 @@ void Advance::AdvanceIt(const double tau,
             VorticityVec omega_local                 = {0.};
             DmuMuBoverTVec baryon_diffusion_vector   = {0.};
 
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
             if (gpu_du_active) {
                 // Read theta / a^μ / σ^{μν} produced by gpu_make_du.
                 // Layout: field[comp * Ncells + cell]; component 4 of a and
@@ -446,7 +446,7 @@ void Advance::AdvanceIt(const double tau,
                 u_derivative_helper.get_DmuMuBoverTVec(baryon_diffusion_vector);
             }
 
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
             const int cell      = grid_nx * (grid_ny * ieta + iy) + ix;
             const int Ncells_gpu = grid_nx * grid_ny * grid_neta;
             const float* cell_uwrhs =
@@ -479,7 +479,7 @@ void Advance::FirstRKStepT(
     double tau_rk = tau + rk_flag*(DATA.delta_tau);
 
     TJbVec qi = {0};
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     if (gpu_qi_base && Ncells > 0) {
         // Component-major layout: qi_out[alpha * Ncells + cell]
         // gpu_qi_base points to qi_out[0 * Ncells + cell]; stride = Ncells.
@@ -490,7 +490,7 @@ void Advance::FirstRKStepT(
     } else {
 #endif
         MakeDeltaQI(tau_rk, arena_current, ix, iy, ieta, qi, rk_flag);
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     }
 #endif
 
@@ -522,7 +522,7 @@ void Advance::FirstRKStepT(
     // Use GPU result when available (gpu_dwmn_base != nullptr), otherwise
     // fall back to the CPU MakeWSource implementation.
     TJbVec dwmn = {0.0};
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     if (gpu_dwmn_base && Ncells > 0) {
         // Component-major layout: dwmn[alpha * Ncells + cell]
         // gpu_dwmn_base points to dwmn[0 * Ncells + cell]; stride = Ncells.
@@ -532,7 +532,7 @@ void Advance::FirstRKStepT(
 #endif
         diss_helper.MakeWSource(tau_rk, arena_current, arena_prev, ix, iy, ieta,
                                 dwmn);
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     }
 #endif
 

@@ -17,6 +17,18 @@
 #include "gpu/GPUGrid.h"
 #include "gpu/MetalPipelines.h"
 #include "gpu/gpu_types.h"
+// Shared alias so the GPU dispatch logic in advance.cpp is back-end agnostic.
+using GPUPipelines = MetalPipelines;
+#elif defined(USE_CUDA)
+#include "gpu/GPUGrid.h"
+#include "gpu/CUDAPipelines.h"
+#include "gpu/gpu_types.h"
+using GPUPipelines = CUDAPipelines;
+#endif
+
+// Single switch covering either GPU back-end.
+#if defined(USE_METAL) || defined(USE_CUDA)
+#define MUSIC_USE_GPU 1
 #endif
 
 class Advance {
@@ -32,7 +44,7 @@ class Advance {
 
     bool flag_add_hydro_source;
 
-#ifdef USE_METAL
+#ifdef MUSIC_USE_GPU
     GPUGrid    gpu_grid_;
     bool       gpu_ready_ = false;
     bool       metal_initialized_ = false;

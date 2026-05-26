@@ -82,9 +82,27 @@ option (KNL "Build executable on KNL" OFF)
 option (unittest "Build Unit tests" OFF)
 option (link_with_lib "Link executable with the libarary" ON)
 option (USE_METAL "Enable Metal GPU acceleration (macOS/Apple Silicon)" OFF)
+option (USE_CUDA  "Enable CUDA GPU acceleration (NVIDIA)" OFF)
 
 if (USE_METAL AND NOT APPLE)
     message(FATAL_ERROR "USE_METAL is only supported on macOS (Apple Silicon).")
+endif()
+
+if (USE_METAL AND USE_CUDA)
+    message(FATAL_ERROR "USE_METAL and USE_CUDA are mutually exclusive.")
+endif()
+
+if (USE_CUDA)
+    # Detect the local GPU's compute capability unless the user overrides it
+    # (e.g. -DCMAKE_CUDA_ARCHITECTURES=80 for an A100).
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "CUDA enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
 endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Intel")

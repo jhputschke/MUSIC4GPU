@@ -83,6 +83,15 @@ if (USE_METAL)
     )
 endif()
 
+# ── CUDA GPU sources (NVIDIA) ────────────────────────────────────────────────
+if (USE_CUDA)
+    set(SOURCES ${SOURCES}
+        gpu/GPUGrid_cuda.cu
+        gpu/CUDAPipelines.cu
+        gpu/music_kernels.cu
+        )
+endif()
+
 add_library(${libname} SHARED ${SOURCES})
 set(CompileFlags "")
 if (APPLE)
@@ -112,6 +121,34 @@ if (USE_METAL)
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu
     )
     add_dependencies(${libname} metal_kernels)
+endif()
+
+if (USE_CUDA)
+    set(CompileFlags "${CompileFlags} -DUSE_CUDA")
+    set_source_files_properties(
+        gpu/GPUGrid_cuda.cu
+        gpu/CUDAPipelines.cu
+        gpu/music_kernels.cu
+        PROPERTIES LANGUAGE CUDA
+    )
+    # USE_CUDA / NDEBUG must reach the nvcc compilation too (COMPILE_FLAGS is
+    # applied to every source, but defines are cleaner via this property, which
+    # spans both CXX and CUDA).
+    target_compile_definitions(${libname} PRIVATE USE_CUDA NDEBUG)
+    target_link_libraries(${libname} CUDA::cudart)
+    target_include_directories(${libname} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+    )
+    # Whole-program compilation: each .cu is self-contained (kernels and their
+    # __device__ helpers live in the same TU; cross-TU references are only the
+    # host launch stubs), so relocatable device code / device linking is not
+    # needed and we avoid the shared-library nvlink complications it brings.
+    # Forward OpenMP to nvcc's host compiler so the AoS<->SoA converters in
+    # GPUGrid_cuda.cu stay parallel.
+    if (OpenMP_CXX_FOUND)
+        target_compile_options(${libname} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${OpenMP_CXX_FLAGS}>)
+    endif()
 endif()
 
 set_target_properties (${libname} PROPERTIES COMPILE_FLAGS "${CompileFlags}")
