@@ -518,6 +518,52 @@ The CPU reference also benefited (56 → 48 ms/step at 64×64×32) since the
 same serial loop was the bottleneck there too; the GPU speedup ratio grows
 because the GPU side improved more than the CPU side did.
 
+### Knob: `output_diagnostics_every_N_timesteps`
+
+In addition to the OpenMP fix above, the per-step summary diagnostics in
+`EvolveIt` (the parallelized `output_momentum_anisotropy_vs_tau`, plus
+`check_conservation_law` on 3D runs and the vorticity-block outputs if
+`output_vorticity == 1`) are now gated by a new input parameter:
+
+```
+output_diagnostics_every_N_timesteps 1    # default — every step, legacy behavior
+output_diagnostics_every_N_timesteps 10   # cuts the host-side diagnostic cost ~10×
+```
+
+These outputs are summary statistics (single line per τ to a few text
+files), so the τ-resolution is much finer than physically meaningful for
+most analyses.  Setting `N = 10` is a no-risk way to recover the remaining
+per-step host cost when high-cadence diagnostic sampling is not needed.
+
+Measured on RTX 3090, init-corrected (same methodology as
+`tests/cuda_perstep_bench.sh`):
+
+| Grid | N=1 (default) | N=10 | Additional saving | vs 48-thread CPU at N=10 |
+|------|--------------:|-----:|------------------:|-------------------------:|
+| 64×64×16 (3D) | 2.97 ms/step | **2.53 ms/step** | ~15% | 9.6× |
+| 64×64×32 (3D, 131k) | 5.00 ms/step | **3.54 ms/step** | ~29% | **13.6×** |
+| 128×128×1 (2D, boost-inv) | 3.49 ms/step | (at noise floor) | — | — |
+
+The 2D boost-invariant grid sees no measurable gain because
+`check_conservation_law` is skipped on boost-invariant runs (only the
+~0.74 ms/step momentum-anisotropy call is gated, and that's already inside
+the bench script's per-step noise band on the small 2D grid).
+
+The evolution itself is unaffected; this only changes how often the
+diagnostic files are written.  Default value (1) preserves the legacy
+every-step behavior so existing inputs are unchanged.
+
+### When to combine the two
+
+- **Default config (N=1):** OpenMP parallelization already gives the
+  ~11.6× drop on the diagnostic; per-step is 5.26 ms at 64×64×32.
+  Recommended for development / validation runs where every-step physics
+  monitoring is wanted.
+- **Production runs (N=10):** combines OpenMP + frequency-gate; the
+  diagnostic essentially disappears from the per-step budget.  The
+  evolution output (controlled by the separate
+  `output_evolution_every_N_timesteps`, see below) is independent.
+
 ### Phase C — full D2H elimination (future)
 
 The plan's full vision (§3) is to drop the per-step D2H copy-back and sync
@@ -551,6 +597,7 @@ copy-back in `AdvanceIt`.  It remains deferred to a follow-up.
 | 5 | `--use_fast_math` | 5.29× | `delta_qi` −51% (2.04×) |
 | 6 | GPU-resident state (skip H2D re-upload) + GPU max-reduction | 4.17× (RTX 3090) | 27% per-step on discrete; ≈neutral on coherent GB10 |
 | 6b | OpenMP-parallelize `output_momentum_anisotropy_vs_tau` (profile-driven) | **9.13× (RTX 3090)** | host function 8.6 → 0.74 ms/step (11.6×); 1T=48T bit-identical |
+| 6c | Knob: `output_diagnostics_every_N_timesteps` (default 1) | **13.6× at N=10 (RTX 3090)** | additional 29% per-step at 64×64×32 when per-step diagnostic resolution isn't needed |
 
 (Per-step figures carry ≈±10% run-to-run noise; the kernel-level `nsys` numbers
 are the reliable per-optimization signal.) Correctness holds throughout: max

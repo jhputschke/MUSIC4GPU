@@ -159,10 +159,11 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
             || it == iFreezeStart + 30 || it == iFreezeStart + 50) {
             grid_info.output_momentum_anisotropy_vs_etas(tau, *ap_current);
         }
-        {
-        bench::Timer _bt_mom("evolve.output_momentum_anisotropy_vs_tau");
-        grid_info.output_momentum_anisotropy_vs_tau(
-                                            tau, -0.5, 0.5, *ap_current);
+        // Gated by output_diagnostics_every_N_timesteps (default 1 = every step).
+        if (it % DATA.output_diagnostics_every_N_timesteps == 0) {
+            bench::Timer _bt_mom("evolve.output_momentum_anisotropy_vs_tau");
+            grid_info.output_momentum_anisotropy_vs_tau(
+                                                tau, -0.5, 0.5, *ap_current);
         }
         if (DATA.Initial_profile == 13) {
             grid_info.output_average_phase_diagram_trajectory(
@@ -179,7 +180,9 @@ int Evolve::EvolveIt(SCGrid &arena_prev, SCGrid &arena_current,
 
 
         // check energy conservation
-        if (!DATA.boost_invariant) {
+        // Gated by output_diagnostics_every_N_timesteps (default 1 = every step).
+        if (!DATA.boost_invariant
+                && it % DATA.output_diagnostics_every_N_timesteps == 0) {
             {
             bench::Timer _bt_cons("evolve.check_conservation_law");
             grid_info.check_conservation_law(*ap_current, *ap_prev, tau);
