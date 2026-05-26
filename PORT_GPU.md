@@ -289,3 +289,53 @@ of curr+prev.  A residency optimisation (keeping snap_curr / snap_prev
 on the GPU across step boundaries) would roughly double per-step
 throughput on the discrete-GPU path but requires confirming that
 JETSCAPE doesn't write to the Fields between AdvanceIt calls.
+
+### 9.5 EvolveOneTimeStep is missing diagnostics that EvolveIt has
+
+MUSIC exposes three entry points; all three reach the GPU dispatch:
+
+| Entry point                                   | Driver               |
+|-----------------------------------------------|----------------------|
+| Standalone `MUSIChydro foo.input`             | `EvolveIt`           |
+| XSCAPE batch (`run_hydro`)                    | `EvolveIt`           |
+| XSCAPE step-by-step (`run_hydro_upto`)        | `EvolveOneTimeStep`  |
+
+The per-substep evolution (RK loop, GPU dispatch, freezeout,
+source-term prep, evolution-data output, frozen-out early exit) is
+identical in both drivers.  `EvolveOneTimeStep` is, however, a
+stripped-down driver compared to `EvolveIt` — features present in
+`EvolveIt` but missing from `EvolveOneTimeStep`:
+
+- **Beast-mode adaptive timestep** (`DATA.beastMode == 2`, `NtauBlock = 200`
+  block that periodically doubles `delta_tau`)
+- **Diagnostic outputs:**
+  - `output_momentum_anisotropy_vs_etas` (at iFreezeStart, +10, +30, +50)
+  - `output_momentum_anisotropy_vs_tau`
+  - `output_average_phase_diagram_trajectory` (for `Initial_profile` 13/131)
+  - Vorticity outputs (`output_vorticity_distribution`,
+    `compute_angular_momentum`, `output_vorticity_time_evolution`)
+  - `output_hydro_debug_info` (per-cell `monitor_a_fluid_cell`)
+  - `output_1p1D_check_file` (`Initial_profile = 1`)
+  - `output_1p1D_RiemannTest`, `output_1p1D_DiffusionTest`
+- **Conservation-law check** (`grid_info.check_conservation_law`)
+- **Per-step profiling** (`bench::Timer` scopes, `bench::dump()`)
+- **`reRunHydro` early-return** hook
+- **End-of-run `FO_nBvseta.dat` summary**
+
+Two subtle semantic differences also exist:
+
+- `EvolveIt` uses `max_allowed_e_increase_factor = 5.0`;
+  `EvolveOneTimeStep` uses `2.0` → tighter sanity check in step-by-step
+  mode.
+- `EvolveIt` checks `tau > source_tau_max + dt`; `EvolveOneTimeStep`
+  checks `tau > source_tau_max` → one-step difference in the eps tracker
+  window.
+
+**Impact:** Most JETSCAPE workflows use the step-by-step path because
+the framework interleaves hard parton energy loss with hydro.  Those
+runs therefore do **not** get the diagnostic outputs above.  Hydro
+evolution itself is unaffected.
+
+**Fix when needed:** Mechanical port — copy the missing blocks from
+`EvolveIt` into `EvolveOneTimeStep`, gated on `tauIdx % output_frequency`
+(replacing `EvolveIt`'s `it %` checks).  Deferred at user request.
