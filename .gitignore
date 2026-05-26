@@ -5,7 +5,6 @@
 .DS_Store
 results/
 obj/
-tests/
 *.pyc
 *.txt
 *.dylib

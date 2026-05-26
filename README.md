@@ -194,20 +194,31 @@ accumulate over long runs and can cause visible divergence near the
 freeze-out surface; always use the production step size (≤0.01 fm/c) with
 the GPU path.
 
-### Running the benchmark / validation script
+### Running the benchmark / validation scripts
 
 ```bash
 # build both CPU and Metal binaries first, then:
-bash tests/metal_vs_cpu_bench.sh
+bash tests/metal_vs_cpu_bench.sh       # 2D boost-invariant
+bash tests/metal_vs_cpu_bench_3d.sh    # 3+1D, exercises η-direction code
 ```
 
-The script:
-1. Creates three analytical Gubser-viscous input files (32², 64², 128² grids, 100 timesteps each).
-2. Times both `build/src/MUSIChydro` (Release, no Metal) and `build_metal/src/MUSIChydro` (Release, Metal) on each.
-3. Computes the speedup and prints the maximum relative error in the `eps_max` trace.
+Both scripts:
+1. Generate analytical Gubser-viscous input files at several grid sizes.
+2. Time `build/src/MUSIChydro` (Release, no Metal) and `build_metal/src/MUSIChydro` (Release, Metal) on each.
+3. Compute the speedup and the maximum relative error in the `eps_max` trace.
 
-Example output (Apple M3 Max, 100 steps, `Delta_Tau=0.005`, both binaries built with `-DCMAKE_BUILD_TYPE=Release`):
+The 2D script uses `boost_invariant=1, Nη=1` (100 timesteps).  The 3D script
+uses `boost_invariant=0, Nη ∈ {8, 16, 32}` (40 timesteps each); this turns
+on every η-direction code path — cosh/sinh-of-Δη geometric terms in
+`MakeDeltaQI` / `MakeWSource`, the η-stencil in `Make_uWRHS`, and the
+`u^3 / τ` couplings inside `Make_uWSource`.  Initial state is the Gubser
+XY profile replicated across all η slices (so `u^η = 0` initially);
+the evolution stays approximately η-invariant, but the code paths are
+fully exercised.
 
+Example output (Apple M3 Max, both binaries built with `-DCMAKE_BUILD_TYPE=Release`):
+
+**2D (`metal_vs_cpu_bench.sh`, 100 timesteps, `Delta_Tau=0.005`)**
 ```
 Grid                   CPU(s)   GPU(s)  Speedup   MaxErr
 ----                   ------   ------  -------   ------
@@ -215,6 +226,23 @@ Grid                   CPU(s)   GPU(s)  Speedup   MaxErr
 64x64x1                 2.01s    0.52s    3.87x  1.0e-04
 128x128x1              10.79s    1.38s    7.82x  9.9e-05
 ```
+
+**3+1D (`metal_vs_cpu_bench_3d.sh`, 40 timesteps each)**
+```
+Grid (Nx×Ny×Nη)       Cells   CPU(s)   GPU(s)  Speedup   MaxErr
+----                  -----   ------   ------  -------   ------
+32x32x8                8.2k    2.27s    0.45s    5.04x   5.3e-05
+32x32x32              32.8k    5.94s    0.80s    7.42x   3.7e-05
+64x64x16              65.5k   12.18s    1.59s    7.66x   3.1e-05
+64x64x32             131.1k   24.63s    3.05s    8.08x   3.1e-05
+```
+
+The 3D run is the more realistic production workload: speedup scales
+**up** with cell count (5× at 8k cells → 8× at 131k cells), reflecting
+the fact that the GPU was under-occupied at small 2D grids and saturates
+much better once Nη > 1.  The 64×64×32 case is 1/8 of a typical
+128×128×64 production grid; at full production size the GPU's relative
+advantage should hold or grow further.
 
 These numbers reflect the **Tier 3 + Tier 3c Phase 1 + Phase 2** state:
 the entire per-cell ideal-and-viscous update runs on the GPU.  The CPU side
@@ -295,7 +323,8 @@ Additional limiting factors:
 | File | Purpose |
 |---|---|
 | [`test_metal_input`](test_metal_input) | Gubser viscous smoke-test input (32×32×1, `boost_invariant 1`, shear viscosity on) |
-| [`tests/metal_vs_cpu_bench.sh`](tests/metal_vs_cpu_bench.sh) | Automated timing and correctness comparison between CPU and Metal GPU builds |
+| [`tests/metal_vs_cpu_bench.sh`](tests/metal_vs_cpu_bench.sh) | 2D (boost-invariant) timing and correctness comparison between CPU and Metal GPU builds |
+| [`tests/metal_vs_cpu_bench_3d.sh`](tests/metal_vs_cpu_bench_3d.sh) | 3+1D timing and correctness comparison; exercises every η-direction code path |
 
 ---
 
