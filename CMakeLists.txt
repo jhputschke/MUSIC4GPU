@@ -1,144 +1,115 @@
-set (SOURCES
-    u_derivative.cpp
-    dissipative.cpp
-    init.cpp
-    reconst.cpp
-    minmod.cpp
-    music.cpp
-    cornelius.cpp
-    hydro_source_base.cpp
-    hydro_source_strings.cpp
-    hydro_source_ampt.cpp
-    hydro_source_TATB.cpp
-    pretty_ostream.cpp
-    grid_info.cpp
-    util.cpp
-    read_in_parameters.cpp
-    advance.cpp
-    eos.cpp
-    eos_base.cpp
-    eos_idealgas.cpp
-    eos_EOSQ.cpp
-    eos_s95p.cpp
-    eos_WB.cpp
-    eos_hotQCD.cpp
-    eos_best.cpp
-    eos_neos.cpp
-    eos_UH.cpp
-    evolve.cpp
-    emoji.cpp
-    music_logo.cpp
-    HydroinfoMUSIC.cpp
-    transport_coeffs.cpp
-    )
+cmake_minimum_required(VERSION 3.4)
+project(MUSIChydro VERSION 2.0 LANGUAGES CXX OBJCXX)
+
+set(libname "music")
+set(exename "MUSIChydro")
+
+# require C++11
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_HOME_DIRECTORY}")
+
+set(CMAKE_INSTALL_RPATH ${CMAKE_HOME_DIRECTORY})
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# Find GSL and openMP for this project:
+find_package(GSL)
 if (GSL_FOUND)
-    set(SOURCES ${SOURCES}
-        freeze.cpp
-        freeze_pseudo.cpp
-        reso_decay.cpp
-        )
+    message("Found GSL library ${GSL_INCLUDE_DIR}, will build MUSIC with GSL")
+    include_directories(${GSL_INCLUDE_DIR})
+elseif()
+    message("Did not find GSL library, will build MUSIC alone")
 endif()
 
-# ── Metal GPU sources (macOS / Apple Silicon) ────────────────────────────────
-if (USE_METAL)
-    set(SOURCES ${SOURCES}
-        gpu/GPUGrid.mm
-        gpu/MetalPipelines.mm
-        )
-
-    # Compile the Metal shader to a .metallib at build time.
-    # xcrun is part of the Xcode command-line tools (required on macOS).
-    set(METAL_SRC  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/music_kernels.metal")
-    set(METAL_AIR  "${CMAKE_CURRENT_BINARY_DIR}/music_kernels.air")
-    set(METAL_LIB  "${CMAKE_CURRENT_BINARY_DIR}/music_kernels.metallib")
-
-    find_program(XCRUN xcrun REQUIRED)
-
-    add_custom_command(
-        OUTPUT  ${METAL_AIR}
-        COMMAND ${XCRUN} -sdk macosx metal
-                    -c ${METAL_SRC}
-                    -I ${CMAKE_CURRENT_SOURCE_DIR}/gpu
-                    -o ${METAL_AIR}
-        DEPENDS ${METAL_SRC}
-                ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_types.h
-        COMMENT "Compiling Metal shader music_kernels.metal -> .air"
-    )
-    add_custom_command(
-        OUTPUT  ${METAL_LIB}
-        COMMAND ${XCRUN} -sdk macosx metallib ${METAL_AIR} -o ${METAL_LIB}
-        DEPENDS ${METAL_AIR}
-        COMMENT "Linking Metal library -> music_kernels.metallib"
-    )
-    add_custom_target(metal_kernels ALL DEPENDS ${METAL_LIB})
-
-    # Copy metallib next to the final executable/library so it can be found
-    # at runtime via [NSBundle mainBundle].
-    add_custom_command(
-        TARGET metal_kernels POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${METAL_LIB}
-            ${CMAKE_HOME_DIRECTORY}/music_kernels.metallib
-        COMMENT "Copying music_kernels.metallib to install prefix"
-    )
+if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 6.0)
+        message(FATAL_ERROR "Insufficient gcc version")
+    endif()
 endif()
 
-add_library(${libname} SHARED ${SOURCES})
-set(CompileFlags "")
-if (APPLE)
-    set(CompileFlags "${CompileFlags} -DAPPLE")
-endif (APPLE)
-if (GSL_FOUND)
-    set(CompileFlags "${CompileFlags} -DGSL")
-    target_link_libraries (${libname} ${GSL_LIBRARIES})
+if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+    message("Using Clang compiler without OpenMP parallelization... ")
+else ()
+    find_package(OpenMP)
+    if (OpenMP_FOUND)
+        set(CMAKE_CXX_COMPILE_FLAGS ${CMAKE_CXX_COMPILE_FLAGS} ${OpenMP_CXX_FLAGS})
+        set(CMAKE_CXX_LINK_FLAGS ${CMAKE_CXX_LINK_FLAGS} ${OpenMP_EXE_LINKER_FLAGS})
+    endif ()
 endif()
 
-if (USE_METAL)
-    set(CompileFlags "${CompileFlags} -DUSE_METAL")
-    # Link Metal and Foundation frameworks
-    target_link_libraries(${libname} "-framework Metal" "-framework Foundation")
-    # Ensure .mm files are compiled as Objective-C++
-    set_source_files_properties(
-        gpu/GPUGrid.mm
-        gpu/MetalPipelines.mm
-        PROPERTIES COMPILE_FLAGS "-x objective-c++"
-    )
-    # Include gpu/ subdirectory for header search
-    target_include_directories(${libname} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
-    )
-    add_dependencies(${libname} metal_kernels)
+# default build type: Release
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release")
 endif()
 
-set_target_properties (${libname} PROPERTIES COMPILE_FLAGS "${CompileFlags}")
-install(TARGETS ${libname} DESTINATION ${CMAKE_HOME_DIRECTORY})
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "${CMAKE_HOME_DIRECTORY}/"
+        CACHE PATH "Install path prefix, prepended onto install directories."
+        FORCE)
+endif()
+
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
+
+option (KNL "Build executable on KNL" OFF)
+option (unittest "Build Unit tests" OFF)
+option (link_with_lib "Link executable with the libarary" ON)
+option (USE_METAL "Enable Metal GPU acceleration (macOS/Apple Silicon)" OFF)
+
+if (USE_METAL AND NOT APPLE)
+    message(FATAL_ERROR "USE_METAL is only supported on macOS (Apple Silicon).")
+endif()
+
+if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Intel")
+    if (KNL)
+        set(CMAKE_CXX_FLAGS "-vecabi=cmdtarget -debug inline-debug-info -fimf-use-svml -xmic-avx512 -qopt-report=5 -qopt-report-phase:vec ${OpenMP_CXX_FLAGS} -std=c++11 -fma -align -finline-functions -DDOCTEST_CONFIG_DISABLE -DNDEBUG")
+    else ()
+        set(CMAKE_CXX_FLAGS "-ipo -qopt-report=5 -qopt-report-phase:vec ${OpenMP_CXX_FLAGS} -std=c++11 -fimf-use-svml -fma -align -finline-functions -DDOCTEST_CONFIG_DISABLE -DNDEBUG")
+    endif ()
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    set(CMAKE_CXX_FLAGS "${OpenMP_CXX_FLAGS} -std=c++11 -DDOCTEST_CONFIG_DISABLE -DNDEBUG")
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+    set(CMAKE_CXX_FLAGS "-std=c++11  -stdlib=libc++ -DDOCTEST_CONFIG_DISABLE -DNDEBUG")
+endif()
 
 if (unittest)
-    add_executable (unittest_reconst.e reconst_unittest.cpp)
-    target_link_libraries (unittest_reconst.e ${libname})
-    install(TARGETS unittest_reconst.e DESTINATION ${CMAKE_HOME_DIRECTORY})
+    set(CMAKE_CXX_FLAGS "${OpenMP_CXX_FLAGS} -std=c++11 -DDOCTEST_CONFIG_IMPLEMENT_WITH_MAIN")
+endif()
 
-    add_executable (unittest_grid.e grid_unittest.cpp)
-    target_link_libraries (unittest_grid.e ${libname})
-    install(TARGETS unittest_grid.e DESTINATION ${CMAKE_HOME_DIRECTORY})
+string(APPEND CMAKE_CXX_FLAGS " -Wall")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "-g -O3")
 
-    add_executable (unittest_cell.e cell_unittest.cpp)
-    target_link_libraries (unittest_cell.e ${libname})
-    install(TARGETS unittest_cell.e DESTINATION ${CMAKE_HOME_DIRECTORY})
+find_package(Git)
+if(Git_FOUND)
+    # Get the current working branch
+    execute_process(
+        COMMAND git rev-parse --abbrev-ref HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_BRANCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
 
-    add_executable (unittest_minmod.e minmod_unittest.cpp)
-    target_link_libraries (unittest_minmod.e ${libname})
-    install(TARGETS unittest_minmod.e DESTINATION ${CMAKE_HOME_DIRECTORY})
-else (unittest)
-    if (link_with_lib)
-        add_executable (${exename} main.cpp)
-        target_link_libraries (${exename} ${libname})
-    else (link_with_lib)
-        add_executable (${exename} main.cpp ${SOURCES})
-        if (GSL_FOUND)
-            target_link_libraries (${exename} ${GSL_LIBRARIES})
-        endif (GSL_FOUND)
-    endif (link_with_lib)
-    set_target_properties (${exename} PROPERTIES COMPILE_FLAGS "${CompileFlags}")
-    install(TARGETS ${exename} DESTINATION ${CMAKE_HOME_DIRECTORY})
-endif (unittest)
+    # Get the latest abbreviated commit hash of the working branch
+    execute_process(
+        COMMAND git log -1 --format=%H
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    add_definitions(-DGIT_COMMIT_HASH="${GIT_COMMIT_HASH}")
+    add_definitions(-DGIT_BRANCH="${GIT_BRANCH}")
+else ()
+    add_definitions(-DGIT_COMMIT_HASH="unknown")
+    add_definitions(-DGIT_BRANCH="unknown")
+endif()
+
+configure_file(
+  src/version.h.in
+  ${CMAKE_BINARY_DIR}/generated/version.h
+)
+
+include_directories(${CMAKE_BINARY_DIR}/generated)
+add_subdirectory (src)

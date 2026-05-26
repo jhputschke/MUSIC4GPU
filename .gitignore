@@ -12,8 +12,9 @@ tests/
 MUSIChydro
 perf.data*
 a.out
-build/
+build*/
 MUSIChydro
 *.dylib
 *.so
+*.metallib
 music_input*

@@ -39,6 +39,50 @@ if (GSL_FOUND)
         )
 endif()
 
+# ── Metal GPU sources (macOS / Apple Silicon) ────────────────────────────────
+if (USE_METAL)
+    set(SOURCES ${SOURCES}
+        gpu/GPUGrid.mm
+        gpu/MetalPipelines.mm
+        )
+
+    # Compile the Metal shader to a .metallib at build time.
+    # xcrun is part of the Xcode command-line tools (required on macOS).
+    set(METAL_SRC  "${CMAKE_CURRENT_SOURCE_DIR}/gpu/music_kernels.metal")
+    set(METAL_AIR  "${CMAKE_CURRENT_BINARY_DIR}/music_kernels.air")
+    set(METAL_LIB  "${CMAKE_CURRENT_BINARY_DIR}/music_kernels.metallib")
+
+    find_program(XCRUN xcrun REQUIRED)
+
+    add_custom_command(
+        OUTPUT  ${METAL_AIR}
+        COMMAND ${XCRUN} -sdk macosx metal
+                    -c ${METAL_SRC}
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+                    -o ${METAL_AIR}
+        DEPENDS ${METAL_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_types.h
+        COMMENT "Compiling Metal shader music_kernels.metal -> .air"
+    )
+    add_custom_command(
+        OUTPUT  ${METAL_LIB}
+        COMMAND ${XCRUN} -sdk macosx metallib ${METAL_AIR} -o ${METAL_LIB}
+        DEPENDS ${METAL_AIR}
+        COMMENT "Linking Metal library -> music_kernels.metallib"
+    )
+    add_custom_target(metal_kernels ALL DEPENDS ${METAL_LIB})
+
+    # Copy metallib next to the final executable/library so it can be found
+    # at runtime via [NSBundle mainBundle].
+    add_custom_command(
+        TARGET metal_kernels POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${METAL_LIB}
+            ${CMAKE_HOME_DIRECTORY}/music_kernels.metallib
+        COMMENT "Copying music_kernels.metallib to install prefix"
+    )
+endif()
+
 add_library(${libname} SHARED ${SOURCES})
 set(CompileFlags "")
 if (APPLE)
@@ -48,6 +92,24 @@ if (GSL_FOUND)
     set(CompileFlags "${CompileFlags} -DGSL")
     target_link_libraries (${libname} ${GSL_LIBRARIES})
 endif()
+
+if (USE_METAL)
+    set(CompileFlags "${CompileFlags} -DUSE_METAL")
+    # Link Metal and Foundation frameworks
+    target_link_libraries(${libname} "-framework Metal" "-framework Foundation")
+    # Ensure .mm files are compiled as Objective-C++
+    set_source_files_properties(
+        gpu/GPUGrid.mm
+        gpu/MetalPipelines.mm
+        PROPERTIES COMPILE_FLAGS "-x objective-c++"
+    )
+    # Include gpu/ subdirectory for header search
+    target_include_directories(${libname} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+    )
+    add_dependencies(${libname} metal_kernels)
+endif()
+
 set_target_properties (${libname} PROPERTIES COMPILE_FLAGS "${CompileFlags}")
 install(TARGETS ${libname} DESTINATION ${CMAKE_HOME_DIRECTORY})
 
