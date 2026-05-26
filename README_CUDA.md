@@ -423,10 +423,7 @@ the data being uploaded is exactly the data the GPU produced one step earlier an
 sent back via the D2H copy-back at the previous rk1.  On RTX 3090 this is
 ~21 MB of redundant PCIe H2D traffic per step (plus the AoS↔SoA pack work).
 
-The plan that targets this restructure is
-[`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md).
-
-### What was implemented (Phase A + Phase B of the plan)
+### What was implemented (Phase A + Phase B)
 
 **Phase A — eliminate the per-step H2D upload.**
 A new `GPUGrid::swap_curr_future()` (pointer-alias swap of `snap_curr ↔
@@ -618,8 +615,7 @@ At production grid on a coherent Grace-Blackwell superchip, **MUSIC's hydro
 kernels are not the bottleneck** — they are ~5.5% of wall time.  The port is
 correct and the kernels are well-optimized (delta_qi halved, w_source tiled),
 so further end-to-end speedup required attacking the **host-side** cost.
-Phase 6 implemented Phases A+B of the GPU-resident-state plan
-([`Plan-GPU-resident-state.md`](Plan-GPU-resident-state.md)): the H2D
+Phase 6 implemented Phases A+B of the GPU-resident-state restructure: the H2D
 re-upload at the start of each rk0 is eliminated, and `eps_max`/`rhob_max` are
 reduced on the GPU.  On the discrete RTX 3090 this delivers a 27% per-step
 win at 64×64×32 (3.22× → 4.17× vs 48-thread CPU).  On coherent GB10 the same
@@ -646,8 +642,11 @@ It is deferred but no longer load-bearing.
 grid suits η-slab domain decomposition with a 2-cell halo exchange — but it is
 gated on the above: a single GPU must first be compute-bound (otherwise N GPUs
 sit idle), and for event-by-event production, one-event-per-GPU is simpler and
-scales better than decomposing a single grid. The design and prerequisite
-ordering are recorded in **[`Plan-multi-GPU.md`](Plan-multi-GPU.md)**.
+scales better than decomposing a single grid. The measured event-packing
+results (below) confirm this empirically — the second GPU gave no throughput
+gain at production grid because the run is CPU/host-bound, not GPU-bound. The
+single-grid decomposition design and its prerequisite ordering are in
+[Outlook: single-grid multi-GPU](#outlook-single-grid-multi-gpu-η-slab-decomposition).
 
 ---
 
@@ -765,7 +764,8 @@ scaling, and **no code change**. Device selection uses the standard CUDA
 `CUDA_VISIBLE_DEVICES` variable: it exposes one physical GPU per process, which
 the binary's `cudaSetDevice(0)` then picks up. (Decomposing a *single* event
 across GPUs is a separate, heavier effort — see
-[`Plan-multi-GPU.md`](Plan-multi-GPU.md).)
+[Outlook: single-grid multi-GPU](#outlook-single-grid-multi-gpu-η-slab-decomposition)
+below.)
 
 ```bash
 # 1. See what GPUs are available
@@ -913,3 +913,70 @@ working dirs — that already gives ~3× aggregate throughput. MPS is a no-cost
 add-on (start the daemon, no code change) that becomes worthwhile as event
 length and grid size grow, not at this short-event / production-grid operating
 point.
+
+---
+
+## Outlook: single-grid multi-GPU (η-slab decomposition)
+
+Splitting *one* event's grid across GPUs (as opposed to one-event-per-GPU above)
+is technically a good fit for this structured-grid stencil solver, but it is
+**not worthwhile at today's production grid** and is recorded here only as a
+design for the large-grid / weak-scaling regime. Status: **not started.**
+
+### Prerequisites and ordering (read first)
+
+1. **A single GPU must be compute-bound.** The whole point of Phase 6 + the
+   OpenMP/diagnostic work above was to attack the host-bound ceiling; even after
+   it, the measured event-packing showed the GPU is *not* the bottleneck at
+   64×64×32 (the second GPU added no throughput — it's CPU/host-bound). Adding
+   GPUs while the first is mostly idle gains nothing, and single-grid decomposition
+   makes the host side *worse* (now scatter/gather the grid across N devices each
+   sync). GPU-residency is a hard prerequisite, and Phase C (drop the D2H too)
+   matters even more here.
+2. **The grid must be large enough to saturate one GPU.** Strong-scaling today's
+   131k-cell grid is poor: split 4 ways it's ~64×64×8/device, where launch latency
+   + halo sync dominate. This is a **weak-scaling** play (fine 3+1D, ≥256³), not a
+   way to speed up the current production size. For event-by-event production,
+   one-event-per-GPU / MPS (above) is simpler and scales better — stop there
+   unless a single event's grid is itself too big for one GPU.
+
+### Design sketch
+
+- **Decomposition axis — η slabs.** Layout is `cell = Nx*(Ny*ieta + iy) + ix`
+  (ix fastest, ieta slowest), so a contiguous `ieta` range — and its boundary
+  planes — is **contiguous in the SoA layout**, making halo copies coalesced.
+  One slab per GPU. (For 2D boost-invariant runs `Neta == 1`; split along `y`.)
+- **Ghost halo — 2 cells.** Stencils have radius ≤ 2 (`delta_qi`, `uwrhs`,
+  `uprhs` are ±2; `w_source`, `make_du` are ±1). Each device keeps a 2-plane
+  ghost layer per internal η face. Before each substep's kernel batch, exchange
+  the 2 boundary η-planes of **both `snap_curr` and `snap_prev`** (`w_source`
+  reads `prev` for the time derivative). Halo volume is tiny: 64×64 × 2 planes ×
+  ~21 floats × 4 B ≈ 0.7 MB/neighbour vs ~1 ms/substep compute.
+- **Boundary handling.** Interior η faces read the neighbour's exchanged halo
+  (no clamp); global outer η faces still clamp via `clamped_cell`. The ghost
+  layer encodes both: interior ghosts filled from the neighbour, outer ghosts by
+  replication as today; kernels then read the ghost layer uniformly with
+  slab-origin + halo-offset index math.
+- **Inter-GPU transport.** NVLink/NVSwitch: `cudaDeviceEnablePeerAccess` +
+  `cudaMemcpyPeerAsync` on a dedicated copy stream (intended path). PCIe-only:
+  P2P if available, else stage halos through pinned host memory. Overlap the
+  exchange with interior compute (interior needs no halo) — classic stencil-halo
+  overlap.
+- **Distributed reductions.** `eps_max`/`rhob_max`/conservation become a
+  per-device partial reduction (the Phase-6 GPU reduction) + a small cross-device
+  all-reduce of a few scalars — cheap, no grid traffic.
+- **Host integration.** The AoS↔SoA pack now scatters η-slabs to devices and the
+  copy-back gathers them — but with resident state (prerequisite 1) only at init
+  and on output/freeze-out steps, not every step. That's exactly why residency
+  must come first.
+
+### Effort
+
+Large, and it compounds with the residency restructure: per-device
+`GPUGrid`+streams+pipeline, slab-aware index math, ghost-layer allocation, the
+`cudaMemcpyPeerAsync` halo exchange, the interior/boundary compute split for
+overlap, the cross-device scalar all-reduce, and the host scatter/gather. No
+change to the seven physics kernels beyond slab-aware indexing and the
+interior/boundary split. Recommended only after a single GPU is genuinely
+compute-bound and on NVLink-connected devices, for grids much larger than
+today's production size.
