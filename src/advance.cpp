@@ -291,6 +291,12 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     static bool charge_warning_logged = false;
     static bool feature_warning_logged = false;
 
+    // Any successful GPU substep will write a new state into snap_future
+    // (which the rk0→rk1 rotation will then promote to snap_curr).  Mark
+    // host arenas as stale so the next sync call actually copies.
+    host_curr_fresh_ = false;
+    host_prev_fresh_ = false;
+
     if (!gpu_features_supported()) {
         if (!feature_warning_logged) {
             music_message << "[MUSIC-GPU] Fields path: configuration outside "
@@ -402,18 +408,15 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     return true;
 }
 
-// On-demand D2H: bring snap_curr and snap_prev back into the host Fields
-// objects so CPU code (diagnostics, freezeout, output writers) can read
-// them.  Cheap no-op when the GPU isn't authoritative (i.e. CPU just ran
-// AdvanceIt, or GPU hasn't been used yet).
+// On-demand D2H: bring GPU snapshots back into the host Fields objects so
+// CPU code (diagnostics, freezeout, output writers) can read them.  The
+// host_curr_fresh_ / host_prev_fresh_ flags act as a per-iteration cache —
+// once a sync has run, subsequent calls in the same outer iteration are
+// no-ops until the next AdvanceIt substep clears the flags.
 //
-// After the sync, gpu_owns_state_ is cleared — but the GPU snapshots are
-// unchanged.  The next AdvanceIt's rk0 substep will see gpu_owns_state_
-// cleared and will re-upload, since the assumption is that the caller of
-// sync_arena_from_gpu may also write to the arena (in practice this is
-// rare — most call sites only read).  Sites that we know are
-// read-only can call sync_arena_from_gpu_readonly() instead to keep
-// gpu_owns_state_ set and avoid the next H2D.
+// sync_arena_from_gpu (the non-readonly variant) additionally clears
+// gpu_owns_state_, forcing the next AdvanceIt rk0 to re-upload from host.
+// Use only when the caller might mutate the arena.
 void Advance::sync_arena_from_gpu(Fields &arenaFieldsPrev,
                                   Fields &arenaFieldsCurr) {
     sync_arena_from_gpu_readonly(arenaFieldsPrev, arenaFieldsCurr);
@@ -423,10 +426,26 @@ void Advance::sync_arena_from_gpu(Fields &arenaFieldsPrev,
 void Advance::sync_arena_from_gpu_readonly(Fields &arenaFieldsPrev,
                                            Fields &arenaFieldsCurr) {
     if (!gpu_owns_state_ || !gpu_ready_) return;
+    bench::Timer _bt_sync("advance.sync_arena_from_gpu");
+    if (!host_curr_fresh_) {
+        gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_curr, arenaFieldsCurr);
+        gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, arenaFieldsCurr);
+        host_curr_fresh_ = true;
+    }
+    if (!host_prev_fresh_) {
+        gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_prev, arenaFieldsPrev);
+        gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_prev, arenaFieldsPrev);
+        host_prev_fresh_ = true;
+    }
+}
+
+void Advance::sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr) {
+    if (!gpu_owns_state_ || !gpu_ready_) return;
+    if (host_curr_fresh_) return;
+    bench::Timer _bt_sync("advance.sync_curr_from_gpu");
     gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_curr, arenaFieldsCurr);
     gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, arenaFieldsCurr);
-    gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_prev, arenaFieldsPrev);
-    gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_prev, arenaFieldsPrev);
+    host_curr_fresh_ = true;
 }
 #endif  // MUSIC_USE_GPU
 

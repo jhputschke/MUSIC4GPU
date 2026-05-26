@@ -261,54 +261,63 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const 
 // algebraically identical to cell_idx().  We call cell_idx() to keep the
 // indexing convention textually unified across all copy routines.
 
-void GPUGrid::copy_to_gpu(const Fields& src, GPUSnapshot& dst) const {
-    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
-    #pragma omp parallel for collapse(3) schedule(static)
-    for (int ieta = 0; ieta < Neta; ++ieta)
-    for (int ix   = 0; ix   < Nx;   ++ix  )
-    for (int iy   = 0; iy   < Ny;   ++iy  ) {
-        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+// Pointer-hoist optimisation: Fields stores u_ and Wmunu_ as
+// std::vector<std::vector<double>>, so naive `src.u_[m][c]` does an
+// indirect load on every iteration.  Hoisting the inner-vector data()
+// pointers out of the parallel loop lets the compiler vectorise the
+// per-cell copies and run at near-memory-bandwidth throughput.
 
-        dst.epsilon[c] = static_cast<float>(src.e_     [c]);
-        dst.rhob   [c] = static_cast<float>(src.rhob_  [c]);
-        dst.pi_b   [c] = static_cast<float>(src.piBulk_[c]);
+void GPUGrid::copy_to_gpu(const Fields& src, GPUSnapshot& dst) const {
+    const int Ncells = Ncells_;
+    const double* __restrict__ src_e      = src.e_     .data();
+    const double* __restrict__ src_rhob   = src.rhob_  .data();
+    const double* __restrict__ src_piBulk = src.piBulk_.data();
+    const double* src_u    [GPU_U_COMPS];
+    const double* src_Wmunu[GPU_WMUNU_COMPS];
+    for (int m = 0; m < GPU_U_COMPS; ++m)     src_u[m]     = src.u_    [m].data();
+    for (int m = 0; m < GPU_WMUNU_COMPS; ++m) src_Wmunu[m] = src.Wmunu_[m].data();
+
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < Ncells; ++c) {
+        dst.epsilon[c] = static_cast<float>(src_e     [c]);
+        dst.rhob   [c] = static_cast<float>(src_rhob  [c]);
+        dst.pi_b   [c] = static_cast<float>(src_piBulk[c]);
 
         for (int m = 0; m < GPU_U_COMPS; ++m)
-            dst.u[m * Ncells_ + c] = static_cast<float>(src.u_[m][c]);
+            dst.u[m * Ncells + c] = static_cast<float>(src_u[m][c]);
 
         for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
-            dst.Wmunu[m * Ncells_ + c] = static_cast<float>(src.Wmunu_[m][c]);
+            dst.Wmunu[m * Ncells + c] = static_cast<float>(src_Wmunu[m][c]);
     }
 }
 
 void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const {
-    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
-    #pragma omp parallel for collapse(3) schedule(static)
-    for (int ieta = 0; ieta < Neta; ++ieta)
-    for (int ix   = 0; ix   < Nx;   ++ix  )
-    for (int iy   = 0; iy   < Ny;   ++iy  ) {
-        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+    const int Ncells = Ncells_;
+    double* __restrict__ dst_piBulk = dst.piBulk_.data();
+    double* dst_Wmunu[GPU_WMUNU_COMPS];
+    for (int m = 0; m < GPU_WMUNU_COMPS; ++m) dst_Wmunu[m] = dst.Wmunu_[m].data();
 
-        dst.piBulk_[c] = static_cast<double>(src.pi_b[c]);
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < Ncells; ++c) {
+        dst_piBulk[c] = static_cast<double>(src.pi_b[c]);
         for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
-            dst.Wmunu_[m][c] = static_cast<double>(src.Wmunu[m * Ncells_ + c]);
+            dst_Wmunu[m][c] = static_cast<double>(src.Wmunu[m * Ncells + c]);
     }
 }
 
 void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const {
-    const int Nx = Nx_, Ny = Ny_, Neta = Neta_;
-    #pragma omp parallel for collapse(3) schedule(static)
-    for (int ieta = 0; ieta < Neta; ++ieta)
-    for (int ix   = 0; ix   < Nx;   ++ix  )
-    for (int iy   = 0; iy   < Ny;   ++iy  ) {
-        const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+    const int Ncells = Ncells_;
+    double* __restrict__ dst_e    = dst.e_   .data();
+    double* __restrict__ dst_rhob = dst.rhob_.data();
+    double* dst_u[GPU_U_COMPS];
+    for (int m = 0; m < GPU_U_COMPS; ++m) dst_u[m] = dst.u_[m].data();
 
-        dst.e_   [c] = static_cast<double>(src.epsilon[c]);
-        dst.rhob_[c] = static_cast<double>(src.rhob   [c]);
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < Ncells; ++c) {
+        dst_e   [c] = static_cast<double>(src.epsilon[c]);
+        dst_rhob[c] = static_cast<double>(src.rhob   [c]);
         for (int m = 0; m < GPU_U_COMPS; ++m)
-            dst.u_[m][c] = static_cast<double>(src.u[m * Ncells_ + c]);
-        // rhoq_ / rhos_ are intentionally untouched — the GPU snapshot does
-        // not carry them.  The caller must guarantee they are zero before
-        // dispatching, otherwise the multi-charge contribution will be lost.
+            dst_u[m][c] = static_cast<double>(src.u[m * Ncells + c]);
+        // rhoq_ / rhos_ intentionally untouched — see PORT_GPU.md §4.1.
     }
 }

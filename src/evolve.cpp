@@ -167,7 +167,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         if (it == iFreezeStart || it == iFreezeStart + 10
             || it == iFreezeStart + 30 || it == iFreezeStart + 50) {
 #ifdef MUSIC_USE_GPU
-            advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+            advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
             grid_info.output_momentum_anisotropy_vs_etas(tau, *fpCurr);
         }
@@ -178,7 +178,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                     || fabs(tau - 1.5) < 1e-8 || fabs(tau - 2.0) < 1e-8
                     || fabs(tau - 3.0) < 1e-8) {
 #ifdef MUSIC_USE_GPU
-                    advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                    advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
                     grid_info.Gubser_flow_check_file(*fpCurr, tau);
                 }
@@ -187,7 +187,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                     || fabs(tau -  5.0) < 1e-8 || fabs(tau - 10.0) < 1e-8
                     || fabs(tau - 20.0) < 1e-8) {
 #ifdef MUSIC_USE_GPU
-                    advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                    advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
                     grid_info.output_1p1D_check_file(*fpCurr, tau);
                 }
@@ -198,7 +198,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             // Inherited from main_gpu — see PORT_GPU.md §8.3.
             if (it % Nskip_diag == 0) {
 #ifdef MUSIC_USE_GPU
-                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
                 bench::Timer _bt_mom(
                             "evolve.output_momentum_anisotropy_vs_tau");
@@ -208,7 +208,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 
             if (DATA.Initial_profile == 13 || DATA.Initial_profile == 131) {
 #ifdef MUSIC_USE_GPU
-                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
                 grid_info.output_average_phase_diagram_trajectory(
                                                 tau, -0.5, 0.5, *fpCurr);
@@ -228,7 +228,10 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 #ifdef MUSIC_USE_GPU
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
 #endif
+                {
+                bench::Timer _bt_cons("evolve.check_conservation_law");
                 grid_info.check_conservation_law(*fpCurr, *fpPrev, tau);
+                }
             }
             if (!DATA.boost_invariant && DATA.output_vorticity == 1) {
                 if (   std::abs(tau -  1.0) < 1e-8
@@ -504,7 +507,7 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                 || fabs(tau - 1.5) < 1e-8 || fabs(tau - 2.0) < 1e-8
                 || fabs(tau - 3.0) < 1e-8) {
 #ifdef MUSIC_USE_GPU
-                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
                 grid_info.Gubser_flow_check_file(*fpCurr, tau);
             }
@@ -516,7 +519,10 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 #ifdef MUSIC_USE_GPU
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
 #endif
+                {
+                bench::Timer _bt_cons("evolve.check_conservation_law");
                 grid_info.check_conservation_law(*fpCurr, *fpPrev, tau);
+                }
             }
 
             double emax_loc = 0.;

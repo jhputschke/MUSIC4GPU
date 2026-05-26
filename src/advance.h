@@ -132,18 +132,42 @@ class Advance {
     void reduce_max_gpu(double& eps_max, double& rhob_max);
 
     // Bring snap_curr/snap_prev back into the host arenas if the GPU has
-    // been authoritative across the timestep boundary.  Two flavours:
-    //   - sync_arena_from_gpu          : also clears gpu_owns_state_, so
-    //                                    the next AdvanceIt rk0 will
-    //                                    re-upload.  Use when caller may
-    //                                    mutate the arena.
-    //   - sync_arena_from_gpu_readonly : leaves gpu_owns_state_ set, so the
-    //                                    next AdvanceIt rk0 skips its H2D.
-    //                                    Use for pure-read diagnostics.
+    // been authoritative across the timestep boundary.  Multiple flavours
+    // for different consumers' needs:
+    //
+    //   sync_arena_from_gpu(prev, curr)
+    //       Full D2H of both snap_curr and snap_prev into host.  Clears
+    //       gpu_owns_state_ so the next AdvanceIt re-uploads.  Use when
+    //       caller may mutate the arena.
+    //
+    //   sync_arena_from_gpu_readonly(prev, curr)
+    //       Full D2H, but leaves gpu_owns_state_ set so the next AdvanceIt
+    //       rk0 still skips its H2D.  Use for pure-read diagnostics that
+    //       read both prev and curr (check_conservation_law, vorticity,
+    //       freezeout, ...).
+    //
+    //   sync_curr_from_gpu_readonly(curr)
+    //       Half-D2H: only snap_curr → arenaFieldsCurr.  About 2× faster
+    //       than the full sync.  Use for diagnostics that only read fpCurr
+    //       (Gubser_flow_check_file, output_momentum_anisotropy_vs_tau,
+    //       output_evolution_data...).
+    //
+    // All three variants are no-ops when gpu_owns_state_ is unset (CPU has
+    // current state) OR when host_curr_fresh_ / host_prev_fresh_ indicate
+    // a previous sync this outer iteration already brought the data over.
     void sync_arena_from_gpu(Fields &arenaFieldsPrev,
                              Fields &arenaFieldsCurr);
     void sync_arena_from_gpu_readonly(Fields &arenaFieldsPrev,
                                       Fields &arenaFieldsCurr);
+    void sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr);
+
+   private:
+    // Set when host arena matches the corresponding GPU snapshot — i.e. a
+    // previous sync this iteration already brought it over.  Cleared at
+    // the start of the next AdvanceIt substep (state changed on GPU).
+    bool host_curr_fresh_ = false;
+    bool host_prev_fresh_ = false;
+   public:
 #endif
 
     // gpu_dwmn_base: pointer to the first alpha-component of the GPU-computed
