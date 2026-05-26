@@ -149,6 +149,12 @@ if (USE_CUDA)
         target_compile_options(${libname} PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${OpenMP_CXX_FLAGS}>)
     endif()
+    # Phase 5: fast-math intrinsics for the compute-bound device kernels
+    # (Newton reconstruction divides/sqrtf, transport expf/powf).  The hydro
+    # state is already FP32 (~1e-5 vs CPU); fast-math stays well inside the
+    # 1e-3 correctness threshold while accelerating delta_qi / w_full.
+    target_compile_options(${libname} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 endif()
 
 set_target_properties (${libname} PROPERTIES COMPILE_FLAGS "${CompileFlags}")

@@ -297,3 +297,86 @@ class of hardware the lever is **not** transfer overlap but reducing host-side
 per-step cost (keeping evolving state GPU-resident across timesteps, moving the
 `eps_max` reduction onto the GPU) and speeding the dominant compute-bound
 kernel (Phase 5).
+
+---
+
+## Phase 5 — Compute-bound kernel acceleration
+
+### Why not warp-vote Newton convergence (the plan's idea)
+
+The plan proposed `__ballot_sync` / `__all_sync` to break the Newton loop once
+all 32 lanes converge. On analysis this gives **nothing** here: the kernels
+already `break` per-thread, which deactivates a converged lane while the warp
+continues for the stragglers — so the warp's iteration count is already
+`max_lane(k)`. A warp vote cannot lower that. Worse, *removing* the per-thread
+break to rely only on the vote would keep converged lanes evaluating the EOS
+every iteration (strictly more work). So the per-thread `break` already in the
+solver is optimal; the warp-vote version was not implemented.
+
+### What actually helps: fast-math intrinsics
+
+The dominant kernel `gpu_make_delta_qi` (Newton-Brent reconstruction) and the
+relaxation kernels are dense with divisions, `sqrtf`, and — in the transport
+profiles — `expf`/`powf`. `--use_fast_math` maps these to the hardware
+approximate units. The hydro state is already FP32 (~1e-5 vs the FP64 CPU), and
+the EOS pressure table is *linear* (no transcendental on the hot path), so
+fast-math stays comfortably inside the 1e-3 threshold.
+
+### Performance — kernel level (`nsys`, 64×64×32, avg of 42 launches)
+
+| Kernel | Phase 4 (µs) | Phase 5 (µs) | Change |
+|--------|-------------:|-------------:|-------:|
+| `gpu_make_delta_qi` | 302 | 148 | **−51% (2.04×)** |
+| `gpu_finalize_ideal` | 55 | 49 | −11% |
+| `gpu_make_uwrhs` | 61 | 46 | −25% |
+| total GPU kernel time | ~39 ms | ~33.5 ms | −14% |
+
+Correctness unchanged: max rel `eps_max` error **2.7e-5** at 64×64×32 (PASS).
+
+The dominant compute kernel is **halved** with no accuracy cost. Per-step *wall*
+time barely moves (11.0 ms at 64×64×32) because — as Phase 4 established — the
+GPU is only ~5.5% of wall on this coherent host-bound run; shrinking the kernels
+shrinks an already-small slice. On a discrete GPU, or once the host-side
+AoS↔SoA / diagnostics cost is addressed, this 2× on the heaviest kernel is the
+one that matters.
+
+FP16 (the plan's other Phase-5 idea) was not pursued: it trades accuracy for
+*bandwidth*, but the kernels that dominate here are compute-bound, and the run
+is host-bound — so FP16 would add accuracy risk for no relevant gain on this
+hardware.
+
+---
+
+## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
+
+| Phase | Change | Per-step speedup | Key kernel-level result |
+|-------|--------|-----------------:|-------------------------|
+| 1 | Direct port, managed memory | 2.40× (wall) | baseline |
+| 2 | `__ldg` read-only cache + adaptive/occupancy block dims | 5.21× (per-step) | fixed 4× 2D eta-lane waste |
+| 3 | Shared-memory tiling of `gpu_make_w_source` | 5.50× | w_source −16% |
+| 4 | Dual-stream scaffolding (memory-model gated) | 4.90× (neutral) | no-op on coherent GB10 |
+| 5 | `--use_fast_math` | 5.29× | `delta_qi` −51% (2.04×) |
+
+(Per-step figures carry ≈±10% run-to-run noise; the kernel-level `nsys` numbers
+are the reliable per-optimization signal.) Correctness holds throughout: max
+rel `eps_max` error ≈ 3e-5, far inside the 1e-3 regression threshold.
+
+### Comparison to the Metal baseline
+
+The README Metal baseline (M3 Max, 64×64×32, 40 steps) was **GPU 1.62 s vs CPU
+12T 2.43 s → 1.50×**. The CUDA port on GB10 reaches **~5.3× per-step vs a
+20-thread CPU**, with the dominant reconstruction kernel running in ~148 µs.
+The two machines and CPU thread counts differ, so this is not a controlled
+Metal-vs-CUDA comparison — but the CUDA back-end clearly clears the Metal
+baseline's speedup ratio.
+
+### The headline engineering finding
+
+At production grid on a coherent Grace-Blackwell superchip, **MUSIC's hydro
+kernels are not the bottleneck** — they are ~5.5% of wall time. The port is
+correct and the kernels are well-optimized (delta_qi halved, w_source tiled),
+but further end-to-end speedup on this hardware requires attacking the
+**host-side** cost: the per-step AoS↔SoA conversion and the CPU `eps_max`
+diagnostics, and keeping evolving state GPU-resident across timesteps so the
+grid is not repacked every step. Those are evolve-loop changes beyond the GPU
+kernel layer and are the recommended next step.
