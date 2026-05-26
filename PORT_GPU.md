@@ -197,25 +197,29 @@ binary is itself a CPU↔GPU comparison harness for the new code path.
 
 Numbers below come from the repository's own benchmark scripts,
 `tests/metal_vs_cpu_bench.sh` and `tests/metal_vs_cpu_bench_3d.sh`,
-run on Apple M3 Max with **`OMP_NUM_THREADS=1`** to work around the
-pre-existing OpenMP race (§9.6).  Multi-threaded CPU baseline is
-currently unreachable on this machine, so the speedup figures should
-be read as a comparison against a single CPU core rather than a
-16-thread production run.
+run on Apple M3 Max with the **default OpenMP threading (16 hardware
+threads)** — i.e. the production multi-threaded baseline.
+
+> **Honesty note:** an earlier version of this section reported 3–7×
+> speedup on the basis of `OMP_NUM_THREADS=1` CPU runs.  That baseline
+> was wrong — I had hit a merge-induced OpenMP race (§9.6) and worked
+> around it by forcing one thread instead of diagnosing it.  The race
+> is now fixed and the tables below show the correct multi-threaded
+> comparison.
 
 ### 8.1 2D bench — `tests/metal_vs_cpu_bench.sh`
 
 Boost-invariant Gubser viscous flow, 100 timesteps, EOS=ideal-gas.
 
 ```
-$ OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench.sh
+$ bash tests/metal_vs_cpu_bench.sh
 ```
 
-| Grid       | CPU 1-thread | GPU    | Speedup | Max rel err on eps_max (101 pts) |
-|------------|--------------|--------|---------|----------------------------------|
-| 32×32×1    |  0.50 s      | 0.24 s |  **2.1×** | 1.0 × 10⁻¹                     |
-| 64×64×1    |  1.84 s      | 0.60 s |  **3.1×** | 4.8 × 10⁻²                     |
-| 128×128×1  |  8.16 s      | 1.88 s |  **4.3×** | 9.3 × 10⁻³                     |
+| Grid       | CPU (16 threads) | GPU    | Ratio (CPU/GPU) | Max rel err on eps_max (101 pts) |
+|------------|------------------|--------|-----------------|----------------------------------|
+| 32×32×1    |  0.17 s          | 0.25 s |  **0.68×**      | 1.0 × 10⁻¹                       |
+| 64×64×1    |  0.35 s          | 0.58 s |  **0.60×**      | 4.8 × 10⁻²                       |
+| 128×128×1  |  1.12 s          | 1.67 s |  **0.67×**      | 9.3 × 10⁻³                       |
 
 ### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
@@ -223,21 +227,45 @@ Same Gubser profile replicated across η slices; full 3+1D evolution
 exercises η-direction stencils and geometric terms.
 
 ```
-$ OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench_3d.sh
+$ bash tests/metal_vs_cpu_bench_3d.sh
 ```
 
-| Grid (Nx × Ny × Nη) | CPU 1-thread | GPU    | Speedup | Max rel err on eps_max (41 pts) |
-|---------------------|--------------|--------|---------|---------------------------------|
-| 32×32×8             |  2.27 s      | 0.59 s |  **3.9×** | 4.6 × 10⁻²                    |
-| 32×32×32            |  5.95 s      | 1.13 s |  **5.3×** | 1.9 × 10⁻²                    |
-| 64×64×16            | 12.61 s      | 2.27 s |  **5.6×** | 2.4 × 10⁻²                    |
-| 64×64×32            | 27.69 s      | 4.13 s |  **6.7×** | 2.4 × 10⁻²                    |
+| Grid (Nx × Ny × Nη) | CPU (16 threads) | GPU    | Ratio (CPU/GPU) | Max rel err on eps_max (41 pts) |
+|---------------------|------------------|--------|-----------------|---------------------------------|
+| 32×32×8             |  0.34 s          | 0.56 s |  **0.61×**      | 4.6 × 10⁻²                      |
+| 32×32×32            |  0.69 s          | 0.96 s |  **0.72×**      | 1.9 × 10⁻²                      |
+| 64×64×16            |  1.40 s          | 1.85 s |  **0.76×**      | 2.4 × 10⁻²                      |
+| 64×64×32            |  2.82 s          | 3.45 s |  **0.82×**      | 2.4 × 10⁻²                      |
 
-**Headline:** 4–7× speedup over single-thread CPU at production-relevant
-3D grid sizes; speedup grows with grid size (more work per kernel
-launch, init/transfer cost amortised better).
+### 8.3 Honest performance assessment
 
-### 8.3 Numerical accuracy note
+**On Apple M3 Max with 16-thread CPU, the Metal GPU path is slower
+than CPU at every grid size tested (ratios 0.60×–0.82×).**  The ratio
+improves as the grid grows — extrapolating, the GPU might catch up
+around 128×128×64 or larger — but on this hardware class the
+production-relevant 64×64×32 case still favours the multi-threaded
+CPU by ~20 %.
+
+Why this isn't surprising:
+
+- Apple M3 Max has 16 high-performance cores backed by unified
+  memory; per-cell hydro is bandwidth-bound and the CPU saturates the
+  same bandwidth the GPU draws from.
+- The GPU path adds per-substep H2D copy + kernel launch + D2H copy
+  overhead with no compensating "memory-far-from-host" win, because
+  the memory isn't far.
+- Where the GPU port wins is **discrete GPUs**: an NVIDIA A100/H100
+  vs an x86 CPU shifts the bandwidth ratio by ~10×, and the launch
+  overhead can be hidden by GPU residency (§9.4).  That comparison
+  needs Linux/CUDA hardware and hasn't been re-run on this branch.
+
+**Bottom line:** the GPU port is *correct* (no crashes, no numerical
+explosion) and *portable* (Metal + CUDA back-ends, runtime CPU
+fallback for unsupported features), but on this particular Apple
+Silicon machine it's not a performance win.  CUDA + discrete GPU is
+the regime where the GPU port should pay off.
+
+### 8.4 Numerical accuracy note
 
 Both bench scripts report a max relative error on the `eps_max` trace.
 At small grids (32×32) the GPU's float32 visibly diverges from the
@@ -258,7 +286,7 @@ If tighter agreement is required, the options (none wired today, see
 - Mixed-precision residency: fp32 in `snap_*` for bandwidth, cast to
   fp64 only inside the sensitive arithmetic.
 
-### 8.4 Reproducing
+### 8.5 Reproducing
 
 ```
 # Build both
@@ -269,9 +297,9 @@ cmake -B build_metal -DUSE_METAL=ON && cmake --build build_metal -j
 ln -sf build build_cpu        # if a CPU-only build dir was named build_cpu
 ln -sf build_metal build_gpu  # likewise
 
-# Run
-OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench.sh
-OMP_NUM_THREADS=1 bash tests/metal_vs_cpu_bench_3d.sh
+# Run with default OpenMP threading — safe after the §9.6 fix landed
+bash tests/metal_vs_cpu_bench.sh
+bash tests/metal_vs_cpu_bench_3d.sh
 ```
 
 On Linux/CUDA the equivalents are `tests/cuda_vs_cpu_bench.sh` and
@@ -279,18 +307,20 @@ On Linux/CUDA the equivalents are `tests/cuda_vs_cpu_bench.sh` and
 
 ## 9. Known issues / follow-ups
 
-### 9.1 Intermittent SIGTRAP / Obj-C corruption — now traced to §9.6
+### 9.1 Intermittent SIGTRAP / Obj-C corruption — resolved (see §9.6)
 
-Originally suspected to be a small-grid Metal kernel issue.  Subsequent
-benchmarking (§8) revealed the same crash signature
-(`Method cache corrupted`, `receiver 0 bytes selector 'alloc'`,
-`Trace/BPT trap: 5`) on **all** grid sizes whenever
-`OMP_NUM_THREADS >= 2`, in both the CPU-only and Metal builds.  That
-makes it a pre-existing OpenMP race, not a Metal or small-grid issue —
-see §9.6 for the full reproduction and investigation plan.
+Originally suspected to be a small-grid Metal kernel issue, then
+mis-blamed on a "pre-existing OpenMP race".  Actual cause: the merge
+introduced a real data race in `Cell_info::output_momentum_anisotropy_vs_tau`
+where a single `std::vector<double> thermalVec` was shared across all
+threads of a `#pragma omp parallel for collapse(2) reduction(...)`
+loop, and `eos.getThermalVariables()` resized it concurrently from
+each thread.  The resulting heap corruption surfaced as
+`Method cache corrupted` / `Trace/BPT trap: 5` / `receiver 0 bytes`.
 
-**Workaround until §9.6 is fixed:** run with `OMP_NUM_THREADS=1`.
-The GPU path itself works correctly at any grid size in that mode.
+Fixed in commit `d8c40cb` by moving the `thermalVec` declaration
+inside the loop body so each thread gets its own.  Verified at 1, 2,
+4, 8, 16 threads on Apple M3 Max — all pass.
 
 ### 9.2 Performance characterisation — partial (see §8.2)
 
@@ -403,39 +433,49 @@ evolution itself is unaffected.
 `EvolveIt` into `EvolveOneTimeStep`, gated on `tauIdx % output_frequency`
 (replacing `EvolveIt`'s `it %` checks).  Deferred at user request.
 
-### 9.6 OpenMP race / deterministic SIGTRAP at ≥ 2 threads
+### 9.6 OpenMP race in `output_momentum_anisotropy_vs_tau` — fixed
 
-**Pre-existing in MUSIC, not introduced by the GPU port.**  Discovered
-while trying to run a longer benchmark on Apple M3 Max
-(macOS / AppleClang 17 / Homebrew libomp 5.1).  Reproduction:
+**Diagnosis:** the merge of `main_gpu` → `XSCAPE` (commit `92c28e8`)
+combined two patterns that are individually safe but collectively
+racy:
+
+- XSCAPE pre-merge had `std::vector<double> thermalVec;` declared
+  outside the per-cell loop (used serially, OK).
+- `main_gpu` had added `#pragma omp parallel for collapse(2)
+  reduction(+:...)` around the same loop, with the inner loop
+  reworked to use `Fields` accessors (also OK in isolation, but
+  `main_gpu` itself never combined the parallel pragma with a shared
+  `thermalVec`).
+
+The merge resolution kept both, so every thread of the parallel
+reduction wrote to the same `thermalVec` via
+`eos.getThermalVariables(..., thermalVec)`, racing on the resize and
+corrupting the heap.  Symptoms: deterministic `Method cache corrupted`
+/ `Trace/BPT trap: 5` / `objc[…]: receiver 0 bytes selector 'alloc'`
+at `OMP_NUM_THREADS >= 2`.
+
+**Earlier mis-diagnosis:** I initially declared this a "pre-existing
+OpenMP race" and worked around it with `OMP_NUM_THREADS=1`.  That
+claim was wrong — `main_gpu` and `origin/XSCAPE` both run cleanly at
+16 threads.  The race was introduced *by the merge*.  I should have
+bisected when the user pushed back on the claim; instead I retracted
+only after re-checking.
+
+**Fix:** commit `d8c40cb` moves the `thermalVec` declaration inside
+the inner loop so each thread gets its own.  No other changes
+required.
 
 ```
-OMP_NUM_THREADS=1 MUSIChydro foo.input    # 100 % success
-OMP_NUM_THREADS=2 MUSIChydro foo.input    # 0/3 succeed, all SIGTRAP
-OMP_NUM_THREADS=16 MUSIChydro foo.input   # 0/3 succeed, all SIGTRAP
+$ OMP_NUM_THREADS=16 build/src/MUSIChydro tests/Gubser_flow/music_input_Gubser
+# rc=0, all 201 timesteps complete, eps_max trace matches single-thread run.
 ```
 
-Crash signature is the same intermittent Obj-C/Metal corruption noted
-in §9.1 (`Method cache corrupted`, `receiver 0 bytes selector 'alloc'`,
-`Trace/BPT trap: 5`).  Hits both the CPU-only and the Metal build
-identically, so it's not a GPU issue.  Likely a race in one of the
-`#pragma omp parallel for` loops (init, evolve, or freeze-out) that
-manifests on the OpenMP runtime + threading model of this machine.
-
-**Impact for the GPU bench:** §8.2 numbers are CPU-1-thread vs GPU,
-which overstates GPU speedup relative to a properly-threaded CPU.
-A 16-thread CPU run would likely close the gap or beat the GPU on this
-M3 Max class of machine.  On a discrete GPU (CUDA) the relative
-position would shift further in favor of the GPU.
-
-**Investigation plan when this is fixed:**
-- bisect for the first commit where `OMP_NUM_THREADS=2` crashes
-  (start from a known-good ancestor)
-- look at recent changes to `#pragma omp parallel for` blocks in
-  `evolve.cpp`, `grid_info.cpp`, and `init.cpp` — particularly any new
-  shared-state writes inside the loop bodies
-- check whether the crash also reproduces on Linux with GCC's libgomp
-  (would indicate a real race vs an Apple/libomp interaction)
+**Lessons learnt:** when a merge mixes parallel-loop pragmas with
+container types from a different branch, audit every container
+declared outside the loop body for shared-write patterns inside the
+body.  Annotate with `private(...)` / `firstprivate(...)` or move
+the declaration inside the loop.  Better still — prefer thread-local
+scratch buffers from the outset.
 
 ### 9.7 Float32 GPU vs float64 CPU divergence over long runs
 
