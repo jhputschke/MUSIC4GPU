@@ -421,3 +421,44 @@ walked back.
 GPU + sync costs matched or better.  The last ~1.3 ms/step is the XSCAPE
 `EvolveIt` CPU driver — a separate optimization target from the CUDA
 backend, profiled next (§9, CPU-side).
+
+## 9. CPU-side: diagnostic thread-scaling (commit `995b4f1`)
+
+Profiling the per-step sections (64×64×32, Nskip=1) by thread count
+exposed one section scaling *backwards*:
+
+| section (ms/step)               | OMP=12 | OMP=48 | scaling |
+|---------------------------------|--------|--------|---------|
+| `evolve.AdvanceRK` (GPU)        | 2.32   | 1.97   | ✓       |
+| `advance.sync_curr_from_gpu`    | 1.14   | 1.35   | ~flat   |
+| `check_conservation_law`        | 0.69   | 0.52   | ✓       |
+| `output_momentum_anisotropy_vs_tau` | 0.83 | **1.59** | ✗ negative |
+
+The contrast with `check_conservation_law` (a similar OMP reduction that
+scales *correctly*) pinned the cause: `check_conservation_law` uses one
+`collapse(3)` over the whole grid, whereas `output_momentum_anisotropy_vs_tau`
+ran **two reductions inside a serial `for (ieta)` loop** — one parallel
+region per in-range η-slice, each a 25-variable reduction over only a
+64×64 slice.  At high thread counts the fork/join + reduction-tree
+overhead per slice dominates the ~85 cells/thread of real work.
+
+**Fix:** two full-grid passes — a centroid pass, then a single
+`collapse(3)` anisotropy/eccentricity reduction — iterating a **dense
+list of in-range η-slice indices** (`ir_etas`).  Dense is essential: the
+in-range slices are a small contiguous η block, so `collapse(3)` over
+*all* slices with a `continue` filter idles most threads under static
+scheduling (a first attempt that way *regressed* to 3.98 ms — recorded
+here as a caution).
+
+Result: `output_momentum_anisotropy_vs_tau` ~0.82 ms/step at **both**
+OMP=12 and 48 (flat); per-step bench 64×64×32 at OMP=48 **6.51 → 4.77
+ms/step, matching `main_gpu` (4.81)**.  Validated bit-identical at
+OMP=1 across all four output files for 2D (single-slice) and 3D
+(multi-slice — the `collapse(3)` preserves the ieta-outer accumulation
+order, so the cross-slice sums are byte-for-byte unchanged).
+
+This optimization is backend-agnostic (it's CPU diagnostic code) and
+applies equally to `main_gpu` and the CPU build.  Smaller grids
+(64×64×16, 128×128×1) still carry a residual gap to `main_gpu` from the
+untimed `EvolveIt` evolve-loop overhead (§8.3), which is proportionally
+larger when there are fewer cells of GPU work per step.
