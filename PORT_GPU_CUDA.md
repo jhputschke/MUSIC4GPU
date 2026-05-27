@@ -263,16 +263,21 @@ This difference method does not cancel the per-step CPU diagnostics
 `step_total`, not the GPU kernels.  The profiled `AdvanceRK` numbers in
 §5.2/§5.3 are the apples-to-apples GPU comparison.
 
-### 5.5 Bottom line
+### 5.5 Bottom line (initial port)
 
 The CUDA backend on XSCAPE is **correct (bit-identical to `main_gpu`)**
 and its **GPU compute matches or beats `main_gpu`**.  The wall-clock gap
-in the default bench is CPU-side: XSCAPE's heavier evolve driver plus
-per-step diagnostic syncs at the legacy `=1` frequency.  Setting
-`output_diagnostics_every_N_timesteps` to a production value (e.g. 10)
-closes most of it, and is exactly what the residency design was built
-for.  Closing the rest means trimming XSCAPE's CPU evolve loop, which is
-out of scope for the GPU port (and would affect CPU runs equally).
+in the default bench is CPU-side.  §8 dissects that gap and removes the
+GPU-attributable part of it; the genuinely-remaining piece is XSCAPE's
+heavier `EvolveIt` driver, which is not the CUDA backend and runs on the
+CPU path too.
+
+> **Note (superseded):** an earlier version of this section claimed that
+> setting `output_diagnostics_every_N_timesteps` to a production value
+> "closes most of" the gap.  §8.3 measures this and walks it back —
+> gating removes the per-step *sync* cost but **not** the untimed
+> evolve-loop overhead, which is the dominant residual at any diagnostic
+> frequency.
 
 ## 6. Reproducing
 
@@ -312,10 +317,11 @@ build the same two dirs there, run the same scripts.
 
 - **Per-arena D2H cost.**  XSCAPE's `copy_primitives_to_cpu` +
   `copy_wmunu_to_cpu` issue five separate `cudaMemcpy` D2H calls per
-  arena (eps, rhob, u, Wmunu, pi_b).  At the default diagnostic
-  frequency this is ~1 ms/arena vs `main_gpu`'s ~0.48 ms copy-back.
-  Batching the transfers or syncing only the components a given
-  diagnostic needs would help, but only matters at
+  arena (eps, rhob, u, Wmunu, pi_b), ~1 ms/arena.  The *prev*-arena half
+  of the per-step cost was eliminated in §8.2 (cross-step residency); the
+  remaining *curr*-arena sync (~1 ms) is still a bit heavier than
+  `main_gpu`'s AoS copy-back.  Batching the five transfers into one or
+  speeding the SoA float→double unpack would help, but only at
   `output_diagnostics_every_N_timesteps = 1`.
 
 - **CUDA on coherent hardware (GB10 / Grace-C2C / integrated).**
@@ -342,3 +348,76 @@ build the same two dirs there, run the same scripts.
 
 - **`rhoq`/`rhos`, finite-µB EOS, baryon diffusion, vorticity** — same
   CPU-fallback guards as the Metal path (PORT_GPU.md §4); unchanged.
+
+## 8. Post-port CPU-side optimizations & final decomposition
+
+After the port was correct, two targeted optimizations chipped at the
+default-config (`output_diagnostics_every_N_timesteps = 1`) wall-clock
+gap.  Both are CPU-side (the GPU kernels were already as fast as
+`main_gpu`).  Numbers are 64×64×32, RTX 3090.
+
+### 8.1 Per-thread `thermalVec` in the anisotropy diagnostic (commit `615527d`)
+
+`output_momentum_anisotropy_vs_tau` declared its `std::vector<double>
+thermalVec` **inside** the OpenMP reduction loop — a heap malloc/free per
+cell.  `eos.getThermalVariables()` does `clear()`+`push_back`, and
+`clear()` keeps capacity, so a thread that keeps its buffer refills it in
+place.  Hoisted to `firstprivate` (one buffer per thread, reused).
+Bit-identical output at OMP=1; ~16 % faster on this function at OMP=12
+(1.00 → 0.84 ms/step); neutral at OMP=48 (the 25-variable reduction tree
+dominates a 64×64 η-slice, not the allocator).  `check_conservation_law`
+already used the scalar `eos.get_pressure` (no vector); the other
+`getThermalVariables` callers are serial — both left as-is.
+
+### 8.2 Cross-step prev residency (commit `aee1736`)
+
+At Nskip_diag=1 the diagnostics re-synced **both** host arenas every step
+(`curr` for the anisotropy, `prev` for conservation/freezeout), ~2.1 ms,
+vs `main_gpu`'s ~0.95 ms — `main_gpu` gets `prev` "for free" because its
+per-substep copy-back leaves the previous step resident on the host.
+
+But MUSIC's RK rotation makes this step's `fpPrev` the *same host buffer*
+that was `fpCurr` last step (net per-step rotation: `fpPrev ← old
+fpCurr`), and the GPU snapshot rotation makes `snap_prev` == last step's
+`snap_curr` — so when `curr` was synced the immediately-preceding step,
+the `prev` D2H is redundant.  Tracked safely with a step counter
+(`gpu_step_count_`, `curr_synced_{buf,step}_`, `prev_fresh_buf_`):
+the `prev` copy is skipped **iff** `&prev` equals the buffer synced as
+`curr` exactly one step earlier; otherwise it copies as before.
+Conservative — never skips unless proven fresh, so it is correct at any
+diagnostic frequency.
+
+Effect: `prev` sync 1.13 → 0.02 ms/step; per-step bench (OMP=48) 7.30 →
+6.51 ms/step; gap to `main_gpu` 1.52× → 1.35×.  **Validated
+bit-identical** at OMP=1 vs the pre-change build — eps trace,
+`global_conservation_laws.dat` (reads `prev`), and the Cornelius
+freezeout surface (reads `prev`) — at Nskip_diag = 1 and 3.
+
+### 8.3 Final decomposition — what the residual gap actually is
+
+Per-step profile after both optimizations (OMP=12, 64×64×32, Nskip=1):
+
+| component                  | XSCAPE (now) | `main_gpu` |
+|----------------------------|--------------|------------|
+| `evolve.AdvanceRK` (kernels)| **2.04 ms** | 3.03 ms    |
+| D2H sync (curr + prev)     | **1.16 ms**  | 0.95 ms    |
+| untimed `EvolveIt` CPU      | 3.75 ms     | 2.43 ms    |
+| `evolve.step_total`        | 8.52 ms      | 7.31 ms    |
+
+So after §8.1–8.2: **the GPU compute is faster on XSCAPE, and the D2H
+sync is essentially matched.**  The entire residual (~1.3 ms/step) is
+**untimed CPU code in `EvolveIt`** — XSCAPE's evolve driver differs from
+`main_gpu`'s by ~1200 lines (adaptive timestep, `Fields` bookkeeping,
+gated checks) and is heavier per step regardless of backend (it runs on
+the CPU path too).
+
+Gating diagnostics (`Nskip_diag = 10`) was measured at XSCAPE 6.51 vs
+`main_gpu` 5.57 ms (OMP=12) — still ~1.17×, confirming the residual is
+the evolve-loop overhead, **not** the sync (which gating already
+amortizes).  This is why the §5.5 "gating closes most of it" claim was
+walked back.
+
+**Conclusion for the CUDA port:** correct (bit-identical to `main_gpu`),
+GPU + sync costs matched or better.  The last ~1.3 ms/step is the XSCAPE
+`EvolveIt` CPU driver — a separate optimization target from the CUDA
+backend, profiled next (§9, CPU-side).
