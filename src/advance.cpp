@@ -161,12 +161,29 @@ void Advance::swap_curr_future_gpu() {
     // makes fpCurr point at what was fpNext, so on GPU snap_curr must now
     // point at what was snap_future.
     //
-    // Gate on gpu_owns_state_ (the inter-step residency flag, which is
-    // set TRUE by the rk1 substep's try_gpu_advance) — NOT on
-    // gpu_state_authoritative_, which is set FALSE in that same call and
-    // would suppress the swap entirely, leaving snap_curr stuck on the
-    // rk0 prediction instead of advancing to the rk1 correction.
+    // Gate on gpu_owns_state_ (set true by the last substep), NOT
+    // gpu_state_authoritative_: try_gpu_advance clears the latter to false on
+    // the last substep, so gating on it here silently skipped the swap and
+    // stranded the rk1 corrector in snap_future — the next step then evolved
+    // from the rk0 predictor, degrading RK2 to forward-Euler (~1e-3 drift
+    // instead of the kernels' ~1e-5 float32 floor).  This matches main_gpu's
+    // original gate; the gpu_state_authoritative_ gate was a regression
+    // introduced in commit 0cecdf5.  See PORT_GPU_CUDA.md.
     if (gpu_owns_state_) gpu_grid_.swap_curr_future();
+
+    // Step boundary (called once per completed RK step, at rk1).  After the
+    // host rotation, this step's fpCurr buffer becomes next step's fpPrev
+    // (new fpPrev == old fpCurr), and the GPU rotation makes next step's
+    // snap_prev == this step's snap_curr — so if we synced curr this step,
+    // next step's prev D2H is redundant.  Carry that buffer forward as
+    // prev_fresh_buf_, but ONLY when curr was actually synced this step
+    // (curr_synced_step_ == gpu_step_count_); otherwise clear it so the next
+    // prev read syncs normally.  This makes it correct at any diagnostic
+    // frequency: on a step that skipped its curr sync, no skip is offered.
+    prev_fresh_buf_   = (curr_synced_step_ == gpu_step_count_) ? curr_synced_buf_
+                                                              : nullptr;
+    ++gpu_step_count_;
+    curr_synced_buf_  = nullptr;
 }
 
 void Advance::rotate_snapshots_gpu() {
@@ -351,6 +368,17 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
             // At rk_flag == 0 of a cold start, prev == curr.
             gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_prev);
         }
+#if defined(USE_CUDA)
+        // Discrete GPU: the copy_to_gpu calls above only packed the float-cast
+        // primitives into pinned host staging.  Push them to the device
+        // snapshot buffers now, or the kernels below read uninitialised device
+        // memory (eps collapses to 0 within a step).  No-op on coherent unified
+        // memory, where copy_to_gpu wrote the device-visible managed buffers
+        // directly.  Mirrors main_gpu's SCGrid dispatch — this H2D call was
+        // lost when the SCGrid AdvanceIt was dropped in the XSCAPE merge.
+        // See PORT_GPU_CUDA.md.
+        GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
+#endif
     }
 
     MUSICGridParams p;
@@ -427,6 +455,10 @@ void Advance::sync_arena_from_gpu(Fields &arenaFieldsPrev,
                                   Fields &arenaFieldsCurr) {
     sync_arena_from_gpu_readonly(arenaFieldsPrev, arenaFieldsCurr);
     gpu_owns_state_ = false;
+    // Residency epoch ends here (host becomes authoritative).  Drop the
+    // cross-step freshness so a later epoch can't match a stale buffer ptr.
+    prev_fresh_buf_  = nullptr;
+    curr_synced_buf_ = nullptr;
 }
 
 void Advance::sync_arena_from_gpu_readonly(Fields &arenaFieldsPrev,
@@ -438,15 +470,31 @@ void Advance::sync_arena_from_gpu_readonly(Fields &arenaFieldsPrev,
         gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, arenaFieldsCurr);
         host_curr_fresh_ = true;
     }
+    // Record the curr buffer so next step's prev D2H can be skipped.
+    curr_synced_buf_  = static_cast<const void*>(&arenaFieldsCurr);
+    curr_synced_step_ = gpu_step_count_;
     if (!host_prev_fresh_) {
-        gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_prev, arenaFieldsPrev);
-        gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_prev, arenaFieldsPrev);
-        host_prev_fresh_ = true;
+        // Skip the prev D2H iff this buffer is the one we synced as curr
+        // exactly one step ago: the RK rotation makes new fpPrev == old
+        // fpCurr and the GPU rotation makes snap_prev == last step's
+        // snap_curr, so its host contents are already current.  Otherwise
+        // (different buffer, or a step was skipped) copy normally.
+        if (static_cast<const void*>(&arenaFieldsPrev) == prev_fresh_buf_) {
+            host_prev_fresh_ = true;            // already current — no copy
+        } else {
+            gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_prev, arenaFieldsPrev);
+            gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_prev, arenaFieldsPrev);
+            host_prev_fresh_ = true;
+        }
     }
 }
 
 void Advance::sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr) {
     if (!gpu_owns_state_ || !gpu_ready_) return;
+    // Record the curr buffer/step (even if the copy itself is cached) so the
+    // step boundary can carry it forward as next step's fresh prev.
+    curr_synced_buf_  = static_cast<const void*>(&arenaFieldsCurr);
+    curr_synced_step_ = gpu_step_count_;
     if (host_curr_fresh_) return;
     bench::Timer _bt_sync("advance.sync_curr_from_gpu");
     gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_curr, arenaFieldsCurr);

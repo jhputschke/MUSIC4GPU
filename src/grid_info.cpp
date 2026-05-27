@@ -2592,7 +2592,17 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
             }
             x_o /= w_sum;
             y_o /= w_sum;
-            #pragma omp parallel for collapse(2) \
+            // One thermalVec per thread, reused across cells (firstprivate),
+            // instead of one allocation per cell.  eos.getThermalVariables()
+            // does clear()+push_back, and clear() keeps the capacity, so after
+            // the first call each thread refills its own buffer in place with
+            // no realloc.  The previous form declared thermalVec inside the
+            // loop body — heap malloc/free every cell, which both costs time
+            // and scales poorly across threads (allocator contention).  A
+            // single shared buffer is not an option: it races on the resize
+            // (the heap corruption documented in PORT_GPU.md §9.6).
+            std::vector<double> thermalVec;
+            #pragma omp parallel for collapse(2) firstprivate(thermalVec) \
                 reduction(+:ideal_num1, ideal_num2, ideal_den, \
                             shear_num1, shear_num2, shear_den, \
                             full_num1, full_num2, full_den, \
@@ -2606,10 +2616,6 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
                             eccn_den[:norder])
             for (int iy = 0; iy < arena.nY(); iy++)
             for (int ix = 0; ix < arena.nX(); ix++) {
-                // Thread-local — must NOT be shared across the parallel
-                // reduction or eos.getThermalVariables' resize races and
-                // corrupts the heap.
-                std::vector<double> thermalVec;
                 int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
                 double x_local   = (- DATA.x_size/2. + ix*DATA.delta_x - x_o);
                 double y_local   = (- DATA.y_size/2. + iy*DATA.delta_y - y_o);
