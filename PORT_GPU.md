@@ -104,6 +104,60 @@ The GPU EOS table (`eos_P`, `eos_dPde`, `eos_s`, `eos_T`) is sampled at
 behavior. The CPU fallback already exists in the SCGrid path; the same
 guard needs to fire on the Fields path.
 
+**Carve-out for EOS 91 (2026-05-27).** The guard in
+`Advance::gpu_features_supported` ([src/advance.cpp](src/advance.cpp))
+was `if (DATA.whichEOS > 9) return false;`, which wrongly rejected
+`whichEOS == 91`. EOS 91 is a *zero-muB* hotQCD variant — built by the
+same `EOS_hotQCD` class as EOS 9 ([src/eos.cpp](src/eos.cpp), the
+`eos_id == 9 || eos_id == 91` branch), with `set_flag_muB(false)` and
+`dpdrhob = 0` ([src/eos_hotQCD.cpp](src/eos_hotQCD.cpp)). It samples the
+GPU EOS table identically to EOS 9 and is GPU-safe. The guard is now:
+
+```cpp
+if (DATA.whichEOS > 9 && DATA.whichEOS != 91) return false;
+```
+
+This unblocks the standard XSCAPE Au+Au config (`EOS=91`,
+`Initial_profile=131`, viscous, `Include_QS=0`/`Include_Rhob=0`), which
+otherwise passes every other guard and was falling back to CPU solely on
+the EOS check.
+
+**Deferred cleaner fix (Option B) — blocked on a latent bug.** The
+principled change is to gate on the EOS's own muB flag instead of a
+magic number:
+
+```cpp
+if (eos.get_flag_muB()) return false;   // instead of the >9 && !=91 check
+```
+
+This is **not safe today** because of two issues found in the
+2026-05-27 audit:
+
+1. `EOS_base::flag_muB` ([src/eos_base.h](src/eos_base.h)) is declared
+   with no initializer and `EOS_base() = default;`, so any subclass that
+   skips `set_flag_muB()` leaves it indeterminate.
+2. `EOS_BEST` (`whichEOS == 17`, [src/eos_best.cpp](src/eos_best.cpp))
+   and `EOS_UH` (`whichEOS == 19`, [src/eos_UH.cpp](src/eos_UH.cpp))
+   **never call `set_flag_muB`**, yet both are genuinely muB-dependent
+   (2D `interpolate2D(e, rhob, …)` tables, nonzero `get_dpOverdrhob2`).
+   With the flag uninitialized, `get_flag_muB()` could read falsy and
+   silently admit a finite-muB EOS onto the rhob=0 GPU path → wrong
+   physics, no warning. The current `> 9` threshold rejects 17/19
+   correctly, which is why the magic number is kept for now.
+
+   The `EOS` wrapper ([src/eos.h](src/eos.h)) also does not yet forward
+   `get_flag_muB()` from the inner `eos_ptr`, so Option B additionally
+   needs a one-line forwarder there.
+
+To land Option B safely: (a) give `flag_muB` a fail-safe default of
+`true` in `eos_base.h`; (b) add `set_flag_muB(true)` to the `EOS_BEST`
+and `EOS_UH` constructors; (c) add `bool get_flag_muB() const { return
+eos_ptr->get_flag_muB(); }` to the `EOS` wrapper; (d) switch the guard
+to `if (eos.get_flag_muB()) return false;`. Only nothing currently reads
+`get_flag_muB()` (the accessor is otherwise dead code), so the
+uninitialized-flag bug is latent today — but it must be fixed before
+anything depends on the flag.
+
 ### 4.3 Other unsupported features (inherited from SCGrid GPU path)
 
 - Baryon diffusion (`turn_on_diff == 1`)

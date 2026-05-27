@@ -214,7 +214,11 @@ bool Advance::gpu_features_supported() const {
     if (DATA.viscosity_flag != 1)         return false;
     if (DATA.turn_on_diff)                return false;
     if (DATA.muB_dependent_shear_to_s != 0) return false;
-    if (DATA.whichEOS > 9)                return false;  // finite-muB EOS
+    // Reject finite-muB EOS tables (GPU EOS is sampled at rhob=0).  EOS 91 is
+    // a zero-muB hotQCD variant (same EOS_hotQCD class as EOS 9, flag_muB=false)
+    // so it is GPU-safe and carved out of the threshold.  See PORT_GPU.md §4.2
+    // for why this stays a magic-number check rather than eos.get_flag_muB().
+    if (DATA.whichEOS > 9 && DATA.whichEOS != 91) return false;
     // Hydro source terms: GPU snapshot only carries rhob, so QS (rhoq/rhos)
     // source contributions can't be applied — fall back to CPU in that case.
     // Pure energy + baryon sources are supported via prefill_hydro_source_on_cpu.

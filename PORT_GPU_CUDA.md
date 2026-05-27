@@ -347,7 +347,14 @@ build the same two dirs there, run the same scripts.
   hardware-coherent and zero-copy).
 
 - **`rhoq`/`rhos`, finite-µB EOS, baryon diffusion, vorticity** — same
-  CPU-fallback guards as the Metal path (PORT_GPU.md §4); unchanged.
+  CPU-fallback guards as the Metal path (PORT_GPU.md §4); the guards live
+  in the backend-agnostic `Advance::gpu_features_supported`
+  ([src/advance.cpp](src/advance.cpp)), so CUDA inherits them unchanged.
+  Note (2026-05-27): the finite-µB EOS guard now carves out `whichEOS ==
+  91` (a zero-µB hotQCD variant) so it runs on GPU — see PORT_GPU.md §4.2,
+  including the deferred `get_flag_muB()` cleanup (Option B) and the
+  latent uninitialized-`flag_muB` bug in `EOS_BEST`/`EOS_UH` that blocks
+  it. CUDA needs no separate change.
 
 ## 8. Post-port CPU-side optimizations & final decomposition
 
