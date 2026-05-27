@@ -218,9 +218,12 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh
 
 | Grid       | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×1    |  0.17 s    | 0.27 s |  **0.63×**     | 3.24×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
-| 64×64×1    |  0.38 s    | 0.33 s |  **1.15×**     | 1.19×              | 3.6 × 10⁻³         | 9.9 × 10⁻⁵             |
-| 128×128×1  |  1.23 s    | 0.72 s |  **1.71×**     | 2.29×              | 1.1 × 10⁻²         | 9.4 × 10⁻⁵             |
+| 32×32×1    |  0.18 s    | 0.25 s |  **0.72×**     | 3.24×              | 5.3 × 10⁻⁵         | 5.3 × 10⁻⁵             |
+| 64×64×1    |  0.39 s    | 0.32 s |  **1.22×**     | 1.19×              | 9.9 × 10⁻⁵         | 9.9 × 10⁻⁵             |
+| 128×128×1  |  1.28 s    | 0.69 s |  **1.86×**     | 2.29×              | 9.4 × 10⁻⁵         | 9.4 × 10⁻⁵             |
+
+Precision now matches `main_gpu` bit-for-bit on every row, after the
+`swap_curr_future_gpu()` fix described in §9.7.
 
 ### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
@@ -233,34 +236,29 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench_3d.sh
 
 | Grid (Nx × Ny × Nη) | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |---------------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×8             |  0.38 s    | 0.67 s |  **0.57×**     | 1.43×              | 4.2 × 10⁻³         | 5.3 × 10⁻⁵             |
-| 32×32×32            |  0.79 s    | 0.37 s |  **2.14×**     | 2.36×              | 6.9 × 10⁻⁴         | 3.7 × 10⁻⁵             |
-| 64×64×16            |  1.64 s    | 0.56 s |  **2.93×**     | 2.91×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
-| 64×64×32            |  3.21 s    | 0.83 s |  **3.87×**     | 3.41×              | 3.2 × 10⁻³         | 3.1 × 10⁻⁵             |
+| 32×32×8             |  0.39 s    | 0.29 s |  **1.34×**     | 1.43×              | 5.3 × 10⁻⁵         | 5.3 × 10⁻⁵             |
+| 32×32×32            |  0.76 s    | 0.33 s |  **2.30×**     | 2.36×              | 3.7 × 10⁻⁵         | 3.7 × 10⁻⁵             |
+| 64×64×16            |  1.62 s    | 0.55 s |  **2.95×**     | 2.91×              | 3.1 × 10⁻⁵         | 3.1 × 10⁻⁵             |
+| 64×64×32            |  3.30 s    | 0.83 s |  **3.98×**     | 3.41×              | 3.1 × 10⁻⁵         | 3.1 × 10⁻⁵             |
 
-**XSCAPE+GPU now matches or beats `main_gpu`'s speedup at production
-3D sizes** (64×64×16 at 2.93× vs 2.91×, 64×64×32 at 3.87× vs 3.41×) —
-the gap that earlier section text complained about has been closed by
-the sync-optimisation commit `950c1ea`.  Small grids (32×32×8 at
-0.57×) regressed slightly because the OpenMP thread spin-up cost for
-the now-cheap sync starts to dominate when there's only ~8k cells of
-real work per substep; not a regime XSCAPE production cares about.
+**XSCAPE+GPU matches `main_gpu`'s speedup at every grid size** and
+all four cases now produce `eps_max` traces bit-for-bit identical to
+`main_gpu` (which itself agrees with the CPU to ~3 × 10⁻⁵, the
+expected float32 noise floor).  The small-grid regression that
+earlier text complained about is gone — even 32×32×8 is now 1.34×.
 
-**Precision improved ~10×** vs the previous intra-substep-only port
-(commit `0cecdf5`): the per-step H2D upload, which truncates every
-cell to float32 and back every step, is now skipped while
-`gpu_owns_state_` is set.  GPU state stays in float32 throughout an
-outer step and only round-trips when a diagnostic actually demands
-it (most diagnostics use `reduce_max_gpu` for eps_max or are gated
-by `output_diagnostics_every_N_timesteps`).
+The "10× precision improvement" that earlier text attributed to the
+inter-step residency optimisation was illusory; it was actually the
+*reverse*.  See §9.7 for the swap-gating bug that was producing the
+~10⁻³ drift and the fix that closed it.
 
 ### 8.3 Honest performance assessment
 
 **XSCAPE+GPU now matches or beats `main_gpu`'s speedup at production
-3D grid sizes** (3.87× at 64×64×32 vs `main_gpu`'s 3.41×; 2.93× at
+3D grid sizes** (3.98× at 64×64×32 vs `main_gpu`'s 3.41×; 2.95× at
 64×64×16 vs 2.91×).  Precision matches the kernel-internal float32
-noise floor (~3 × 10⁻³ over 100 steps), about 100× tighter than
-before inter-step residency landed.
+noise floor (~3 × 10⁻⁵ over 41 steps) — bit-for-bit identical to
+`main_gpu` after the §9.7 swap-gating fix.
 
 Per-step profile breakdown at 64×64×32 after commit `950c1ea`
 (`MUSIC_PROFILE=1`):
@@ -314,24 +312,19 @@ recovers the full GPU benefit.
 
 ### 8.4 Numerical accuracy note
 
-Both bench scripts report a max relative error on the `eps_max` trace.
-At small grids (32×32) the GPU's float32 visibly diverges from the
-CPU's float64 — 10 % at 32×32×1 isn't a bug, it's the expected order
-of magnitude of single-precision viscous evolution over 100 steps.
-The error decreases as the grid refines (more cells → individual
-single-cell noise averages out), with the largest grid (128×128×1)
-landing at 0.9 %.  3D results are similar at ~2 %.
+Both bench scripts report a max relative error on the `eps_max`
+trace.  After the §9.7 swap-gating fix, the GPU agrees with the CPU
+to **5 × 10⁻⁵ in 2D and 3 × 10⁻⁵ in 3D** — exactly matching
+`main_gpu`, and at the expected float32 noise floor.  All bench
+cases now print `PASS  (all steps agree within 1e-4)`.
 
-For most XSCAPE use cases this is fine — JETSCAPE only needs hydro
-correct to a few percent for thermal-particle production downstream.
-If tighter agreement is required, the options (none wired today, see
-§9.7) are:
-
-- Promote `gpu_reconst` (the Newton solve) to fp64.  Metal MSL 3.0+
-  and CUDA both support `double`; cost is ~2× on the Newton kernel,
-  small end-to-end.
-- Mixed-precision residency: fp32 in `snap_*` for bandwidth, cast to
-  fp64 only inside the sensitive arithmetic.
+No precision-targeted work (fp64 Newton, mixed precision, etc.) is
+needed at this time; the divergence that earlier text proposed those
+remedies for was caused by a host-side rotation bug, not by float
+arithmetic.  Metal MSL on Apple Silicon does not support `double` in
+any case (the compiler rejects the type — `xcrun metal` errors at
+parse time), so the fp64 Newton path was not even available; the
+old §9.7 claim that it was is corrected below.
 
 ### 8.5 Reproducing
 
@@ -543,29 +536,55 @@ body.  Annotate with `private(...)` / `firstprivate(...)` or move
 the declaration inside the loop.  Better still — prefer thread-local
 scratch buffers from the outset.
 
-### 9.7 Float32 GPU vs float64 CPU divergence over long runs
+### 9.7 GPU vs CPU divergence — root-caused, fixed
 
-§8.3 documents ~6 % error after 200 steps at 64×64 and 48 % after 200
-steps at 128×128 in the Gubser viscous test.  Per-step error is small;
-the accumulation is in the dilute-tail cells where the viscous Newton
-solve is most sensitive.
+**Earlier draft of this section** attributed a ~3 × 10⁻³ GPU-vs-CPU
+gap to float32 accumulation in the viscous Newton solve and proposed
+fp64 `gpu_reconst` (or mixed-precision residency) as the remedy.
+**That diagnosis was wrong on two counts:**
 
-If tighter agreement matters:
+1. Apple Silicon Metal does not support `double` in MSL — the
+   compiler rejects the type at parse time (`'double' is not
+   supported in Metal`).  So the proposed fp64 Newton path was never
+   available on this backend.
+2. The actual cause was a host-side bug in `swap_curr_future_gpu()`
+   ([src/advance.cpp:158](src/advance.cpp#L158)), not float
+   arithmetic.
 
-1. **Promote `gpu_reconst` (the Newton solve in `music_kernels.metal`
-   / `music_kernels.cu`) to fp64.**  Both Metal MSL 3.0+ and CUDA
-   support `double`; the cost is roughly 2× on the Newton kernel and
-   negligible end-to-end.  This is the highest-leverage single change.
-2. **Promote KT flux reconstruction to fp64** if (1) isn't enough.
-   ~30 % overall slowdown.
-3. **Mixed-precision residency:** keep `snap_*` in fp32 for bandwidth,
-   re-cast to fp64 only inside the kernel for the sensitive arithmetic.
+**The bug.**  `swap_curr_future_gpu()` mirrors the host's rk1
+`fpCurr ↔ fpNext` swap on the GPU side: after rk1, `try_gpu_advance`
+has written the corrected step into `snap_future`, and the swap
+should make `snap_curr` point at it.  But the swap was gated on
+`gpu_state_authoritative_`, which `try_gpu_advance` had just set
+*false* in the same rk1 call (because at that point the residency
+mode hands off from the "intra-substep" flag to the "inter-step"
+flag `gpu_owns_state_`).  The gate suppressed the swap entirely,
+leaving `snap_curr` stuck on the rk0 *prediction* across the step
+boundary.  Every diagnostic that subsequently read `snap_curr` —
+`reduce_max_gpu`, `sync_arena_from_gpu_readonly`, the next step's
+kernels — saw the wrong state.
 
-None of these are wired today.  For most XSCAPE downstream uses
-(thermal-particle production, post-decay observables), 5–10 % hydro
-error is fine — particle yields and flow harmonics smooth most of it
-out.  Revisit if/when JETSCAPE consumers report deviations they care
-about.
+**Diagnostic signature.**  The GPU-vs-CPU `eps_max` gap appeared
+already on step 1 at full magnitude (~1.7 × 10⁻³) rather than
+accumulating across many steps, which ruled out float32 noise.  CPU
+baselines on XSCAPE and `main_gpu` are bit-identical; cold-start
+upload data is bit-identical; the `.metal` kernel file is
+bit-identical; dispatch counters showed identical kernel call
+patterns (1 H2D, 82 entries, all six kernels each substep).  The
+only host-side asymmetry that explained the gap was the
+rk1-boundary swap.
+
+**The fix.**  Change the gate from `gpu_state_authoritative_` to
+`gpu_owns_state_`.  One line.  Result: drift drops from 3.18 × 10⁻³
+to 3.06 × 10⁻⁵ at 64×64×32 — bit-for-bit matching `main_gpu` across
+the entire 2D and 3D bench.  See §8.1, §8.2, §8.4.
+
+**Lessons learnt.**  Before proposing kernel-precision remedies for
+a CPU-vs-GPU gap, verify the gap is actually kernel-numerics in
+origin: a per-step-error vs cumulative-error decomposition would
+have ruled out float32 in one step.  When two branches share a
+`.metal` file and a CPU baseline but diverge by 100×, the difference
+is in host orchestration, not kernel arithmetic.
 
 ### 9.8 Slow `check_conservation_law` — misdiagnosis, retracted
 

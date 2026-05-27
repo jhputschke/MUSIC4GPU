@@ -160,7 +160,13 @@ void Advance::swap_curr_future_gpu() {
     // try_gpu_advance has written results into snap_future; the host swap
     // makes fpCurr point at what was fpNext, so on GPU snap_curr must now
     // point at what was snap_future.
-    if (gpu_state_authoritative_) gpu_grid_.swap_curr_future();
+    //
+    // Gate on gpu_owns_state_ (the inter-step residency flag, which is
+    // set TRUE by the rk1 substep's try_gpu_advance) — NOT on
+    // gpu_state_authoritative_, which is set FALSE in that same call and
+    // would suppress the swap entirely, leaving snap_curr stuck on the
+    // rk0 prediction instead of advancing to the rk1 correction.
+    if (gpu_owns_state_) gpu_grid_.swap_curr_future();
 }
 
 void Advance::rotate_snapshots_gpu() {
