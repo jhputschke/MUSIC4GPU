@@ -58,6 +58,20 @@ class Advance {
     // snap_curr/snap_prev are already current (maintained by swap_curr_future +
     // lockstep rotations).  Set on the first complete full-GPU step.
     bool       gpu_owns_state_ = false;
+    // Cross-step prev residency.  Under inter-step residency, MUSIC's RK
+    // rotation makes this step's fpPrev the *same host buffer* that was
+    // fpCurr last step (new fpPrev == old fpCurr), and its contents still
+    // equal GPU snap_prev — so the per-step prev D2H is redundant whenever
+    // curr was synced the immediately-preceding step.  These track that
+    // safely: gpu_step_count_ bumps once per completed step (in
+    // swap_curr_future_gpu), curr_synced_{buf,step}_ record the last curr
+    // sync, and prev_fresh_buf_ is the buffer proven fresh-as-prev for the
+    // current step (set only when the curr sync was exactly one step ago,
+    // else nullptr → sync prev).  Conservative: we never skip unless proven.
+    long        gpu_step_count_   = 0;
+    const void* curr_synced_buf_  = nullptr;
+    long        curr_synced_step_ = -2;
+    const void* prev_fresh_buf_   = nullptr;
     // Lazy GPU init.  Takes grid dimensions as plain ints so it can be called
     // from any caller — Fields-based AdvanceIt today, SCGrid-based EvolveIt
     // in the standalone path if/when that is re-introduced.
