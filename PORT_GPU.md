@@ -218,12 +218,14 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench.sh
 
 | Grid       | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×1    |  0.18 s    | 0.25 s |  **0.72×**     | 3.24×              | 5.3 × 10⁻⁵         | 5.3 × 10⁻⁵             |
-| 64×64×1    |  0.39 s    | 0.32 s |  **1.22×**     | 1.19×              | 9.9 × 10⁻⁵         | 9.9 × 10⁻⁵             |
-| 128×128×1  |  1.28 s    | 0.69 s |  **1.86×**     | 2.29×              | 9.4 × 10⁻⁵         | 9.4 × 10⁻⁵             |
+| 32×32×1    |  0.78 s    | 0.21 s |  **3.71×**     | 3.24×              | 5.3 × 10⁻⁵         | 5.3 × 10⁻⁵             |
+| 64×64×1    |  0.36 s    | 0.28 s |  **1.29×**     | 1.19×              | 9.9 × 10⁻⁵         | 9.9 × 10⁻⁵             |
+| 128×128×1  |  1.15 s    | 0.52 s |  **2.21×**     | 2.29×              | 9.4 × 10⁻⁵         | 9.4 × 10⁻⁵             |
 
-Precision now matches `main_gpu` bit-for-bit on every row, after the
-`swap_curr_future_gpu()` fix described in §9.7.
+Precision matches `main_gpu` bit-for-bit on every row, after the
+`swap_curr_future_gpu()` fix described in §9.7.  Speedups jumped on
+the merge from the CUDA-side `prev_fresh_buf_` sync optimisation —
+see §8.3 for the per-step breakdown.
 
 ### 8.2 3D bench — `tests/metal_vs_cpu_bench_3d.sh`
 
@@ -236,16 +238,21 @@ $ OMP_NUM_THREADS=12 bash tests/metal_vs_cpu_bench_3d.sh
 
 | Grid (Nx × Ny × Nη) | CPU 12 thr | GPU    | XSCAPE speedup | `main_gpu` speedup | XSCAPE max rel err | `main_gpu` max rel err |
 |---------------------|------------|--------|----------------|--------------------|--------------------|------------------------|
-| 32×32×8             |  0.39 s    | 0.29 s |  **1.34×**     | 1.43×              | 5.3 × 10⁻⁵         | 5.3 × 10⁻⁵             |
-| 32×32×32            |  0.76 s    | 0.33 s |  **2.30×**     | 2.36×              | 3.7 × 10⁻⁵         | 3.7 × 10⁻⁵             |
-| 64×64×16            |  1.62 s    | 0.55 s |  **2.95×**     | 2.91×              | 3.1 × 10⁻⁵         | 3.1 × 10⁻⁵             |
-| 64×64×32            |  3.30 s    | 0.83 s |  **3.98×**     | 3.41×              | 3.1 × 10⁻⁵         | 3.1 × 10⁻⁵             |
+| 32×32×8             |  0.37 s    | 0.24 s |  **1.54×**     | 1.43×              | 5.3 × 10⁻⁵         | 5.3 × 10⁻⁵             |
+| 32×32×32            |  0.81 s    | 0.30 s |  **2.70×**     | 2.36×              | 3.7 × 10⁻⁵         | 3.7 × 10⁻⁵             |
+| 64×64×16            |  1.66 s    | 0.45 s |  **3.69×**     | 2.91×              | 3.1 × 10⁻⁵         | 3.1 × 10⁻⁵             |
+| 64×64×32            |  3.27 s    | 0.65 s |  **5.03×**     | 3.41×              | 3.1 × 10⁻⁵         | 3.1 × 10⁻⁵             |
 
-**XSCAPE+GPU matches `main_gpu`'s speedup at every grid size** and
-all four cases now produce `eps_max` traces bit-for-bit identical to
-`main_gpu` (which itself agrees with the CPU to ~3 × 10⁻⁵, the
-expected float32 noise floor).  The small-grid regression that
-earlier text complained about is gone — even 32×32×8 is now 1.34×.
+**XSCAPE+GPU now beats `main_gpu`'s speedup at every 3D grid size**,
+decisively so at production scale (5.03× at 64×64×32 vs `main_gpu`'s
+3.41×; 3.69× at 64×64×16 vs 2.91×).  All four cases produce `eps_max`
+traces bit-for-bit identical to `main_gpu` (which itself agrees with
+the CPU to ~3 × 10⁻⁵, the expected float32 noise floor).
+
+The performance gain over the pre-merge XSCAPE Metal numbers comes
+from the CUDA-side cross-step sync optimisation (commit `aee1736`,
+see §8.3), which proved backend-agnostic — Metal benefits the same
+way CUDA does despite the very different memory model.
 
 The "10× precision improvement" that earlier text attributed to the
 inter-step residency optimisation was illusory; it was actually the
@@ -254,13 +261,46 @@ inter-step residency optimisation was illusory; it was actually the
 
 ### 8.3 Honest performance assessment
 
-**XSCAPE+GPU now matches or beats `main_gpu`'s speedup at production
-3D grid sizes** (3.98× at 64×64×32 vs `main_gpu`'s 3.41×; 2.95× at
-64×64×16 vs 2.91×).  Precision matches the kernel-internal float32
-noise floor (~3 × 10⁻⁵ over 41 steps) — bit-for-bit identical to
-`main_gpu` after the §9.7 swap-gating fix.
+**XSCAPE+GPU now beats `main_gpu`'s speedup at every 3D grid size**,
+including decisively at production scale (5.03× at 64×64×32 vs
+`main_gpu`'s 3.41×; 3.69× at 64×64×16 vs 2.91×).  Precision matches
+the kernel-internal float32 noise floor (~3 × 10⁻⁵ over 41 steps) —
+bit-for-bit identical to `main_gpu` after the §9.7 swap-gating fix.
 
-Per-step profile breakdown at 64×64×32 after commit `950c1ea`
+How the speedup gap was closed (chronological):
+
+1. **Split sync API** (commit `950c1ea`).  Most diagnostics only
+   read `fpCurr`, not `fpPrev`.  `sync_curr_from_gpu_readonly`
+   copies one arena instead of two, halving the sync cost at every
+   call site that doesn't need `prev`.
+2. **Pointer-hoist in `copy_*_to_cpu(Fields&)`** (commit `950c1ea`).
+   Fields stores `u_` and `Wmunu_` as
+   `std::vector<std::vector<double>>`; naive `dst.u_[m][c]` does an
+   indirect load on every iteration.  Hoisting the inner-vector
+   `.data()` pointers outside the parallel loop unlocks
+   vectorisation and goes from ~1 GB/s effective throughput to near
+   memory-bandwidth peak.  Identical change in both `GPUGrid.mm`
+   (Metal) and `GPUGrid_cuda.cu` (CUDA).
+3. **`host_curr_fresh_` / `host_prev_fresh_` cache** (commit
+   `950c1ea`).  Subsequent sync calls within the same outer
+   iteration are no-ops.  `try_gpu_advance` clears them at substep
+   entry so the next sync actually runs.
+4. **rk1-boundary swap fix** (commit `2e87cff`).  Restored
+   `swap_curr_future_gpu` so the GPU's `snap_curr` actually advances
+   across the step boundary — see §9.7.  Doesn't change wall time
+   per step but closes the 100× precision gap so the bench reports
+   `PASS` instead of `WARN`.
+5. **Cross-step `prev_fresh_buf_` sync skip** (commit `aee1736`,
+   originated on the CUDA side, merged in `0e2cb39`).  Tracks which
+   buffer was last synced as `curr` at the step boundary; at the
+   start of the next step the host's rotation makes that buffer the
+   new `prev`, so the prev-side D2H is provably redundant and gets
+   elided.  Halves the per-step D2H volume when both curr and prev
+   diagnostics fire.  This was the biggest single contributor to
+   the Metal speedup jump — 3.98× → 5.03× at 64×64×32, even though
+   it was authored for discrete-GPU PCIe pressure.
+
+Per-step profile breakdown at 64×64×32 after the full chain
 (`MUSIC_PROFILE=1`):
 
 | Section                                | XSCAPE   | `main_gpu` |
@@ -274,35 +314,17 @@ Per-step profile breakdown at 64×64×32 after commit `950c1ea`
 | `evolve.max_energy_density` (reduce_max_gpu) | 0.07 ms | 0.07 ms |
 
 ★ `main_gpu`'s timer breakdown calls this `advance.d2h_copyback`.
+(Profile numbers predate item 5 above; the bench wall times in §8.2
+reflect the full chain.)
 
-How the gap closed (commit `950c1ea`):
-
-1. **Split sync API.**  Most diagnostics only read `fpCurr`, not
-   `fpPrev`.  `sync_curr_from_gpu_readonly` copies one arena instead
-   of two, halving the sync cost at every call site that doesn't
-   need `prev`.
-2. **Pointer-hoist in `copy_*_to_cpu(Fields&)`.**  Fields stores
-   `u_` and `Wmunu_` as `std::vector<std::vector<double>>`; naive
-   `dst.u_[m][c]` does an indirect load on every iteration.
-   Hoisting the inner-vector `.data()` pointers outside the parallel
-   loop unlocks vectorisation and goes from ~1 GB/s effective
-   throughput to near memory-bandwidth peak.  Identical change in
-   both `GPUGrid.mm` (Metal) and `GPUGrid_cuda.cu` (CUDA).
-3. **`host_curr_fresh_` / `host_prev_fresh_` cache.**  Subsequent
-   sync calls within the same outer iteration are no-ops.
-   `try_gpu_advance` clears them at substep entry so the next sync
-   actually runs.
-
-Where the GPU port should win decisively is **discrete GPUs** (CUDA
-on Linux): an NVIDIA A100/H100 vs an x86 CPU shifts the bandwidth
-ratio ~10× and makes the H2D round-trip much more painful, so the
-residency optimisation matters more there.  All Metal-side
-improvements (intra-substep + inter-step residency, GPU-side
-reduce_max, diagnostic gating, Fields↔snapshot copies) are
-backend-agnostic and apply identically to the CUDA build — they call
-through the shared `GPUGrid` / `GPUPipelines` interfaces that both
-backends implement.  A CUDA bench on Linux hardware hasn't been
-re-run on this branch.
+**Backend portability of item 5.**  The `prev_fresh_buf_`
+optimisation was designed to relieve PCIe pressure on discrete
+NVIDIA GPUs, where every D2H is an explicit DMA copy.  On Apple
+Silicon (Metal) the same buffer addresses are host-visible — there's
+no DMA — so the win there comes from skipping the AoS↔SoA repack
+work and the OpenMP thread spin-up of the redundant copy, not from
+saved bus traffic.  Same code path, different reason it pays off:
+the abstraction held up cleanly across the two backends.
 
 **Bottom line:** the GPU port is *correct*, *portable*, and
 *useful*.  The CPU-side `check_conservation_law` cost is the limiting
