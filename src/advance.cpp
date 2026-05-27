@@ -160,7 +160,16 @@ void Advance::swap_curr_future_gpu() {
     // try_gpu_advance has written results into snap_future; the host swap
     // makes fpCurr point at what was fpNext, so on GPU snap_curr must now
     // point at what was snap_future.
-    if (gpu_state_authoritative_) gpu_grid_.swap_curr_future();
+    //
+    // Gate on gpu_owns_state_ (set true by the last substep), NOT
+    // gpu_state_authoritative_: try_gpu_advance clears the latter to false on
+    // the last substep, so gating on it here silently skipped the swap and
+    // stranded the rk1 corrector in snap_future — the next step then evolved
+    // from the rk0 predictor, degrading RK2 to forward-Euler (~1e-3 drift
+    // instead of the kernels' ~1e-5 float32 floor).  This matches main_gpu's
+    // original gate; the gpu_state_authoritative_ gate was a regression
+    // introduced in commit 0cecdf5.  See PORT_GPU_CUDA.md.
+    if (gpu_owns_state_) gpu_grid_.swap_curr_future();
 }
 
 void Advance::rotate_snapshots_gpu() {
@@ -345,6 +354,17 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
             // At rk_flag == 0 of a cold start, prev == curr.
             gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_prev);
         }
+#if defined(USE_CUDA)
+        // Discrete GPU: the copy_to_gpu calls above only packed the float-cast
+        // primitives into pinned host staging.  Push them to the device
+        // snapshot buffers now, or the kernels below read uninitialised device
+        // memory (eps collapses to 0 within a step).  No-op on coherent unified
+        // memory, where copy_to_gpu wrote the device-visible managed buffers
+        // directly.  Mirrors main_gpu's SCGrid dispatch — this H2D call was
+        // lost when the SCGrid AdvanceIt was dropped in the XSCAPE merge.
+        // See PORT_GPU_CUDA.md.
+        GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
+#endif
     }
 
     MUSICGridParams p;
