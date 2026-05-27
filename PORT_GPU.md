@@ -545,10 +545,26 @@ scratch buffers from the outset.
 
 ### 9.7 Float32 GPU vs float64 CPU divergence over long runs
 
+> **Correction (2026-05-26, from the CUDA port).**  The ~4 × 10⁻³ vs
+> ~5 × 10⁻⁵ accuracy gap between XSCAPE and `main_gpu` that §8.4 and the
+> text below blame on "float32 over 100 steps" was **misdiagnosed**.
+> The real cause was a residency bug: `swap_curr_future_gpu()` was
+> gated on `gpu_state_authoritative_` (commit `0cecdf5`), which
+> `try_gpu_advance` clears to false on the last substep, so the rk1
+> corrector swap never ran and RK2 silently degraded to forward Euler —
+> on **both** backends.  Re-gating on `gpu_owns_state_` (matching
+> `main_gpu`) drops the CUDA Gubser error from 3.6 × 10⁻³ to
+> 9.9 × 10⁻⁵, exactly matching `main_gpu`.  The same fix applies to
+> Metal but the Metal benchmarks here have not been re-run.  See
+> PORT_GPU_CUDA.md §2 (Bug 2).  The genuine float32 noise floor is
+> ~1 × 10⁻⁴ over 100 steps, not 10⁻³.
+
 §8.3 documents ~6 % error after 200 steps at 64×64 and 48 % after 200
 steps at 128×128 in the Gubser viscous test.  Per-step error is small;
 the accumulation is in the dilute-tail cells where the viscous Newton
-solve is most sensitive.
+solve is most sensitive.  (Numbers predate the §9.7 correction above and
+likely include the forward-Euler error; re-measure on Metal when
+convenient.)
 
 If tighter agreement matters:
 
