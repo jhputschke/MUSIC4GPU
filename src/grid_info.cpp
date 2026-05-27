@@ -2568,162 +2568,188 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
     // Originally a single shared std::vector outside the loop, which races
     // on resize and causes the SIGTRAP / Method-cache-corruption seen at
     // OMP_NUM_THREADS >= 2.  See PORT_GPU.md §9.6.
-    for (int ieta = 0; ieta < arena.nEta(); ieta++) {
+    // ── Anisotropy / eccentricity, restructured for OpenMP thread scaling ────
+    // The original ran two parallel-for reductions *inside* a serial eta loop,
+    // i.e. 2*Neta OpenMP fork/joins per call; on small eta-slices at high
+    // thread counts that overhead dominated and the diagnostic scaled
+    // *negatively* (PORT_GPU_CUDA.md §9).  Restructured into two full-grid
+    // passes: a centroid pass and a single collapse(3) anisotropy reduction
+    // (1 fork/join for the heavy pass).  At OMP_NUM_THREADS=1 the cell-visit
+    // and accumulation order (ieta-outer, then iy, ix) is unchanged, so the
+    // output is bit-identical.
+    const int neta_loc = arena.nEta();
+    // Dense list of in-range eta-slice indices.  Iterating only these (rather
+    // than collapse(3) over ALL slices with a `continue`) keeps the parallel
+    // iteration space dense and load-balanced: the in-range slices are a small
+    // contiguous block of eta, so a continue-filter would idle most threads
+    // under static scheduling.
+    std::vector<int> ir_etas;
+    for (int ieta = 0; ieta < neta_loc; ieta++) {
         double eta = 0.0;
         if (!DATA.boost_invariant) {
             eta = ((static_cast<double>(ieta))*(DATA.delta_eta)
                     - (DATA.eta_size)/2.0);
         }
-        if (eta < eta_max && eta > eta_min) {
-            double x_o   = 0.0;
-            double y_o   = 0.0;
-            double w_sum = 0.0;
-            #pragma omp parallel for collapse(2) reduction(+:x_o, y_o, w_sum)
-            for (int iy = 0; iy < arena.nY(); iy++)
-            for (int ix = 0; ix < arena.nX(); ix++) {
-                int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
-                double x_local    = - DATA.x_size/2. + ix*DATA.delta_x;
-                double y_local    = - DATA.y_size/2. + iy*DATA.delta_y;
-                double e_local    = arena.e_[fieldIdx];  // 1/fm^4
-                double gamma_perp = arena.u_[0][fieldIdx];
-                x_o   += x_local*e_local*gamma_perp;
-                y_o   += y_local*e_local*gamma_perp;
-                w_sum += e_local*gamma_perp;
-            }
-            x_o /= w_sum;
-            y_o /= w_sum;
-            // One thermalVec per thread, reused across cells (firstprivate),
-            // instead of one allocation per cell.  eos.getThermalVariables()
-            // does clear()+push_back, and clear() keeps the capacity, so after
-            // the first call each thread refills its own buffer in place with
-            // no realloc.  The previous form declared thermalVec inside the
-            // loop body — heap malloc/free every cell, which both costs time
-            // and scales poorly across threads (allocator contention).  A
-            // single shared buffer is not an option: it races on the resize
-            // (the heap corruption documented in PORT_GPU.md §9.6).
-            std::vector<double> thermalVec;
-            #pragma omp parallel for collapse(2) firstprivate(thermalVec) \
-                reduction(+:ideal_num1, ideal_num2, ideal_den, \
-                            shear_num1, shear_num2, shear_den, \
-                            full_num1, full_num2, full_den, \
-                            u_perp_num, u_perp_den, \
-                            T_avg_num, T_avg_den, \
-                            R_Pi_num, R_Pi_den, \
-                            R_shearpi_num, R_shearpi_den, \
-                            meanpT_est_num[:4], meanpT_est_den[:1], \
-                            ep_num1[:6], ep_num2[:6], ep_den[:6], \
-                            eccn_num1[:norder], eccn_num2[:norder], \
-                            eccn_den[:norder])
-            for (int iy = 0; iy < arena.nY(); iy++)
-            for (int ix = 0; ix < arena.nX(); ix++) {
-                int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
-                double x_local   = (- DATA.x_size/2. + ix*DATA.delta_x - x_o);
-                double y_local   = (- DATA.y_size/2. + iy*DATA.delta_y - y_o);
-                double r_local   = sqrt(x_local*x_local + y_local*y_local);
-                double phi_local = atan2(y_local, x_local);
+        if (eta < eta_max && eta > eta_min) ir_etas.push_back(ieta);
+    }
+    const int n_ir = static_cast<int>(ir_etas.size());
 
-                double e_local = arena.e_[fieldIdx];        // 1/fm^4
-                eos.getThermalVariables(
-                    e_local, arena.rhob_[fieldIdx], arena.rhoq_[fieldIdx],
-                    arena.rhos_[fieldIdx], thermalVec);
+    // Pass 1 — per-slice energy x gamma-weighted transverse centroid.
+    std::vector<double> xo_acc(neta_loc, 0.0), yo_acc(neta_loc, 0.0),
+                        w_acc(neta_loc, 0.0);
+    double* pxo = xo_acc.data();
+    double* pyo = yo_acc.data();
+    double* pw  = w_acc.data();
+    #pragma omp parallel for collapse(3) \
+        reduction(+: pxo[0:neta_loc], pyo[0:neta_loc], pw[0:neta_loc])
+    for (int k = 0; k < n_ir; k++)
+    for (int iy = 0; iy < arena.nY(); iy++)
+    for (int ix = 0; ix < arena.nX(); ix++) {
+        const int ieta = ir_etas[k];
+        int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
+        double x_local    = - DATA.x_size/2. + ix*DATA.delta_x;
+        double y_local    = - DATA.y_size/2. + iy*DATA.delta_y;
+        double e_local    = arena.e_[fieldIdx];  // 1/fm^4
+        double gamma_perp = arena.u_[0][fieldIdx];
+        pxo[ieta] += x_local*e_local*gamma_perp;
+        pyo[ieta] += y_local*e_local*gamma_perp;
+        pw [ieta] += e_local*gamma_perp;
+    }
+    std::vector<double> xo_cen(neta_loc, 0.0), yo_cen(neta_loc, 0.0);
+    for (int k = 0; k < n_ir; k++) {
+        const int ieta = ir_etas[k];
+        xo_cen[ieta] = xo_acc[ieta]/w_acc[ieta];
+        yo_cen[ieta] = yo_acc[ieta]/w_acc[ieta];
+    }
+    const double* x_o_arr = xo_cen.data();
+    const double* y_o_arr = yo_cen.data();
 
-                double P_local = thermalVec[2];
-                double enthopy = e_local + P_local;
-                double u0      = arena.u_[0][fieldIdx];
-                double ux      = arena.u_[1][fieldIdx];
-                double uy      = arena.u_[2][fieldIdx];
-                double pi_0x   = arena.Wmunu_[1][fieldIdx];
-                double pi_0y   = arena.Wmunu_[2][fieldIdx];
-                double pi_xx   = arena.Wmunu_[4][fieldIdx];
-                double pi_xy   = arena.Wmunu_[5][fieldIdx];
-                double pi_yy   = arena.Wmunu_[7][fieldIdx];
-                double bulk_Pi = arena.piBulk_[fieldIdx];
+    // Pass 2 — anisotropy / eccentricity / mean-pT sums over the whole grid.
+    // thermalVec is firstprivate: one reusable buffer per thread (a shared one
+    // races on resize — PORT_GPU.md §9.6).
+    std::vector<double> thermalVec;
+    #pragma omp parallel for collapse(3) firstprivate(thermalVec) \
+        reduction(+:ideal_num1, ideal_num2, ideal_den, \
+                    shear_num1, shear_num2, shear_den, \
+                    full_num1, full_num2, full_den, \
+                    u_perp_num, u_perp_den, \
+                    T_avg_num, T_avg_den, \
+                    R_Pi_num, R_Pi_den, \
+                    R_shearpi_num, R_shearpi_den, \
+                    meanpT_est_num[:4], meanpT_est_den[:1], \
+                    ep_num1[:6], ep_num2[:6], ep_den[:6], \
+                    eccn_num1[:norder], eccn_num2[:norder], \
+                    eccn_den[:norder])
+    for (int k = 0; k < n_ir; k++)
+    for (int iy = 0; iy < arena.nY(); iy++)
+    for (int ix = 0; ix < arena.nX(); ix++) {
+        const int ieta = ir_etas[k];
+        int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
+        double x_local   = (- DATA.x_size/2. + ix*DATA.delta_x - x_o_arr[ieta]);
+        double y_local   = (- DATA.y_size/2. + iy*DATA.delta_y - y_o_arr[ieta]);
+        double r_local   = sqrt(x_local*x_local + y_local*y_local);
+        double phi_local = atan2(y_local, x_local);
 
-                double T_00_ideal  = enthopy*u0*u0 - P_local;
-                double T_0x_ideal  = enthopy*u0*ux;
-                double T_0y_ideal  = enthopy*u0*uy;
-                double T_0r_ideal  = sqrt(  T_0x_ideal*T_0x_ideal
-                                          + T_0y_ideal*T_0y_ideal);
-                double phi_u_ideal = atan2(T_0y_ideal, T_0x_ideal);
-                double T_xx_ideal  = enthopy*ux*ux + P_local;
-                double T_xy_ideal  = enthopy*ux*uy;
-                double T_yy_ideal  = enthopy*uy*uy + P_local;
+        double e_local = arena.e_[fieldIdx];        // 1/fm^4
+        eos.getThermalVariables(
+            e_local, arena.rhob_[fieldIdx], arena.rhoq_[fieldIdx],
+            arena.rhos_[fieldIdx], thermalVec);
 
-                double T_0x_shear  = T_0x_ideal + pi_0x;
-                double T_0y_shear  = T_0y_ideal + pi_0y;
-                double T_0r_shear  = sqrt(  T_0x_shear*T_0x_shear
-                                          + T_0y_shear*T_0y_shear);
-                double phi_u_shear = atan2(T_0y_shear, T_0x_shear);
-                double T_xx_shear  = T_xx_ideal + pi_xx;
-                double T_xy_shear  = T_xy_ideal + pi_xy;
-                double T_yy_shear  = T_yy_ideal + pi_yy;
+        double P_local = thermalVec[2];
+        double enthopy = e_local + P_local;
+        double u0      = arena.u_[0][fieldIdx];
+        double ux      = arena.u_[1][fieldIdx];
+        double uy      = arena.u_[2][fieldIdx];
+        double pi_0x   = arena.Wmunu_[1][fieldIdx];
+        double pi_0y   = arena.Wmunu_[2][fieldIdx];
+        double pi_xx   = arena.Wmunu_[4][fieldIdx];
+        double pi_xy   = arena.Wmunu_[5][fieldIdx];
+        double pi_yy   = arena.Wmunu_[7][fieldIdx];
+        double bulk_Pi = arena.piBulk_[fieldIdx];
 
-                double T_0x_full   = T_0x_shear + bulk_Pi*u0*ux;
-                double T_0y_full   = T_0y_shear + bulk_Pi*u0*uy;
-                double T_0r_full   = sqrt(  T_0x_full*T_0x_full
-                                          + T_0y_full*T_0y_full);
-                double phi_u_full  = atan2(T_0y_full, T_0x_full);
-                double T_xx_full   = T_xx_shear - bulk_Pi*(-1 - ux*ux);
-                double T_xy_full   = T_xy_shear + bulk_Pi*ux*uy;
-                double T_yy_full   = T_yy_shear - bulk_Pi*(-1 - uy*uy);
+        double T_00_ideal  = enthopy*u0*u0 - P_local;
+        double T_0x_ideal  = enthopy*u0*ux;
+        double T_0y_ideal  = enthopy*u0*uy;
+        double T_0r_ideal  = sqrt(  T_0x_ideal*T_0x_ideal
+                                  + T_0y_ideal*T_0y_ideal);
+        double phi_u_ideal = atan2(T_0y_ideal, T_0x_ideal);
+        double T_xx_ideal  = enthopy*ux*ux + P_local;
+        double T_xy_ideal  = enthopy*ux*uy;
+        double T_yy_ideal  = enthopy*uy*uy + P_local;
 
-                ideal_num1 += T_xx_ideal - T_yy_ideal;
-                ideal_num2 += 2.*T_xy_ideal;
-                ideal_den  += T_xx_ideal + T_yy_ideal;
-                shear_num1 += T_xx_shear - T_yy_shear;
-                shear_num2 += 2.*T_xy_shear;
-                shear_den  += T_xx_shear + T_yy_shear;
-                full_num1  += T_xx_full - T_yy_full;
-                full_num2  += 2.*T_xy_full;
-                full_den   += T_xx_full + T_yy_full;
+        double T_0x_shear  = T_0x_ideal + pi_0x;
+        double T_0y_shear  = T_0y_ideal + pi_0y;
+        double T_0r_shear  = sqrt(  T_0x_shear*T_0x_shear
+                                  + T_0y_shear*T_0y_shear);
+        double phi_u_shear = atan2(T_0y_shear, T_0x_shear);
+        double T_xx_shear  = T_xx_ideal + pi_xx;
+        double T_xy_shear  = T_xy_ideal + pi_xy;
+        double T_yy_shear  = T_yy_ideal + pi_yy;
 
-                double weight_local = e_local;
-                u_perp_num += weight_local*u0;
-                u_perp_den += weight_local;
-                T_avg_num  += weight_local*thermalVec[6];
-                T_avg_den  += weight_local;
+        double T_0x_full   = T_0x_shear + bulk_Pi*u0*ux;
+        double T_0y_full   = T_0y_shear + bulk_Pi*u0*uy;
+        double T_0r_full   = sqrt(  T_0x_full*T_0x_full
+                                  + T_0y_full*T_0y_full);
+        double phi_u_full  = atan2(T_0y_full, T_0x_full);
+        double T_xx_full   = T_xx_shear - bulk_Pi*(-1 - ux*ux);
+        double T_xy_full   = T_xy_shear + bulk_Pi*ux*uy;
+        double T_yy_full   = T_yy_shear - bulk_Pi*(-1 - uy*uy);
 
-                if (e_local > 1e-3) {
-                    double r_shearpi, r_bulkPi;
-                    calculate_inverse_Reynolds_numbers(
-                            arena, fieldIdx, P_local, r_shearpi, r_bulkPi);
-                    R_shearpi_num += weight_local*r_shearpi;
-                    R_shearpi_den += weight_local;
-                    R_Pi_num      += weight_local*r_bulkPi;
-                    R_Pi_den      += weight_local;
-                }
+        ideal_num1 += T_xx_ideal - T_yy_ideal;
+        ideal_num2 += 2.*T_xy_ideal;
+        ideal_den  += T_xx_ideal + T_yy_ideal;
+        shear_num1 += T_xx_shear - T_yy_shear;
+        shear_num2 += 2.*T_xy_shear;
+        shear_den  += T_xx_shear + T_yy_shear;
+        full_num1  += T_xx_full - T_yy_full;
+        full_num2  += 2.*T_xy_full;
+        full_den   += T_xx_full + T_yy_full;
 
-                for (int i = 0; i < 2; i++) {
-                    int idx = 3*i;
-                    int iorder = 2+i;
-                    ep_num1[idx]   += T_0r_ideal*cos(iorder*phi_u_ideal);
-                    ep_num2[idx]   += T_0r_ideal*sin(iorder*phi_u_ideal);
-                    ep_den [idx]   += T_0r_ideal;
-                    ep_num1[idx+1] += T_0r_shear*cos(iorder*phi_u_shear);
-                    ep_num2[idx+1] += T_0r_shear*sin(iorder*phi_u_shear);
-                    ep_den [idx+1] += T_0r_shear;
-                    ep_num1[idx+2] += T_0r_full*cos(iorder*phi_u_full);
-                    ep_num2[idx+2] += T_0r_full*sin(iorder*phi_u_full);
-                    ep_den [idx+2] += T_0r_full;
-                }
-                for (int i = 1; i <= norder; i++) {
-                    if (i == 1) {
-                        weight_local = u0*e_local*pow(r_local, 3);
-                    } else {
-                        weight_local = u0*e_local*pow(r_local, i);
-                    }
-                    eccn_num1[i-1] += weight_local*cos(i*phi_local);
-                    eccn_num2[i-1] += weight_local*sin(i*phi_local);
-                    eccn_den [i-1] += weight_local;
-                }
+        double weight_local = e_local;
+        u_perp_num += weight_local*u0;
+        u_perp_den += weight_local;
+        T_avg_num  += weight_local*thermalVec[6];
+        T_avg_den  += weight_local;
 
-                meanpT_est_num[0] += tau*thermalVec[12]*u0;         // dS/deta_s
-                meanpT_est_num[1] += tau*T_00_ideal;                // dE/deta_s
-                meanpT_est_num[2] += thermalVec[12]*u0*e_local;     // [s]
-                meanpT_est_num[3] += r_local*r_local*u0*e_local;    // [r^2]
-                meanpT_est_den[0] += u0*e_local;
-            }
+        if (e_local > 1e-3) {
+            double r_shearpi, r_bulkPi;
+            calculate_inverse_Reynolds_numbers(
+                    arena, fieldIdx, P_local, r_shearpi, r_bulkPi);
+            R_shearpi_num += weight_local*r_shearpi;
+            R_shearpi_den += weight_local;
+            R_Pi_num      += weight_local*r_bulkPi;
+            R_Pi_den      += weight_local;
         }
+
+        for (int i = 0; i < 2; i++) {
+            int idx = 3*i;
+            int iorder = 2+i;
+            ep_num1[idx]   += T_0r_ideal*cos(iorder*phi_u_ideal);
+            ep_num2[idx]   += T_0r_ideal*sin(iorder*phi_u_ideal);
+            ep_den [idx]   += T_0r_ideal;
+            ep_num1[idx+1] += T_0r_shear*cos(iorder*phi_u_shear);
+            ep_num2[idx+1] += T_0r_shear*sin(iorder*phi_u_shear);
+            ep_den [idx+1] += T_0r_shear;
+            ep_num1[idx+2] += T_0r_full*cos(iorder*phi_u_full);
+            ep_num2[idx+2] += T_0r_full*sin(iorder*phi_u_full);
+            ep_den [idx+2] += T_0r_full;
+        }
+        for (int i = 1; i <= norder; i++) {
+            if (i == 1) {
+                weight_local = u0*e_local*pow(r_local, 3);
+            } else {
+                weight_local = u0*e_local*pow(r_local, i);
+            }
+            eccn_num1[i-1] += weight_local*cos(i*phi_local);
+            eccn_num2[i-1] += weight_local*sin(i*phi_local);
+            eccn_den [i-1] += weight_local;
+        }
+
+        meanpT_est_num[0] += tau*thermalVec[12]*u0;         // dS/deta_s
+        meanpT_est_num[1] += tau*T_00_ideal;                // dE/deta_s
+        meanpT_est_num[2] += thermalVec[12]*u0*e_local;     // [s]
+        meanpT_est_num[3] += r_local*r_local*u0*e_local;    // [r^2]
+        meanpT_est_den[0] += u0*e_local;
     }
     double R_shearpi = R_shearpi_num/std::max(R_shearpi_den, small_eps);
     double R_Pi      = R_Pi_num/std::max(R_Pi_den, small_eps);
@@ -2848,3 +2874,4 @@ void Cell_info::get_LRF_shear_stress_tensor(const Fields &arena,
     res[6] = q_LRF[2];
     res[7] = q_LRF[3];
 }
+
