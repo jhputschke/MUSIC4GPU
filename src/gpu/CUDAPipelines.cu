@@ -118,6 +118,19 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
                             "forcing discrete memory path\n");
         }
     }
+    // Symmetric override: force the coherent (managed, zero-copy) path even on
+    // discrete hardware, to validate the GB10/Grace-C2C code path where no
+    // coherent GPU is available.  On a discrete GPU cudaMallocManaged still
+    // works (pages migrate over PCIe), so this exercises the same in-place
+    // pack/read/copy-back logic the coherent parts use — correctness only, not
+    // representative of true-coherence performance.  Set MUSIC_CUDA_FORCE_COHERENT=1.
+    if (const char* e = getenv("MUSIC_CUDA_FORCE_COHERENT")) {
+        if (e[0] == '1') {
+            coherent_memory_ = true;
+            fprintf(stderr, "[MUSIC-GPU] MUSIC_CUDA_FORCE_COHERENT=1: "
+                            "forcing coherent memory path\n");
+        }
+    }
     g_cuda_coherent  = coherent_memory_;   // GPUGrid uses this to pick its allocator
     fprintf(stderr, "[MUSIC-GPU] coherent host memory: %s\n",
             coherent_memory_ ? "yes (managed buffers, zero-copy)"

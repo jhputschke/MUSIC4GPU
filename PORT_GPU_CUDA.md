@@ -318,11 +318,27 @@ build the same two dirs there, run the same scripts.
   diagnostic needs would help, but only matters at
   `output_diagnostics_every_N_timesteps = 1`.
 
-- **CUDA on coherent hardware (GB10).**  Only the discrete RTX 3090 path
-  was exercised here.  The coherent CUDA branch
-  (`g_cuda_coherent == true`) takes the same in-place path as Metal and
-  the upload is a no-op there; it inherits the Bug 2 fix but was not
-  re-benchmarked.
+- **CUDA on coherent hardware (GB10 / Grace-C2C / integrated).**
+  Coherence is detected from `cudaDevAttrPageableMemoryAccess` (or
+  `prop.integrated`) in `CUDAPipelines::initialize()` — the standard
+  attribute that reports 1 on Grace-coherent parts (GH200/GB10/GB200)
+  and integrated GPUs, so GB10 resolves to the zero-copy managed path.
+  On that path `copy_to_gpu` packs straight into the `cudaMallocManaged`
+  buffers the kernels read, `upload_snapshots_async` early-returns (the
+  Bug-1 fix is a no-op), and the D2H copy-backs read the managed buffers
+  in place (no `cudaMemcpy`); the Bug-2 swap fix is a pure pointer-alias
+  rotation, identical on both memory models.
+
+  No GB10 silicon was available, but the coherent *code path* was
+  validated on the discrete RTX 3090 via the new
+  `MUSIC_CUDA_FORCE_COHERENT=1` override (symmetric to
+  `MUSIC_CUDA_FORCE_DISCRETE`).  Forced-coherent results are
+  **bit-identical** to the discrete path — 9.9 × 10⁻⁵ (2D 64×64×1) and
+  exactly 0 difference vs discrete in 3D (32×32×8) — and match the CPU
+  reference at the float32 floor.  This confirms the coherent branches
+  are logically correct; it does not measure true-coherence performance
+  (the 3090's managed memory migrates over PCIe, whereas GB10's is
+  hardware-coherent and zero-copy).
 
 - **`rhoq`/`rhos`, finite-µB EOS, baryon diffusion, vorticity** — same
   CPU-fallback guards as the Metal path (PORT_GPU.md §4); unchanged.
