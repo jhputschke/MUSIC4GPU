@@ -374,28 +374,34 @@ __global__ void gpu_make_w_source_tiled(
 
 // ── EOS table helpers ─────────────────────────────────────────────────────────
 
-DFI float gpu_eos_interp(const float* __restrict__ table, float e,
+// Log-spaced table lookup, shared by P, dP/de, s and T.  All four are
+// non-linear in e for realistic (non-conformal) EOS, and hydro cells live in
+// the dilute regime (e ~ 0.1 /fm^4) far below eps_max (~1e4 /fm^4 for
+// hotQCD), so log spacing is required to resolve them.  Grid matches
+// GPUGrid::upload_eos's log_* params.
+// __ldg: route the EOS table through the read-only data cache.  The index
+// depends on the cell's local energy density, so warp lanes generally hit
+// different entries — the read-only L1 path handles this far better than
+// __constant__ memory, which serializes non-broadcast accesses.
+DFI float gpu_log_interp(float e, const float* __restrict__ tab,
                          const GPUEosParams& ep) {
-    e = clampf(e, ep.e_min, ep.e_max);
-    float fe  = (e - ep.e_min) / ep.delta_e;
-    int   idx = min((int)fe, ep.n_pts - 2);
-    idx = max(0, idx);
+    if (e <= 0.f) return 0.f;
+    float le = logf(e);
+    le = clampf(le, ep.log_e_min, ep.log_e_max);
+    float fe   = (le - ep.log_e_min) / ep.log_delta_e;
+    int   idx  = clampi((int)fe, 0, ep.n_pts - 2);
     float frac = fe - (float)idx;
-    // __ldg: route the EOS table through the read-only data cache.  The index
-    // depends on the cell's local energy density, so warp lanes generally hit
-    // different entries — the read-only L1 path handles this far better than
-    // __constant__ memory, which serializes non-broadcast accesses.
-    return __ldg(&table[idx]) * (1.f - frac) + __ldg(&table[idx + 1]) * frac;
+    return fmaxf(0.f, __ldg(&tab[idx]) * (1.f - frac) + __ldg(&tab[idx + 1]) * frac);
 }
 
 DFI float gpu_P(float e, const float* __restrict__ P_tab,
                 const GPUEosParams& ep) {
-    return fmaxf(1.e-20f, gpu_eos_interp(P_tab, e, ep));
+    return fmaxf(1.e-20f, gpu_log_interp(e, P_tab, ep));
 }
 
 DFI float gpu_dPde(float e, const float* __restrict__ dPde_tab,
                    const GPUEosParams& ep) {
-    return gpu_eos_interp(dPde_tab, e, ep);
+    return gpu_log_interp(e, dPde_tab, ep);
 }
 
 DFI float gpu_cs2(float e, const float* __restrict__ P_tab,
@@ -1212,19 +1218,6 @@ __global__ void gpu_make_du(
     sigma_out[7 * Ncells + c] = sigma_local[2][2];
     sigma_out[8 * Ncells + c] = sigma_local[2][3];
     sigma_out[9 * Ncells + c] = sigma_local[3][3];
-}
-
-// ── log-spaced EOS table lookup (entropy s(e), temperature T(e)) ──────────────
-
-DFI float gpu_log_interp(float e, const float* __restrict__ tab,
-                         const GPUEosParams& ep) {
-    if (e <= 0.f) return 0.f;
-    float le = logf(e);
-    le = clampf(le, ep.log_e_min, ep.log_e_max);
-    float fe   = (le - ep.log_e_min) / ep.log_delta_e;
-    int   idx  = clampi((int)fe, 0, ep.n_pts - 2);
-    float frac = fe - (float)idx;
-    return fmaxf(0.f, __ldg(&tab[idx]) * (1.f - frac) + __ldg(&tab[idx + 1]) * frac);
 }
 
 DFI float gpu_s(float e, const float* __restrict__ s_tab, const GPUEosParams& ep) {

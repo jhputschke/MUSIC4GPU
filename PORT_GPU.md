@@ -167,6 +167,83 @@ anything depends on the flag.
 All of these already trigger CPU fallback on the SCGrid path; the same
 guards need to be applied on the Fields path.
 
+### 4.4 GPU EOS table was linear-sampled — broke every non-conformal EOS (2026-05-27)
+
+**Symptom.** After the §4.2 carve-out enabled EOS 91 on GPU, a CPU↔GPU
+comparison (EOS=91, viscous, Gubser profile) diverged ~6 % by step 49
+and the GPU run blew past the 5× energy-density sanity guard and aborted
+at step 123, while the fp64 CPU completed all 210 steps cleanly. This
+was **not** float32 noise and **not** the §9.7 swap-gating bug (which is
+fixed and present): the divergence is deterministic and appears in fp64
+too.
+
+**Root cause — EOS table resolution.** The GPU samples the CPU EOS onto
+four `GPU_EOS_N = 8192`-point tables at `rhob = 0`. `s(e)` and `T(e)`
+were correctly **log-spaced** (they vary over many decades), but `P(e)`
+and `dP/de(e)` were **linear-spaced** on `[0, eps_max]`, with a comment
+admitting it was "essentially exact for the ideal-gas EOS." For hotQCD,
+`eps_max = 9659 /fm⁴`, so the linear spacing is `de ≈ 1.18 /fm⁴` — but
+the hydro cells live at `e ≈ 0.15 /fm⁴`, i.e. **0.13 of one grid
+interval**. The entire evolution was interpolated on the single segment
+`P(0)→P(1.18)`, a straight line drawn across the QCD crossover. The
+conformal ideal gas (`P = e/3`) is exactly linear, which is why every
+prior bench (all `EOS_to_use 0`) passed and never caught this.
+
+**Per-EOS audit (which eligible EOS need log sampling).** Every EOS that
+passes the guard (`whichEOS ≤ 9 || == 91`) except the ideal gas is
+non-conformal and was affected. The CPU code shows it directly:
+
+| id    | class    | P(e) shape (CPU)                         | linear GPU grid? |
+|-------|----------|------------------------------------------|------------------|
+| 0     | idealgas | `P = e/3`, exactly linear                | ✓ exact          |
+| 1     | EOSQ     | bag model + 1st-order transition         | ✗ (also finite-µB, see §4.2) |
+| 2–7   | s95p     | **7 piecewise tables**, per-table spacing ([eos_s95p.cpp](src/eos_s95p.cpp)) | ✗ |
+| 8     | WB       | **degree-12 rational poly** ([eos_WB.cpp](src/eos_WB.cpp)) | ✗ (worst: `de ≈ 12`) |
+| 9, 91 | hotQCD   | 100k-pt table, fine spacing ([eos_hotQCD.cpp](src/eos_hotQCD.cpp)) | ✗ (`de ≈ 1.18`) |
+
+The non-linearity is visible in the CPU representation itself: s95p
+*splits into 7 sub-tables* specifically to refine the dilute end, WB is
+a rational polynomial, hotQCD uses a 100k-point fine table. The GPU's
+single 8192-point linear grid over the full range can't match any of
+them in the dilute regime.
+
+**Fix.** Sample `P` and `dP/de` on the **same log-e grid** already used
+for `s`/`T`, and route the kernel lookups through `gpu_log_interp`
+instead of the linear `gpu_eos_interp` (now removed). One general fix
+covers hotQCD, WB and s95p at once; the ideal gas stays effectively
+exact (linear-in-log interp of a straight line over 0.14 %-wide
+intervals → ~1e-7 error, far under the fp32 floor). Changes:
+
+- [src/advance.cpp](src/advance.cpp) — host samples all four tables on
+  one log grid (`log_e_floor = 1e-6`, matching `GPUGrid::upload_eos`'s
+  `log_*` params). Shared by both backends.
+- [src/gpu/music_kernels.metal](src/gpu/music_kernels.metal) and
+  [src/gpu/music_kernels.cu](src/gpu/music_kernels.cu) — `gpu_P` /
+  `gpu_dPde` use `gpu_log_interp`; the linear `gpu_eos_interp` is
+  deleted. (The struct's linear `e_min`/`e_max`/`delta_e` fields are now
+  set-but-unused; left in place to avoid touching the shared
+  `upload_eos` signature.)
+
+**Verification (Metal, Apple M3 Max).**
+
+- EOS=91 hotQCD (Gubser IC, 210 steps): max rel err on `eps_max` drops
+  from ~6 % (and a step-123 crash) to ~1e-4 through mid-run, growing to
+  2.5e-3 by step 210 (genuine fp32 accumulation on a deliberately
+  non-physical Gubser-on-hotQCD IC). GPU now completes all 210 steps.
+- EOS=0 ideal gas (`tests/metal_vs_cpu_bench.sh`): no regression —
+  4.7e-5 / 9.7e-5 / 9.4e-5 at 32/64/128², matching the pre-fix floor.
+
+**Caveats / follow-ups.**
+
+- The CUDA kernel change is a structural mirror of the validated
+  Metal+host change; **not built or run on CUDA hardware** in-session.
+- The Gubser profile is only an exact solution for the conformal EOS, so
+  the EOS=91 run is a CPU↔GPU *agreement* test, not a physics test. A
+  smooth physical IC (Gaussian blob or read-in profile) would be a
+  cleaner accuracy check and is the recommended next step.
+- EOSQ (id 1) remains finite-µB yet passes the `≤ 9` threshold — the
+  log fix does not address that; it is Option B territory (§4.2).
+
 ## 5. Port plan
 
 ### Phase 1 — Plumbing

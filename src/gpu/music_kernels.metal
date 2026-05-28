@@ -414,24 +414,30 @@ kernel void gpu_first_rk_step_w(
 
 // ── EOS table helpers ─────────────────────────────────────────────────────────
 
-inline float gpu_eos_interp(device const float* table, float e,
-                             constant GPUEosParams& ep) {
-    e = clamp(e, ep.e_min, ep.e_max);
-    float fe  = (e - ep.e_min) / ep.delta_e;
-    int   idx = min((int)fe, ep.n_pts - 2);
-    idx = max(0, idx);
+// Log-spaced table lookup, shared by P, dP/de, s and T.  All four are
+// non-linear in e for realistic (non-conformal) EOS, and hydro cells live in
+// the dilute regime (e ~ 0.1 /fm^4) far below eps_max (~1e4 /fm^4 for
+// hotQCD), so log spacing is required to resolve them.  Grid matches
+// GPUGrid::upload_eos's log_* params.
+inline float gpu_log_interp(float e, device const float* tab,
+                            constant GPUEosParams& ep) {
+    if (e <= 0.f) return 0.f;
+    float le = log(e);
+    le = clamp(le, ep.log_e_min, ep.log_e_max);
+    float fe   = (le - ep.log_e_min) / ep.log_delta_e;
+    int   idx  = clamp((int)fe, 0, ep.n_pts - 2);
     float frac = fe - (float)idx;
-    return table[idx] * (1.f - frac) + table[idx + 1] * frac;
+    return max(0.f, tab[idx] * (1.f - frac) + tab[idx + 1] * frac);
 }
 
 inline float gpu_P(float e, device const float* P_tab,
                    constant GPUEosParams& ep) {
-    return max(1.e-20f, gpu_eos_interp(P_tab, e, ep));
+    return max(1.e-20f, gpu_log_interp(e, P_tab, ep));
 }
 
 inline float gpu_dPde(float e, device const float* dPde_tab,
                       constant GPUEosParams& ep) {
-    return gpu_eos_interp(dPde_tab, e, ep);
+    return gpu_log_interp(e, dPde_tab, ep);
 }
 
 // Speed of sound squared, clamped to physical range [0.01, 1/3].
@@ -1466,20 +1472,6 @@ kernel void gpu_make_du(
 //  16  eos_s        [GPU_EOS_N]
 //  17  params
 //  18  eos_p
-
-// Helper: log-spaced table lookup, used for both entropy s(e) ~ e^(3/4)
-// and temperature T(e) ~ e^(1/4).  Linear interpolation in log(e) gives
-// ~1e-6 relative error across the full physical range.
-inline float gpu_log_interp(float e, device const float* tab,
-                            constant GPUEosParams& ep) {
-    if (e <= 0.f) return 0.f;
-    float le = log(e);
-    le = clamp(le, ep.log_e_min, ep.log_e_max);
-    float fe   = (le - ep.log_e_min) / ep.log_delta_e;
-    int   idx  = clamp((int)fe, 0, ep.n_pts - 2);
-    float frac = fe - (float)idx;
-    return max(0.f, tab[idx] * (1.f - frac) + tab[idx + 1] * frac);
-}
 
 inline float gpu_s(float e, device const float* s_tab,
                    constant GPUEosParams& ep) {

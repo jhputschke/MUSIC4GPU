@@ -356,6 +356,18 @@ build the same two dirs there, run the same scripts.
   latent uninitialized-`flag_muB` bug in `EOS_BEST`/`EOS_UH` that blocks
   it. CUDA needs no separate change.
 
+- **GPU EOS table now log-sampled for `P`/`dP/de` (2026-05-27).** Enabling
+  EOS 91 exposed that `P(e)`/`dP/de(e)` were linear-sampled (exact only
+  for the conformal ideal gas), starving the dilute regime for hotQCD/WB/
+  s95p — see PORT_GPU.md §4.4. The fix samples all four tables on the
+  shared log-e grid and routes `gpu_P`/`gpu_dPde` through `gpu_log_interp`
+  (linear `gpu_eos_interp` removed). The CUDA kernel
+  ([src/gpu/music_kernels.cu](src/gpu/music_kernels.cu)) got the
+  structural mirror of the Metal change, but **was not built or run on
+  CUDA hardware in-session** — verify on a discrete GPU before relying on
+  it. The host sampling change ([src/advance.cpp](src/advance.cpp)) is
+  shared, so an un-mirrored CUDA kernel would mis-index the table.
+
 ## 8. Post-port CPU-side optimizations & final decomposition
 
 After the port was correct, two targeted optimizations chipped at the

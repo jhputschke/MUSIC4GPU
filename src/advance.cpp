@@ -43,34 +43,30 @@ void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
         return;
     }
 
-    // Sample P(e) and dP/de(e) at rhob=0 on a uniform grid for the GPU EOS.
-    // This covers the standard zero-net-baryon case.
+    // Sample P, dP/de, s and T at rhob=0 onto ONE log-spaced e grid for the
+    // GPU EOS (standard zero-net-baryon case).  All four are non-linear in e
+    // for any realistic EOS (hotQCD/WB/s95p): P(e) curves through the QCD
+    // crossover just as s~e^(3/4) and T~e^(1/4) do.  Hydro cells live at
+    // e ~ 0.1 /fm^4 while eps_max ~ 1e4 /fm^4, so a LINEAR grid would put the
+    // entire evolution inside its first interval — exact only for the
+    // conformal ideal gas (P=e/3).  Log spacing keeps resolution in the
+    // dilute regime.  The floor/grid must match GPUGrid::upload_eos's log_*.
     {
         const int    N_EOS   = GPU_EOS_N;
         double       eps_max = eos.get_eps_max();
         if (eps_max <= 0.0) eps_max = 1.0e4;
-        const double de = eps_max / static_cast<double>(N_EOS - 1);
         std::vector<float> P_data(N_EOS), dPde_data(N_EOS);
         std::vector<float> s_data(N_EOS), T_data(N_EOS);
-        // P, dPde sampled linearly in e (typically near-linear in e so
-        // linear interpolation is essentially exact for the ideal-gas EOS).
-        for (int i = 0; i < N_EOS; i++) {
-            const double e = i * de;
-            P_data[i]    = static_cast<float>(eos.get_pressure(e, 0.0));
-            dPde_data[i] = static_cast<float>(eos.get_dpde(e, 0.0));
-        }
-        // Entropy s(e) ~ e^(3/4) and temperature T(e) ~ e^(1/4) are strongly
-        // non-linear in e, so they're sampled at LOG-spaced e to keep
-        // resolution in the dilute regime where most hydro cells live.
-        // Both share the same log grid (driven by GPUEosParams::log_*).
-        constexpr double s_log_e_floor = 1.0e-6;  // 1/fm^4
-        const double log_e_min = std::log(s_log_e_floor);
-        const double log_e_max = std::log(std::max(eps_max, s_log_e_floor*1.01));
+        constexpr double log_e_floor = 1.0e-6;  // 1/fm^4
+        const double log_e_min = std::log(log_e_floor);
+        const double log_e_max = std::log(std::max(eps_max, log_e_floor*1.01));
         const double dle = (log_e_max - log_e_min) / static_cast<double>(N_EOS - 1);
         for (int i = 0; i < N_EOS; i++) {
             const double e = std::exp(log_e_min + i * dle);
-            s_data[i] = static_cast<float>(eos.get_entropy    (e, 0.0));
-            T_data[i] = static_cast<float>(eos.get_temperature(e, 0.0));
+            P_data[i]    = static_cast<float>(eos.get_pressure   (e, 0.0));
+            dPde_data[i] = static_cast<float>(eos.get_dpde       (e, 0.0));
+            s_data[i]    = static_cast<float>(eos.get_entropy    (e, 0.0));
+            T_data[i]    = static_cast<float>(eos.get_temperature(e, 0.0));
         }
         if (!gpu_grid_.upload_eos(P_data.data(), dPde_data.data(),
                                   s_data.data(), T_data.data(),
