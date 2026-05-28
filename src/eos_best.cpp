@@ -15,6 +15,7 @@ EOS_BEST::EOS_BEST() {
     set_EOS_id(17);
     set_number_of_tables(0);
     set_eps_max(1e5);
+    set_flag_muB(true);  // finite-muB lattice EOS — not valid on the rhob=0 GPU path
 }
 
 

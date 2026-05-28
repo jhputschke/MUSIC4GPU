@@ -33,6 +33,7 @@ class EOS {
     double get_T2e        (double T_in_GeV, double rhob) const {return(eos_ptr->get_T2e(T_in_GeV, rhob));}
 
     double get_eps_max() const {return(eos_ptr->get_eps_max());}
+    bool   get_flag_muB() const {return(eos_ptr->get_flag_muB());}
     void   check_eos()   const {return(eos_ptr->check_eos());}
 };
 

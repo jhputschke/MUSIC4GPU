@@ -13,7 +13,8 @@ class EOS_base {
     int whichEOS;
     int number_of_tables;
     double eps_max;
-    bool flag_muB;
+    bool flag_muB = true;  // fail-safe: treat as finite-muB until a subclass
+                           // explicitly clears it via set_flag_muB(false).
     bool flag_muS;
     bool flag_muC;
 
