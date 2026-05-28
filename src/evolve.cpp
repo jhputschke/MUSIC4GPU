@@ -775,6 +775,39 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
             int Idx111 = arena_current.getFieldIdx(ix+fac_x, iy+fac_y, ieta+fac_eta);
             int Idx011 = arena_current.getFieldIdx(ix, iy+fac_y, ieta+fac_eta);
 
+            // Skip cells with a non-finite energy density at any corner.  A NaN
+            // (e.g. from an fp32 GPU reconstruction that blew up at the dilute
+            // edge) would slip through the intersection test below — every
+            // comparison against NaN is false, so intersect stays 1 — and then
+            // make Cornelius::EndsOfEdge see an odd cut count and call exit(1).
+            if (   !std::isfinite(arena_current.e_[Idx000])
+                || !std::isfinite(arena_current.e_[Idx100])
+                || !std::isfinite(arena_current.e_[Idx010])
+                || !std::isfinite(arena_current.e_[Idx110])
+                || !std::isfinite(arena_current.e_[Idx001])
+                || !std::isfinite(arena_current.e_[Idx101])
+                || !std::isfinite(arena_current.e_[Idx011])
+                || !std::isfinite(arena_current.e_[Idx111])
+                || !std::isfinite(arena_freezeout.e_[Idx000])
+                || !std::isfinite(arena_freezeout.e_[Idx100])
+                || !std::isfinite(arena_freezeout.e_[Idx010])
+                || !std::isfinite(arena_freezeout.e_[Idx110])
+                || !std::isfinite(arena_freezeout.e_[Idx001])
+                || !std::isfinite(arena_freezeout.e_[Idx101])
+                || !std::isfinite(arena_freezeout.e_[Idx011])
+                || !std::isfinite(arena_freezeout.e_[Idx111])) {
+                static bool warned_nonfinite = false;
+                if (!warned_nonfinite) {
+                    music_message << "[freeze-out] skipping cell with non-finite "
+                                     "energy density (likely fp32 GPU instability "
+                                     "at the dilute edge); compare with "
+                                     "MUSIC_FORCE_CPU=1.";
+                    music_message.flush("warning");
+                    warned_nonfinite = true;
+                }
+                continue;
+            }
+
             // judge intersection (from Bjoern)
             int intersect = 1;
             if ((   arena_current.e_[Idx111] - epsFO)
@@ -1513,6 +1546,29 @@ int Evolve::FindFreezeOutSurface_boostinvariant_Cornelius(
                 int Idx10 = arena_current.getFieldIdx(ix+fac_x, iy, 0);
                 int Idx11 = arena_current.getFieldIdx(ix+fac_x, iy+fac_y, 0);
                 int Idx01 = arena_current.getFieldIdx(ix, iy+fac_y, 0);
+
+                // Skip cells with a non-finite energy density at any corner; a
+                // NaN slips through the intersection test (NaN comparisons are
+                // false) and aborts Cornelius::EndsOfEdge via exit(1).
+                if (   !std::isfinite(arena_current.e_[Idx00])
+                    || !std::isfinite(arena_current.e_[Idx10])
+                    || !std::isfinite(arena_current.e_[Idx01])
+                    || !std::isfinite(arena_current.e_[Idx11])
+                    || !std::isfinite(arena_freezeout.e_[Idx00])
+                    || !std::isfinite(arena_freezeout.e_[Idx10])
+                    || !std::isfinite(arena_freezeout.e_[Idx01])
+                    || !std::isfinite(arena_freezeout.e_[Idx11])) {
+                    static bool warned_nonfinite_bi = false;
+                    if (!warned_nonfinite_bi) {
+                        music_message << "[freeze-out] skipping cell with "
+                                         "non-finite energy density (likely fp32 "
+                                         "GPU instability at the dilute edge); "
+                                         "compare with MUSIC_FORCE_CPU=1.";
+                        music_message.flush("warning");
+                        warned_nonfinite_bi = true;
+                    }
+                    continue;
+                }
 
                 // judge intersection (from Bjoern)
                 intersect=1;

@@ -512,7 +512,11 @@ inline float gpu_solve_v(float v_guess, float T00, float M, float J0,
 
     if (abs(fv_l) < ABS_ERR) return v_l;
     if (abs(fv_h) < ABS_ERR) return v_h;
-    if (fv_l * fv_h > 0.f) return 0.f;
+    // No sign change in [0,1]: no root to bracket.  Return a negative sentinel
+    // so the caller can revert to the previous cell (matches CPU
+    // solve_v_Hybrid returning status 0 -> revert_grid).  A real velocity is
+    // always in [0,1], so <0 is unambiguous.
+    if (fv_l * fv_h > 0.f) return -1.f;
 
     float dv_prev = v_h - v_l;
     float dv_curr = dv_prev;
@@ -625,6 +629,18 @@ ReconstResult gpu_reconst(float tau, float tauq[5],
     float T00 = q[0];
     float J0  = q[4];
 
+    // Non-finite input (NaN/Inf propagated from an upstream blow-up, e.g. the
+    // viscous W^{mu nu} update at the dilute edge): revert to the previous cell
+    // rather than writing NaN downstream, where it would reach the freeze-out
+    // finder and abort Cornelius.  Every comparison below is false for NaN, so
+    // without this guard a NaN T00 sails through to res.e.
+    if (!isfinite(T00) || !isfinite(M)) {
+        res.e    = prev_eps;
+        res.u[0] = prev_u[0];  res.u[1] = prev_u[1];
+        res.u[2] = prev_u[2];  res.u[3] = prev_u[3];
+        return res;
+    }
+
     // Low energy: regulate (return small e, u=rest frame)
     if (T00 < ABS_ERR) {
         res.e = ABS_ERR;
@@ -643,18 +659,37 @@ ReconstResult gpu_reconst(float tau, float tauq[5],
     float v_guess = sqrt(max(0.f, 1.f - 1.f / (prev_u[0] * prev_u[0] + ABS_ERR)));
     float v_sol   = gpu_solve_v(v_guess, T00, M, J0, P_tab, dPde_tab, ep);
 
+    // Solver could not bracket a root (sentinel < 0): revert to the previous
+    // cell instead of fabricating e = T00 from v = 0 (matches CPU revert_grid).
+    if (v_sol < 0.f) {
+        res.e    = prev_eps;
+        res.u[0] = prev_u[0];  res.u[1] = prev_u[1];
+        res.u[2] = prev_u[2];  res.u[3] = prev_u[3];
+        return res;
+    }
+
     float u0      = 1.f / (sqrt(max(0.f, 1.f - v_sol * v_sol)) + v_sol * ABS_ERR);
     float epsilon = T00 - v_sol * M;
     float rhob    = J0 / u0;
 
-    // High-velocity branch (v > 0.563624)
-    if (v_sol > 0.563624f) {
+    // High-velocity branch (v > v_critical).  The epsilon > 1e-6 guard matches
+    // CPU ReconstIt_velocity_Newton — the u0 solve is meaningless at ~zero e.
+    if (v_sol > 0.563624f && epsilon > 1e-6f) {
         float u0_sol = gpu_solve_u0(u0, T00, K00, M, J0, P_tab, dPde_tab, ep);
         if (u0_sol >= 1.f) {
             u0      = u0_sol;
             epsilon = T00 - sqrt(max(0.f, (1.f - 1.f / (u0 * u0)) * K00));
             rhob    = J0 / u0;
         }
+    }
+
+    // Runaway reconstruction: u0 jumped >100x vs the previous step.  The CPU
+    // path discards this via revert_grid (check_u0_var).  prev_u[0] >= 1.
+    if (abs(u0 - prev_u[0]) / prev_u[0] > 100.f) {
+        res.e    = prev_eps;
+        res.u[0] = prev_u[0];  res.u[1] = prev_u[1];
+        res.u[2] = prev_u[2];  res.u[3] = prev_u[3];
+        return res;
     }
 
     res.e    = epsilon;
@@ -674,6 +709,14 @@ ReconstResult gpu_reconst(float tau, float tauq[5],
         res.u[1] *= scale;
         res.u[2] *= scale;
         res.u[3] *= scale;
+    }
+
+    // Catch-all: if the solver still produced a non-finite e (e.g. a 0/0 Newton
+    // step), revert rather than poison e_future and crash the freeze-out.
+    if (!isfinite(res.e)) {
+        res.e    = prev_eps;
+        res.u[0] = prev_u[0];  res.u[1] = prev_u[1];
+        res.u[2] = prev_u[2];  res.u[3] = prev_u[3];
     }
     return res;
 }
