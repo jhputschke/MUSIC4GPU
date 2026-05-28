@@ -88,7 +88,8 @@ existing CPU code path (per-cell), so results stay correct — just slower.
 |------------|----------------------|----------------------------|
 | Baryon diffusion qᵘ | `turn_on_diff == 1` (disables `gpu_make_du`/`w_full`) | port `Make_uqRHS`/`Make_uqSource`; the diffusion components (idx 10–13) are currently zeroed on the GPU |
 | Vorticity terms | `include_vorticity_terms == 1` | port the kinetic-vorticity tensor (`dUoverTsup`/`dUTsup`) into `gpu_make_du` |
-| Finite net-baryon EOS / μ_B-dependent shear | `muB_dependent_shear_to_s != 0` | the GPU EOS tables are sampled at **rhob = 0**; needs a 2-D P(e, ρ_B) table + μ_B(e, ρ_B) and the diffusion sector |
+| Finite-μ_B EOS (EOSQ 1, neos 10–15, BEST 17, UH 19) | `eos.get_flag_muB() == true` | GPU EOS tables are sampled at **rhob = 0**; `init_metal_if_needed` sets `gpu_ready_ = false` so the whole evolution uses the CPU. Needs a 2-D P(e, ρ_B) table + μ_B(e, ρ_B) and the diffusion sector |
+| μ_B-dependent shear multiplier | `muB_dependent_shear_to_s != 0` | intrinsically tied to the finite-μ_B EOS work above |
 | η/s modes outside {0,1,2,3,11} | `T_dependent_shear_to_s` other | add the profile to `gpu_eta_over_s` |
 
 All temperature-dependent η/s **and** ζ/s profiles are now ported (ζ/s mode 7,
@@ -96,6 +97,15 @@ bigbroadP, was the last gap — added on the CUDA side beyond the Metal baseline
 validated CPU-vs-GPU at 4.9e-5). The only remaining transport gap is the
 **μ_B-dependent** shear multiplier, which is intrinsically tied to the finite-μ_B
 EOS work above.
+
+**GPU EOS tables (zero-μ_B).** All μ_B = 0 EOS run on the GPU: ideal gas (0),
+s95p (2–7), WB (8) and hotQCD (9/91). P, dP/de, s and T are pre-sampled at
+rhob = 0 onto an 8192-point **log-spaced** e grid. Log spacing (not the earlier
+linear grid) is what makes the non-conformal lattice EOS accurate: hydro cells
+live at e ~ 0.1 /fm⁴ while `eps_max ≈ 10⁴ /fm⁴`, so the old linear grid resolved
+the physical region with < 1 point and silently produced wrong P/c_s² for any
+EOS but the conformal ideal gas. See README_Metal.md "EOS handling on the GPU
+path"; verify with `tests/eos_gpu_vs_cpu.sh`.
 
 **Not GPU work at all (host, by design):** initial-condition construction
 (`init.cpp`), Cooper–Frye freeze-out / Cornelius surface finding, evolution

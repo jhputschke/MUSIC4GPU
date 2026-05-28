@@ -74,24 +74,32 @@ code falls back to the CPU path with a warning and continues normally.
 | Freeze-out / Cornelius | `src/freeze_pseudo.cpp` | Permanent CPU — irregular geometry |
 | Vorticity / baryon-diffusion source paths | `src/dissipative.cpp` / `src/u_derivative.cpp` | CPU — used only when `include_vorticity_terms == 1` or `turn_on_diff == 1` |
 
-#### EOS caveat for `gpu_make_delta_qi`
+#### EOS handling on the GPU path
 
 `MakeDeltaQI` requires equation-of-state lookups (pressure, dP/de) inside
 a Newton iteration at every half-interface of the KT flux stencil.  The GPU
-kernel carries a **pre-sampled float32 table** of P(e) and dP/de(e) evaluated
-at **rhob = 0** on a uniform 8192-point grid spanning `[0, eps_max]`.
+kernel carries **pre-sampled float32 tables** of P(e), dP/de(e), s(e) and
+T(e) evaluated at **rhob = 0** on an 8192-point **log-spaced** grid in e.
 
-This covers the standard heavy-ion case where the net baryon density is
-negligible (EOS IDs 2–17 in MUSIC, i.e. all single-variable EOS).  When the
-net baryon density is non-zero (`turn_on_rhob = 1` with a 2D EOS such as
-`neos` or `best`), the GPU path is **automatically bypassed** and the CPU
-`MakeDeltaQI` is called as a fallback — no user action required.
+**Log spacing (all four tables).**  Hydro cells live in the dilute regime
+(e ~ 0.1 /fm⁴) while `eps_max` reaches ~10⁴ /fm⁴ for lattice EOS (hotQCD
+`eps_max ≈ 9659 /fm⁴`), so a *linear* grid would collapse the entire
+evolution into its first one or two points — exact only for the conformal
+ideal gas (`P = e/3`).  Earlier versions sampled P/dP/de linearly and
+silently produced the wrong pressure and speed of sound for non-conformal
+EOS (CPU↔GPU divergence ~6 % within ~50 steps, then a blow-up).  P/dP/de
+are now log-spaced like s/T, so hotQCD (incl. EOS 91), WB and s95p
+reproduce the CPU EOS to the float32 noise floor (~1e-4).  This is a
+deterministic table-resolution effect, independent of float32.  Verify with
+`tests/eos_gpu_vs_cpu.sh`.
 
-Additionally, `dP/drhob` is assumed zero inside the GPU Newton solver
-(consistent with the rhob = 0 EOS sample), so the velocity reconstruction
-is slightly approximate even when rhob is small but non-zero.  For
-production finite-muB runs, disable the GPU ideal step by building without
-`-DUSE_METAL` or by waiting for Tier 3.
+**muB = 0 only — finite-muB EOS auto-fall back to CPU.**  Because the tables
+are sampled at rhob = 0, only zero-net-baryon EOS are valid on the GPU.
+`init_metal_if_needed` checks the EOS's `flag_muB`: muB = 0 EOS (idealgas 0,
+s95p 2–7, WB 8, hotQCD 9/91) run on the GPU, while finite-muB EOS (EOSQ 1,
+neos 10–15, BEST 17, UH 19) set `gpu_ready_ = false` and transparently use
+the CPU path — no user action required.  `dP/drhob` is assumed zero inside
+the GPU Newton solver, consistent with the rhob = 0 sample.
 
 ### Numerical accuracy
 

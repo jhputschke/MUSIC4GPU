@@ -152,7 +152,7 @@ hydro timestep runs on the GPU** (the per-cell CPU loop is skipped):
 - T-dependent η/s (modes 0, 1, 2, 3, 11) and ζ/s (modes 0, 1, 2, 3, 7, 8, 9, 10)
 - Second-order coupling terms; QuestRevert regulator
 - Hydro source terms (source evaluated on CPU, integrated on GPU)
-- Zero net-baryon density (rhob = 0 EOS); 2D boost-invariant and full 3+1D grids
+- All μ_B = 0 EOS — ideal gas (0), s95p (2–7), WB (8), hotQCD (9/91) — sampled at rhob = 0 onto **log-spaced** P/dP/de/s/T tables (log spacing is required for the non-conformal lattice EOS to be accurate); 2D boost-invariant and full 3+1D grids
 
 ### What stays on the CPU (not ported)
 
@@ -161,7 +161,7 @@ slower:
 
 - Baryon diffusion (`turn_on_diff = 1`)
 - Vorticity terms (`include_vorticity_terms = 1`)
-- Finite net-baryon EOS / μ_B-dependent shear (the GPU EOS table is sampled at rhob = 0)
+- Finite-μ_B EOS — EOSQ (1), neos (10–15), BEST (17), UH (19) — auto-detected via the EOS `flag_muB` and run on the CPU (GPU EOS tables are sampled at rhob = 0)
 - μ_B-dependent shear multiplier (`muB_dependent_shear_to_s != 0`)
 - Cooper–Frye freeze-out / Cornelius surface finding, initial-condition construction, evolution output
 
