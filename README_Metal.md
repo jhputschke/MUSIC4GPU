@@ -60,6 +60,16 @@ first call to `AdvanceIt()`.  Confirmation messages are printed to stderr:
 If Metal initialisation fails (e.g. `music_kernels.metallib` not found), the
 code falls back to the CPU path with a warning and continues normally.
 
+**Force the CPU path at runtime:** set `MUSIC_FORCE_CPU=1` to disable the GPU
+substep without rebuilding, so the same Metal-enabled binary runs pure-CPU
+(handy for CPU-vs-GPU validation or debugging).  Metal is never initialised in
+this mode.  The override is read once; any value other than empty or `0`
+enables it.
+
+```sh
+MUSIC_FORCE_CPU=1 ./MUSIChydro input_params
+```
+
 ### GPU kernel — what is ported
 
 | Kernel | Source | Status |

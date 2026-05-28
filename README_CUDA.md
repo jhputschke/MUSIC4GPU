@@ -103,6 +103,16 @@ output, and the per-step diagnostics. The per-step `eps_max`/`T_max` reduction
 in particular is the host dependency targeted by the GPU-resident-state plan
 below.
 
+**Force the CPU path at runtime:** set `MUSIC_FORCE_CPU=1` to disable the GPU
+substep in a GPU-enabled build, so the same binary runs pure-CPU without a
+rebuild (handy for CPU-vs-GPU validation or debugging). The override is read
+once and applies to both the CUDA and Metal back-ends; any value other than
+empty or `0` enables it. Example:
+
+```sh
+MUSIC_FORCE_CPU=1 ./MUSIChydro input_params
+```
+
 ---
 
 ## Phase 1 — Direct port (correctness first)

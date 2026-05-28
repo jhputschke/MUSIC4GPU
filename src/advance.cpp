@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -25,6 +26,18 @@ using Util::hbarc;
 
 // ── Metal helpers (compiled only when USE_METAL is defined) ───────────────────
 #ifdef MUSIC_USE_GPU
+
+// Runtime override: MUSIC_FORCE_CPU=1 disables the GPU path in a GPU-enabled
+// build so a single binary can run pure-CPU for validation/debugging.  Treated
+// as set unless the value is empty or "0".  Cached on first read.
+static bool gpu_force_cpu() {
+    static const bool forced = []{
+        const char* e = getenv("MUSIC_FORCE_CPU");
+        return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return forced;
+}
+
 void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
@@ -319,6 +332,17 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     // host arenas as stale so the next sync call actually copies.
     host_curr_fresh_ = false;
     host_prev_fresh_ = false;
+
+    if (gpu_force_cpu()) {
+        static bool force_cpu_logged = false;
+        if (!force_cpu_logged) {
+            music_message << "[MUSIC-GPU] MUSIC_FORCE_CPU set — GPU path "
+                             "disabled, running on CPU.";
+            music_message.flush("info");
+            force_cpu_logged = true;
+        }
+        return false;
+    }
 
     if (!gpu_features_supported()) {
         if (!feature_warning_logged) {
