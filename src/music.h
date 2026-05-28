@@ -120,10 +120,10 @@ class MUSIC {
     }
     void clear_hydro_info_from_memory();
 
-    int get_number_of_surface_cells() const {
+    long get_number_of_surface_cells() const {
         return(evolve_ptr_->get_number_of_surface_cells());
     }
-    void get_surface_cell_with_index(const int idx, SurfaceCell &cell_i) {
+    void get_surface_cell_with_index(const long idx, SurfaceCell &cell_i) {
         evolve_ptr_->get_surface_cell_with_index(idx, cell_i);
     }
     void clear_surface_cell_vector() {evolve_ptr_->clearSurfaceCellVector();}
