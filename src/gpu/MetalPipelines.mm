@@ -5,13 +5,31 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <dlfcn.h>
 #include "MetalPipelines.h"
 #include "GPUGrid.h"
 #include "gpu_types.h"
 
 // Shared Metal device – declared here, extern'd in GPUGrid.mm
 id<MTLDevice> g_metal_device = nil;
+
+// Directory containing libmusic.dylib (this TU is compiled into it), resolved at
+// runtime via dladdr.  Lets the metallib be located relative to the shared
+// library rather than the executable, so it works for any binary that links
+// libmusic (MUSICTest, runJetscape, standalone MUSIChydro, ...).
+static std::string music_library_dir() {
+    Dl_info info;
+    if (dladdr(reinterpret_cast<const void*>(&music_library_dir), &info) &&
+        info.dli_fname) {
+        std::string p(info.dli_fname);
+        const size_t slash = p.find_last_of('/');
+        if (slash != std::string::npos) return p.substr(0, slash);
+    }
+    return std::string();
+}
 
 // ── singleton ─────────────────────────────────────────────────────────────────
 
@@ -55,30 +73,47 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     if (!q) { fprintf(stderr, "[MUSIC-GPU] Failed to create command queue.\n"); return false; }
     cmd_queue_ = (__bridge_retained void*)q;
 
-    // 3. Load shader library
+    // 3. Load shader library.  Resolution order:
+    //   (1) explicit path argument, (2) $MUSIC_METALLIB, (3) next to
+    //   libmusic.dylib (via dladdr), (4) the main executable's bundle directory.
     id<MTLLibrary> lib = nil;
     NSError* err = nil;
 
-    if (metallib_path && metallib_path[0] != '\0') {
-        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib_path]];
-        lib = [dev newLibraryWithURL:url error:&err];
+    auto try_path = [&](NSString* path) {
+        if (lib || path == nil || [path length] == 0) return;
+        NSError* e = nil;
+        id<MTLLibrary> l =
+            [dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&e];
+        if (l) {
+            lib = l;
+            fprintf(stderr, "[MUSIC-GPU] Loaded kernels from %s\n",
+                    [path UTF8String]);
+        } else {
+            err = e;
+        }
+    };
+
+    if (metallib_path && metallib_path[0] != '\0')
+        try_path([NSString stringWithUTF8String:metallib_path]);
+
+    if (const char* env = getenv("MUSIC_METALLIB"))
+        try_path([NSString stringWithUTF8String:env]);
+
+    {
+        const std::string dir = music_library_dir();
+        if (!dir.empty())
+            try_path([NSString stringWithUTF8String:
+                          (dir + "/music_kernels.metallib").c_str()]);
     }
 
-    if (!lib) {
-        // Fall back: look for music_kernels.metallib next to the executable
-        NSBundle* bundle = [NSBundle mainBundle];
-        NSString* path = [bundle pathForResource:@"music_kernels" ofType:@"metallib"];
-        if (path) {
-            NSURL* url = [NSURL fileURLWithPath:path];
-            lib = [dev newLibraryWithURL:url error:&err];
-        }
-    }
+    try_path([[NSBundle mainBundle] pathForResource:@"music_kernels"
+                                             ofType:@"metallib"]);
 
     if (!lib) {
         fprintf(stderr, "[MUSIC-GPU] Could not load music_kernels.metallib: %s\n",
-                err ? [[err localizedDescription] UTF8String] : "unknown error");
-        fprintf(stderr, "[MUSIC-GPU] Run: xcrun -sdk macosx metal music_kernels.metal"
-                        " -o music_kernels.metallib\n");
+                err ? [[err localizedDescription] UTF8String] : "not found");
+        fprintf(stderr, "[MUSIC-GPU] Place it next to libmusic.dylib, or set "
+                        "MUSIC_METALLIB=/path/to/music_kernels.metallib\n");
         return false;
     }
     library_ = (__bridge_retained void*)lib;

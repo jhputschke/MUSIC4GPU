@@ -74,15 +74,11 @@ if (USE_METAL)
     )
     add_custom_target(metal_kernels ALL DEPENDS ${METAL_LIB})
 
-    # Copy metallib next to the final executable/library so it can be found
-    # at runtime via [NSBundle mainBundle].
-    add_custom_command(
-        TARGET metal_kernels POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${METAL_LIB}
-            ${CMAKE_HOME_DIRECTORY}/music_kernels.metallib
-        COMMENT "Copying music_kernels.metallib to install prefix"
-    )
+    # The metallib is generated in ${CMAKE_CURRENT_BINARY_DIR}, i.e. right next to
+    # the freshly built libmusic.dylib, so the dladdr-based loader in
+    # MetalPipelines.mm finds it directly in the build tree (no copy needed).
+    # For `make install`, place it alongside the installed library.
+    install(FILES ${METAL_LIB} DESTINATION ${CMAKE_HOME_DIRECTORY})
 endif()
 
 # ── CUDA GPU sources (NVIDIA) ────────────────────────────────────────────────
