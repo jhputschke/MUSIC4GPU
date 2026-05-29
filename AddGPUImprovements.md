@@ -167,6 +167,41 @@ Target files: `gpu/GPUGrid_cuda.cu` + `gpu/music_kernels.cu(.cuh)`
 - This is the proper "Phase C for evolution output," analogous to the deferred
   Phase C in `README_CUDA.md:574`.
 
+### As built (CUDA) and measured (2026-05-29)
+
+- Kernel `gpu_pack_evolution_ideal` (`gpu/music_kernels.cu`) packs
+  `eta, sd, ed, pressure, temperature, ux, uy, ueta` (fluidCell_ideal layout,
+  e/p/T scaled by hbarc) for the down-sampled grid, reusing the resident EOS
+  tables via `gpu_log_interp`. Launched by `CUDAPipelines::pack_evolution_ideal`
+  and consumed by `Advance::pack_evolution_ideal`, wired into both output sites
+  in `evolve.cpp` (used only when `store_hydro_info_in_memory==1 &&
+  outputEvolutionData==0 && gpu_owns_state()`; host path is the fallback).
+- **The pack scratch buffer lives on `CUDAPipelines` (the singleton), NOT on
+  `GPUGrid`.** ⚠️ Adding a member to `GPUGrid` (which is embedded in
+  `Advance`→`Evolve`) changes `Evolve`'s object layout and **triggers a
+  pre-existing latent heap out-of-bounds write** that stomps
+  `Evolve::surfaceCellVec_` (garbage surface count ~3.6e16 → segfault in
+  `PassHydroSurfaceToFramework`). Baseline d64e102 is clean; any `GPUGrid` size
+  change reproduces the crash. Keeping the buffer off `GPUGrid` leaves the layout
+  byte-identical so the latent bug stays dormant. **The latent OOB is a separate,
+  real bug to fix (tracked separately).**
+- **Correctness (`OO_one_event`, EOS 91, RTX 3090):** surface cells = 97477
+  (identical to baseline — layout safe); `ux/uy/ueta` bit-exact, `ed` rel err
+  1e-7; in the physical region (T>0.1 GeV) `p/s/T` agree with the host EOS to
+  **≤ ~1e-4** (8.5e-5 pressure, 3.6e-5 T, 2.1e-5 s) — resampling-level. Large
+  all-cell errors (sd~40, p~100) are confined to sub-floor vacuum cells
+  (negligible absolute values, no sampled particles).
+- **Performance:** on **discrete RTX 3090 with no spatial down-sampling**
+  (`every_N_x/y/eta = 1`, so `n_out == Ncells`), the pack is **13.7 ms/call**
+  (`advance.output_pack_gpu`, 2.24 s over 163 frames) vs the Phase-1 host loop's
+  2.63 s (16T) — roughly **break-even** on total wall (31 s vs 30 s), though the
+  output-frame full-arena syncs are eliminated (`sync_arena` calls 328 → 165).
+  The pack's cost here is the **19 MB managed-buffer host read fault-migrating
+  over PCIe**; an explicit device-buffer + pinned-staging `cudaMemcpyAsync` (like
+  the snapshot path) would cut that — a follow-up. The real wins land on **GB10
+  coherent memory** (the managed buffer is zero-copy → no D2H, pack ≈ kernel
+  time) and **with spatial down-sampling** (`n_out ≪ Ncells` → tiny transfer).
+
 ---
 
 ## Verification

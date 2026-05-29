@@ -76,6 +76,10 @@ public:
     // epsilon/rhob on the host after wait() has ensured the last kernel is done.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // Phase 2b: GPU evolution-output packing is not yet ported to Metal.
+    // Return false so the caller falls back to the host memory-output path.
+    bool pack_evolution_ideal(GPUGrid&, const GPUPackParams&, float*) { return false; }
+
     // Block until all pending GPU work is done.
     void wait();
 

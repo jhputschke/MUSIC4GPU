@@ -124,6 +124,28 @@ struct GPUEosParams {
     float log_delta_e;   // (log_e_max - log_e_min) / (n_pts - 1)
 };
 
+// Parameters for gpu_pack_evolution_ideal: pack the ideal-hydro output fields
+// (eta, s, e, p, T, ux, uy, ueta) for the down-sampled evolution grid into a
+// compact AoS buffer laid out exactly like host fluidCell_ideal (8 floats per
+// cell, in that field order).  e/p/T are scaled by hbarc to match the host
+// memory-output path; entropy is stored unscaled.
+struct GPUPackParams {
+    int   Nx;
+    int   Ny;
+    int   Neta;
+    int   Ncells;          // Nx * Ny * Neta (device snapshot stride)
+    int   skip_x;          // output_evolution_every_N_x
+    int   skip_y;          // output_evolution_every_N_y
+    int   skip_eta;        // output_evolution_every_N_eta
+    int   nx_out;          // (Nx-1)/skip_x + 1   (down-sampled dims)
+    int   ny_out;
+    int   neta_out;
+    int   boost_invariant; // 1 -> eta forced to 0
+    float delta_eta;
+    float eta_size;
+    float hbarc;           // Util::hbarc (GeV*fm), applied to e/p/T
+};
+
 // Wmunu 2D->1D index table (same as Util::map_2d_idx_to_1d)
 // Use as: WMUNU_IDX[alpha][direction]  for alpha in [0,4], direction in [0,3]
 #ifdef __METAL_VERSION__

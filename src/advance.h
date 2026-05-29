@@ -175,6 +175,14 @@ class Advance {
                                       Fields &arenaFieldsCurr);
     void sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr);
 
+    // Phase 2b: pack the ideal-hydro evolution output for the current step
+    // directly on the GPU (EOS lookups + down-sampling on device) into `out`,
+    // laid out exactly as host fluidCell_ideal.  Avoids the full-arena D2H and
+    // the serial host EOS loop for the memory-output path.  Returns false when
+    // the GPU is not holding current state or the back-end has no packing
+    // kernel (Metal); the caller must then use the host output path.
+    bool pack_evolution_ideal(std::vector<fluidCell_ideal> &out);
+
    private:
     // Set when host arena matches the corresponding GPU snapshot — i.e. a
     // previous sync this iteration already brought it over.  Cleared at

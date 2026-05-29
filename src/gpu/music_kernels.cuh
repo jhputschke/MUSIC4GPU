@@ -115,3 +115,17 @@ __global__ void gpu_reduce_max_eps_rhob(
     int Ncells,
     float* out_eps,
     float* out_rhob);
+
+// Pack ideal-hydro output for the down-sampled evolution grid (Phase 2b).
+// One thread per output cell; reads snap_curr (epsilon, u) and the device EOS
+// tables, writes 8 floats per cell into `out` in fluidCell_ideal field order
+// (eta, sd, ed, pressure, temperature, ux, uy, ueta).  e/p/T are hbarc-scaled.
+__global__ void gpu_pack_evolution_ideal(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ u,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_s,
+    const float* __restrict__ eos_T,
+    float* __restrict__ out,
+    GPUEosParams eos_p,
+    GPUPackParams pp);

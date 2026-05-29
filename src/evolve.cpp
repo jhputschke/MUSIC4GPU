@@ -134,9 +134,15 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 
         if (it % Nskip_timestep == 0) {
 #ifdef MUSIC_USE_GPU
-            // Output writers read the full arena.  Sync from GPU if needed.
+            // Memory-ideal output is packed directly on the GPU (no full-arena
+            // D2H).  Sync the host arena only for consumers that read it: the
+            // file evolution writers, or the memory path when GPU packing is
+            // unavailable (CPU holds the current state).
+            const bool gpu_pack_mem = (DATA.store_hydro_info_in_memory == 1
+                                       && DATA.outputEvolutionData == 0
+                                       && advance.gpu_owns_state());
             if (DATA.outputEvolutionData > 0
-                    || DATA.store_hydro_info_in_memory == 1) {
+                    || (DATA.store_hydro_info_in_memory == 1 && !gpu_pack_mem)) {
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
             }
 #endif
@@ -151,6 +157,22 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                                             *fpCurr, *fpPrev, tau);
             }
             if (DATA.store_hydro_info_in_memory == 1) {
+#ifdef MUSIC_USE_GPU
+                bool mem_done = false;
+                if (gpu_pack_mem) {
+                    std::vector<fluidCell_ideal> packed_frame;
+                    if (advance.pack_evolution_ideal(packed_frame)) {
+                        hydro_info_ptr.dump_ideal_info_frame_to_memory(
+                                tau, packed_frame);
+                        mem_done = true;
+                    } else {
+                        // gpu_owns_state implies the pack succeeds; sync
+                        // defensively so the CPU fallback reads fresh state.
+                        advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                    }
+                }
+                if (!mem_done)
+#endif
                 grid_info.OutputEvolutionDataXYEta_memory(*fpCurr, tau,
                                                           hydro_info_ptr);
             }
@@ -481,8 +503,13 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 
         if (tauIdx % Nskip_timestep == 0) {
 #ifdef MUSIC_USE_GPU
+            // See EvolveIt: pack memory-ideal output on the GPU; only sync the
+            // host arena for file writers or the host fallback.
+            const bool gpu_pack_mem = (DATA.store_hydro_info_in_memory == 1
+                                       && DATA.outputEvolutionData == 0
+                                       && advance.gpu_owns_state());
             if (DATA.outputEvolutionData > 0
-                    || DATA.store_hydro_info_in_memory == 1) {
+                    || (DATA.store_hydro_info_in_memory == 1 && !gpu_pack_mem)) {
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
             }
 #endif
@@ -497,6 +524,22 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                                             *fpCurr, *fpPrev, tau);
             }
             if (DATA.store_hydro_info_in_memory == 1) {
+#ifdef MUSIC_USE_GPU
+                bool mem_done = false;
+                if (gpu_pack_mem) {
+                    std::vector<fluidCell_ideal> packed_frame;
+                    if (advance.pack_evolution_ideal(packed_frame)) {
+                        hydro_info_ptr.dump_ideal_info_frame_to_memory(
+                                tau, packed_frame);
+                        mem_done = true;
+                    } else {
+                        // gpu_owns_state implies the pack succeeds; sync
+                        // defensively so the CPU fallback reads fresh state.
+                        advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                    }
+                }
+                if (!mem_done)
+#endif
                 grid_info.OutputEvolutionDataXYEta_memory(*fpCurr, tau,
                                                           hydro_info_ptr);
             }

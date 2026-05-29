@@ -525,6 +525,43 @@ void Advance::sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr) {
     gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, arenaFieldsCurr);
     host_curr_fresh_ = true;
 }
+
+bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
+    if (!gpu_owns_state_ || !gpu_ready_) return false;
+    bench::Timer _bt("advance.output_pack_gpu");
+
+    GPUPackParams pp;
+    pp.Nx     = gpu_grid_.Nx();
+    pp.Ny     = gpu_grid_.Ny();
+    pp.Neta   = gpu_grid_.Neta();
+    pp.Ncells = gpu_grid_.Ncells();
+    int sx = DATA.output_evolution_every_N_x;   if (sx < 1) sx = 1;
+    int sy = DATA.output_evolution_every_N_y;   if (sy < 1) sy = 1;
+    int se = DATA.output_evolution_every_N_eta; if (se < 1) se = 1;
+    pp.skip_x   = sx;
+    pp.skip_y   = sy;
+    pp.skip_eta = se;
+    pp.nx_out   = (pp.Nx   - 1) / sx + 1;
+    pp.ny_out   = (pp.Ny   - 1) / sy + 1;
+    pp.neta_out = (pp.Neta - 1) / se + 1;
+    pp.boost_invariant = DATA.boost_invariant ? 1 : 0;
+    pp.delta_eta = static_cast<float>(DATA.delta_eta);
+    pp.eta_size  = static_cast<float>(DATA.eta_size);
+    pp.hbarc     = static_cast<float>(hbarc);
+
+    // The pipeline writes the packed records straight into `out` (which is laid
+    // out as contiguous fluidCell_ideal == 8 floats per cell), so there is no
+    // per-cell host EOS work.
+    static_assert(sizeof(fluidCell_ideal) == 8 * sizeof(float),
+                  "fluidCell_ideal must be 8 contiguous floats for the pack copy");
+    const size_t n_out =
+        static_cast<size_t>(pp.nx_out) * pp.ny_out * pp.neta_out;
+    out.resize(n_out);
+    if (!GPUPipelines::instance().pack_evolution_ideal(
+            gpu_grid_, pp, reinterpret_cast<float*>(out.data())))
+        return false;
+    return true;
+}
 #endif  // MUSIC_USE_GPU
 
 Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
