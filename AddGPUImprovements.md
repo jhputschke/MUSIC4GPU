@@ -204,6 +204,42 @@ Target files: `gpu/GPUGrid_cuda.cu` + `gpu/music_kernels.cu(.cuh)`
 
 ---
 
+## Phase 3 — make the GPU pack pay off on discrete GPUs (output-path follow-up)
+
+**Motivation (measured 2026-05-29, discrete RTX 3090, full resolution — see
+`PORT_GPU_CUDA.md` §10 for the full table).** Phase 2b *as built* is **net
+neutral-to-slightly-negative at `OMP_NUM_THREADS=16`**: the `EvolveIt` hydro wall is
+**12.8 s with the pack vs 11.3 s with the Phase-1 host loop** (~13% worse). The pack
+*kernel* is cheap (13.9 ms/frame), but `evo_pack_out` is a `cudaMallocManaged`
+buffer and the `std::memcpy(host_out, evo_pack_out, …)` readback fault-migrates
+~19 MB/frame over PCIe. At full resolution (`n_out == Ncells`) that transfer costs
+more than the host EOS loop it replaces, so on a discrete card with many host
+threads the pack should not be the default. (The pack still wins at low thread
+counts — 1T: 19.8 s vs 24.5 s — and, by design, on coherent memory / with
+down-sampling.)
+
+### Phase 3a — explicit device buffer + pinned-staging readback
+Mirror the snapshot discrete path: make `evo_pack_out` a `cudaMalloc` **device**
+buffer with a paired pinned host staging buffer, and copy it back with an explicit
+`cudaMemcpyAsync(D2H)` on the compute stream (overlapping the next step's compute,
+like `CUDAPipelines::upload_snapshots_async` does for H2D) instead of a
+managed-memory `memcpy`. Replaces per-page fault migration with one bandwidth-bound
+DMA (~19 MB ≈ a few ms), flipping 2b from break-even to a net win at full resolution
+on discrete GPUs. Coherent (`g_cuda_coherent`) parts keep the zero-copy managed
+buffer (no staging, no D2H).
+
+### Phase 3b — gate the pack to where it already wins (cheap, do first)
+Until 3a lands, only take the pack path when it is actually faster:
+`use_pack = gpu_owns_state && (g_cuda_coherent || n_out < Ncells)` — i.e. on
+coherent memory (managed buffer is zero-copy) or with spatial down-sampling
+(`output_evolution_every_N_{x,y,eta} > 1` ⇒ `n_out ≪ Ncells`, tiny transfer). On a
+discrete card at full resolution, fall back to the Phase-1 parallel host loop
+(measured faster). One predicate in `Advance::pack_evolution_ideal` and the
+`gpu_pack_mem` gate in `evolve.cpp`. Removes the ~13% discrete/full-res regression
+while preserving 2b's wins on GB10 and down-sampled output.
+
+---
+
 ## Verification
 
 - **Correctness, Phase 1 (must be bit-identical):** run a MUSIC test with

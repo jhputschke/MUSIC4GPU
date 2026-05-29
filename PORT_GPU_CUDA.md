@@ -481,3 +481,71 @@ applies equally to `main_gpu` and the CPU build.  Smaller grids
 (64×64×16, 128×128×1) still carry a residual gap to `main_gpu` from the
 untimed `EvolveIt` evolve-loop overhead (§8.3), which is proportionally
 larger when there are fewer cells of GPU work per step.
+
+
+## 10. Output-path optimization (Phase 1 / 2a / 2b) — benchmarks & changes
+
+The `output_evolution_every_N_timesteps` memory-output path was the dominant
+GPU-path wall cost outside the physics step.  Three phases (design doc:
+`AddGPUImprovements.md`) attack it:
+
+- **Phase 1** (`d64e102`): `reserve()` + OpenMP-parallel, order-preserving fill of
+  `Cell_info::OutputEvolutionDataXYEta_memory` (grid_info.cpp), batched into
+  `HydroinfoMUSIC::dump_ideal_info_frame_to_memory`.  Bit-identical to the old
+  serial `push_back` loop.
+- **Phase 2a**: ideal-only D2H sync — skip `copy_wmunu_to_cpu` when only the
+  memory-ideal output is needed; halves the per-output sync calls.
+- **Phase 2b** (`2a55f96`; scratch buffer moved onto `GPUGrid` in `0e4ba78`): a
+  device kernel (`gpu_pack_evolution_ideal`) packs `eta,sd,ed,pressure,temperature,
+  ux,uy,ueta` (the `fluidCell_ideal` layout) using the resident EOS tables,
+  eliminating the host EOS loop entirely.
+
+### 10.1 Benchmark — discrete RTX 3090, `OO_one_event`, 100×100×60, 163 frames, **no down-sampling**
+
+`MUSIC_PROFILE=1` timers inside `EvolveIt` (RootBulkWriter excluded), single run,
+≈±10% GPU run-to-run variance.  All four configs produce surface cells = **97477**
+(correctness preserved).  Toggled via `OMP_NUM_THREADS` and a temporary
+`MUSIC_NO_GPU_PACK` gate (not committed).
+
+| config            | OMP | output path          | step_total (s) | AdvanceRK | output | sync_arena (calls) |
+|-------------------|-----|----------------------|----------------|-----------|--------|--------------------|
+| serial baseline   | 1   | host loop (serial)   | **24.5**       | 8.5       | 8.59   | 4.28 (328)         |
+| pack @ 1T         | 1   | GPU pack             | 19.8           | 8.45      | 2.28   | 4.26 (165)         |
+| host @ 16T        | 16  | host loop (Phase 1)  | **11.3**       | 4.48      | 2.70   | 0.85 (328)         |
+| pack @ 16T        | 16  | GPU pack (as built)  | **12.8**       | 4.64      | 2.26   | 1.04 (165)         |
+
+- **Phase 1:** the output loop alone is **8.59 → 2.70 s = 3.2×** (1T→16T, matching the
+  design-doc 3.3×); the whole output+sync path is **12.87 → 3.55 s = 3.6×**.
+- **Phase 2a:** sync calls **328 → 165** (halved when the pack path is active);
+  wall-neutral at 16T (~1 s either way — the remaining syncs are cheap cached/ideal
+  copies) but it cuts D2H volume.
+- **Phase 2b:** the pack kernel is cheap (13.9 ms/frame), **but at full resolution
+  the 19 MB managed-buffer readback fault-migrates over PCIe**, so the Phase-1 host
+  path (11.3 s) actually **beats the pack (12.8 s) by ~13% at 16 threads**.  The pack
+  wins only at low thread counts (1T: 19.8 vs 24.5 s = **+24%**, offloading the
+  serial EOS loop) and — by design — on coherent memory (GB10, zero-copy) or with
+  down-sampling (`n_out ≪ Ncells`).  Fix tracked as **Phase 3** in
+  `AddGPUImprovements.md` (device-buffer + pinned-staging `cudaMemcpyAsync` readback;
+  gate the pack to where it wins).
+- **Net:** serial-output baseline → fully-optimized (pack @ 16T) = 24.5 → 12.8 s ≈
+  **1.9×**; the best config (Phase 1 only @ 16T) is **2.2×**.  ~9.6 s of the saving is
+  the output/IO path (Phase 1+2a: 12.9 → 3.3 s ≈ 3.9×); the remaining ~4 s is the
+  GPU port's general 16-thread host work (`AdvanceRK` 8.5 → 4.6 s), not these phases.
+
+### 10.2 What changed (commit `0e4ba78`, branch `AddGPUTuning`)
+
+- **Phase-2b pack buffer moved off the `CUDAPipelines` singleton onto `GPUGrid`**
+  (`evo_pack_out` / `evo_pack_floats`, freed in `GPUGrid::release()`;
+  `CUDAPipelines::pack_evolution_ideal` now writes `gpu.evo_pack_out`).  Ties the
+  buffer's lifetime to the grid and removes the layout-preserving workaround.
+- This is a `sizeof(GPUGrid)` change that `OOB_Bug.md` predicted would crash via a
+  latent freeze-out OOB.  **That OOB could not be reproduced** here across
+  exhaustive configs (build_lite + build_gpu, ROOT + RootBulkWriter active,
+  OMP 1/16, `char[64]`/scan pads, the doc-exact `evo_pack` + `buf_handles_[32→40]`,
+  and 12 random-seed ICs — surface stays 97477).  See `OOB_Bug.md`
+  "## 2026-05-29 follow-up".
+- **Cornelius hardening:** `Polygon::add_line` and `Polyhedron::add_polygon` now
+  bounds-check their fixed `MAX_LINES`/`MAX_POLYGONS` heap arrays (the one concrete
+  real latent OOB the doc flagged).  Instrumented runs — including 12 random ICs —
+  show the guards **never fire**, so this is dormant defensive hardening, not the
+  active corruptor.
