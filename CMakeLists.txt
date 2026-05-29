@@ -22,7 +22,10 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 find_package(GSL)
 if (GSL_FOUND)
     message("Found GSL library ${GSL_INCLUDE_DIR}, will build MUSIC with GSL")
-    include_directories(${GSL_INCLUDE_DIR})
+    # NOTE: the GSL -I flag is appended below, AFTER the compiler-specific
+    # set(CMAKE_CXX_FLAGS ...) blocks, which would otherwise overwrite it.
+    # include_directories() is not used here because CMake strips paths it
+    # considers implicit to the (conda) compiler, dropping GSL from -I.
 elseif()
     message("Did not find GSL library, will build MUSIC alone")
 endif()
@@ -126,6 +129,15 @@ endif()
 if (NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
     string(APPEND CMAKE_CXX_FLAGS " -Wall")
 endif()
+
+# Append the GSL include here, after the compiler-specific set(CMAKE_CXX_FLAGS)
+# overwrites above. Done as a raw -I flag (not include_directories) so CMake
+# cannot strip it as an "implicit" compiler path (conda toolchain reports
+# $PREFIX/include as implicit only when CPATH is set at configure time).
+if (GSL_FOUND)
+    string(APPEND CMAKE_CXX_FLAGS " -I${GSL_INCLUDE_DIR}")
+endif()
+
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-g -O3")
 
