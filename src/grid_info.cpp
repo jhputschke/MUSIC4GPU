@@ -7,6 +7,7 @@
 
 #include "util.h"
 #include "grid_info.h"
+#include "bench_timer.h"
 
 using Util::hbarc;
 using Util::small_eps;
@@ -371,40 +372,75 @@ void Cell_info::calculate_inverse_Reynolds_numbers(
 //! This function outputs hydro evolution file into memory for JETSCAPE
 void Cell_info::OutputEvolutionDataXYEta_memory(
             Fields &arena, const double tau, HydroinfoMUSIC &hydro_info_ptr) {
+    bench::Timer _bt("grid.output_evolution_memory");
     const int n_skip_x   = DATA.output_evolution_every_N_x;
     const int n_skip_y   = DATA.output_evolution_every_N_y;
     const int n_skip_eta = DATA.output_evolution_every_N_eta;
-    for (int ix = 0; ix < arena.nX(); ix += n_skip_x) {
-        for (int iy = 0; iy < arena.nY(); iy += n_skip_y) {
-            for (int ieta = 0; ieta < arena.nEta(); ieta += n_skip_eta) {
-                int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
+
+    // Output (downsampled) grid dimensions.  These reproduce the iteration
+    // counts of the original `for (i = 0; i < n; i += n_skip)` loops.
+    const int nx_out   = (arena.nX()   - 1)/n_skip_x   + 1;
+    const int ny_out   = (arena.nY()   - 1)/n_skip_y   + 1;
+    const int neta_out = (arena.nEta() - 1)/n_skip_eta + 1;
+
+    // Fill a per-frame buffer in parallel.  Each cell writes its own slot at a
+    // flat index matching the original push order (ix outer, iy middle, ieta
+    // inner), so the appended lattice is byte-identical to the former serial
+    // push_back loop.  The EOS getters are const and thread-safe (cf. the
+    // parallelized diagnostic loops in this file).
+    std::vector<fluidCell_ideal> frame(
+            static_cast<size_t>(nx_out)*ny_out*neta_out);
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int ix_idx = 0; ix_idx < nx_out; ix_idx++) {
+        for (int iy_idx = 0; iy_idx < ny_out; iy_idx++) {
+            for (int ieta_idx = 0; ieta_idx < neta_out; ieta_idx++) {
+                const int ix   = ix_idx*n_skip_x;
+                const int iy   = iy_idx*n_skip_y;
+                const int ieta = ieta_idx*n_skip_eta;
+                const int fieldIdx = arena.getFieldIdx(ix, iy, ieta);
+
                 double eta = 0.0;
                 if (!DATA.boost_invariant) {
                     eta = ((static_cast<double>(ieta))*(DATA.delta_eta)
                             - (DATA.eta_size)/2.0);
                 }
-                double e_local = arena.e_[fieldIdx];         // 1/fm^4
-                double rhob_local = arena.rhob_[fieldIdx];      // 1/fm^3
-                double rhoq_local = arena.rhoq_[fieldIdx];      // 1/fm^3
-                double rhos_local = arena.rhos_[fieldIdx];      // 1/fm^3
+                const double e_local    = arena.e_[fieldIdx];     // 1/fm^4
+                const double rhob_local = arena.rhob_[fieldIdx];   // 1/fm^3
+                const double rhoq_local = arena.rhoq_[fieldIdx];   // 1/fm^3
+                const double rhos_local = arena.rhos_[fieldIdx];   // 1/fm^3
 
-                double p_local = eos.get_pressure(
+                const double p_local = eos.get_pressure(
                     e_local, rhob_local, rhoq_local, rhos_local);
-                double T_local = eos.get_temperature(
+                const double T_local = eos.get_temperature(
                     e_local, rhob_local, rhoq_local, rhos_local);
-                double s_local = eos.get_entropy(
+                const double s_local = eos.get_entropy(
                     e_local, rhob_local, rhoq_local, rhos_local);
 
-                double ux   = arena.u_[1][fieldIdx];
-                double uy   = arena.u_[2][fieldIdx];
-                double ueta = arena.u_[3][fieldIdx];
+                const double ux   = arena.u_[1][fieldIdx];
+                const double uy   = arena.u_[2][fieldIdx];
+                const double ueta = arena.u_[3][fieldIdx];
 
+                // Reproduce dump_ideal_info_to_memory exactly: values are first
+                // narrowed to float (that function's parameter type), then the
+                // energy/pressure/temperature are scaled by hbarc.
+                fluidCell_ideal cell;
+                cell.eta         = static_cast<float>(eta);
+                cell.temperature = static_cast<float>(T_local)*hbarc;
+                cell.ed          = static_cast<float>(e_local)*hbarc;
+                cell.sd          = static_cast<float>(s_local);
+                cell.pressure    = static_cast<float>(p_local)*hbarc;
+                cell.ux          = static_cast<float>(ux);
+                cell.uy          = static_cast<float>(uy);
+                cell.ueta        = static_cast<float>(ueta);
 
-                hydro_info_ptr.dump_ideal_info_to_memory(
-                    tau, eta, e_local, p_local, s_local, T_local, ux, uy, ueta);
+                const int flatIdx =
+                    (ix_idx*ny_out + iy_idx)*neta_out + ieta_idx;
+                frame[flatIdx] = cell;
             }
         }
     }
+
+    hydro_info_ptr.dump_ideal_info_frame_to_memory(tau, frame);
 }
 
 //! This function outputs hydro evolution file in binary format

@@ -61,6 +61,8 @@ class HydroinfoMUSIC {
     void dump_ideal_info_to_memory(double tau, float eta, float epsilon,
                                    float pressure, float entropy, float T,
                                    float ux, float uy, float ueta);
+    void dump_ideal_info_frame_to_memory(
+            double tau, const std::vector<fluidCell_ideal> &frame);
 
     int get_number_of_fluid_cells() const {return(lattice_ideal.size());}
     void get_fluid_cell_with_index(const int idx, fluidCell *info) const;
