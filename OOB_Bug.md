@@ -1,9 +1,58 @@
 # Latent heap OOB in the MUSIC GPU / freeze-out path
 
-> **Status:** characterized, deterministic repro in hand, **not yet root-caused**.
-> Next step is an AddressSanitizer run (details below). Discovered 2026-05-29
-> while building Phase 2b (`AddGPUImprovements.md`); the cause is **pre-existing**
-> in the GPU port, not introduced by Phase 1 or 2b.
+> **Status (updated 2026-05-29 follow-up):** **could NOT be reproduced** in the
+> committed code (music4gpu `c7c7022`, == `AddGPUTuning`). The original
+> "deterministic repro" below did not hold up under re-testing — see
+> **"## 2026-05-29 follow-up"** immediately below before relying on anything in
+> the original write-up. Phase 2b's pack buffer has now been moved onto `GPUGrid`
+> (the change this doc predicted would crash) and it runs clean. The only concrete
+> real OOB found (Cornelius `add_line`/`add_polygon`) has been bounds-guarded but
+> never triggers on these inputs.
+
+---
+
+## 2026-05-29 follow-up — exhaustive non-reproduction + Phase 2b shipped
+
+The crash described below **does not reproduce** in the current committed tree.
+Tested on the same machine (RTX 3090, discrete, `g_cuda_coherent=false`), same
+commit, identical music4gpu build flags:
+
+| Config (all OMP=16 unless noted) | Result |
+|---|---|
+| build_lite, `char[64]` pad in `GPUGrid` (OMP 1 & 16) | clean 97477 |
+| build_lite, scan of `char[N]` (N=8..184) **directly before `surfaceCellVec_`** | clean 97477 (every N) |
+| build_lite, host-C++ **ASan** (`-fsanitize=address`) | **no** ASan error (freeze-out suppressed to 0 cells — ASan allocator artifact) |
+| build_gpu (ROOT), `char[64]` pad ×8 | clean 97477 |
+| build_gpu (ROOT), `char[64]` pad + **RootBulkWriter active** ×8 | clean 97477 |
+| build_gpu (ROOT), **real Phase 2b** (`evo_pack_out` on `GPUGrid`) + RootBulkWriter ×8 | clean 97477 |
+| build_gpu (ROOT), **doc-exact** `evo_pack_out` + `buf_handles_[32]→[40]` + RootBulkWriter ×8 | clean 97477 |
+| build_gpu (ROOT), **random seed** (12 ICs, surface 32k–147k) + RootBulkWriter | clean, **0 Cornelius-guard hits** |
+
+Notes / what this rules out or revises:
+- `AddGPUTuning` and the current branch are the **same commit** (`c7c7022`), so the
+  bug is not hiding in uncommitted/branch-only code.
+- **The "any `GPUGrid` size change crashes" claim does not hold** — neither a 64-byte
+  pad nor the actual Phase-2b member addition (nor the doc-exact `[40]` combo)
+  reproduces it, with or without ROOT / RootBulkWriter / over varied initial data.
+- **Forensic on the garbage count:** `size()=(_M_finish−_M_start)/sizeof(SurfaceCell=128)`.
+  The observed ~3.6166e16 ⇒ `_M_finish` overwritten by ≈`0x4000…`, i.e. a
+  **`double` in [2,4)** (a freeze-out coordinate/τ/γ-like value), *not* a pointer
+  (low bits vary with ASLR through the still-valid `_M_start`). So if the write
+  ever fires, it is a stray `double` from the freeze-out / Cornelius path.
+- **Cornelius `add_line`/`add_polygon` are now bounds-guarded** (the real latent
+  OOB flagged below). Instrumented runs — including 12 random ICs — show the guards
+  **never fire**, so this path does not overflow for any geometry tested; it is a
+  genuine-but-dormant latent bug, not the active corruptor here.
+- **Phase 2b now keeps its pack buffer on `GPUGrid`** (`evo_pack_out`/`evo_pack_floats`,
+  freed in `GPUGrid::release()`), replacing the `CUDAPipelines`-singleton workaround.
+  Surface stays 97477; no crash.
+
+**Conclusion:** the layout-trigger hypothesis is not supported by these tests. The
+crash is either already absent in the committed code or a heisenbug not reproducible
+in this environment/input. The original analysis below is retained for reference but
+is **not** confirmed.
+
+---
 
 ## Symptom
 

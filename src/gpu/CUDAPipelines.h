@@ -93,12 +93,9 @@ private:
     // discrete transfer to overlap, so the dual-stream prefetch+gate is skipped
     // (it would only add migration latency).  Kept active on discrete GPUs.
     bool  coherent_memory_ = false;
-    // Phase 2b: pipeline-owned managed scratch for the packed evolution output
-    // (8 floats per down-sampled cell).  Lazily (re)allocated to fit; freed in
-    // the destructor.  Kept here rather than on GPUGrid to avoid changing the
-    // embedded GPUGrid's size/layout.
-    float* evo_pack_buf_    = nullptr;
-    size_t evo_pack_floats_ = 0;
+    // Phase 2b: the packed-evolution scratch buffer now lives on GPUGrid
+    // (gpu.evo_pack_out / gpu.evo_pack_floats), tying its lifetime to the grid
+    // and freeing it in GPUGrid::release().
     // Occupancy-tuned upper bound on threads per block (Phase 2).  The 3-D
     // block is factored from this at dispatch time, adapting to Neta so 2-D
     // (Neta==1) grids don't waste the eta thread dimension.

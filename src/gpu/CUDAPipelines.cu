@@ -71,11 +71,6 @@ CUDAPipelines::~CUDAPipelines() {
         cudaStreamDestroy(static_cast<cudaStream_t>(compute_stream_));
         compute_stream_ = nullptr;
     }
-    if (evo_pack_buf_) {
-        cudaFree(evo_pack_buf_);
-        evo_pack_buf_    = nullptr;
-        evo_pack_floats_ = 0;
-    }
 }
 
 // ── initialization ────────────────────────────────────────────────────────────
@@ -265,19 +260,19 @@ bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
     if (n_out <= 0) return false;
     const size_t need = static_cast<size_t>(n_out) * 8;   // 8 floats per cell
 
-    // Lazily (re)allocate the managed scratch buffer to fit.  Kept on the
-    // pipeline (a singleton), not on GPUGrid, so the embedded GPUGrid layout
-    // is byte-identical to the non-2b build.
-    if (evo_pack_floats_ < need) {
-        if (evo_pack_buf_) cudaFree(evo_pack_buf_);
-        evo_pack_buf_    = nullptr;
-        evo_pack_floats_ = 0;
-        if (cudaMallocManaged(&evo_pack_buf_, need * sizeof(float))
-                != cudaSuccess || !evo_pack_buf_) {
-            evo_pack_buf_ = nullptr;
+    // Lazily (re)allocate the managed scratch buffer to fit.  The buffer lives
+    // on GPUGrid (Phase 2b) so its lifetime is tied to the grid; it is freed in
+    // GPUGrid::release().
+    if (gpu.evo_pack_floats < need) {
+        if (gpu.evo_pack_out) cudaFree(gpu.evo_pack_out);
+        gpu.evo_pack_out    = nullptr;
+        gpu.evo_pack_floats = 0;
+        if (cudaMallocManaged(&gpu.evo_pack_out, need * sizeof(float))
+                != cudaSuccess || !gpu.evo_pack_out) {
+            gpu.evo_pack_out = nullptr;
             return false;
         }
-        evo_pack_floats_ = need;
+        gpu.evo_pack_floats = need;
     }
 
     const int block = 256;
@@ -285,11 +280,11 @@ bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
     gpu_pack_evolution_ideal<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_s, gpu.eos_T,
-        evo_pack_buf_, gpu.eos_params, pp);
+        gpu.evo_pack_out, gpu.eos_params, pp);
     check_launch("gpu_pack_evolution_ideal");
 
     if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
-    std::memcpy(host_out, evo_pack_buf_, need * sizeof(float));
+    std::memcpy(host_out, gpu.evo_pack_out, need * sizeof(float));
     return true;
 }
 

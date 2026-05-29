@@ -216,6 +216,14 @@ void GPUGrid::release() {
         }
     }
     n_handles_ = 0;
+
+    // Phase 2b pack scratch is managed independently of buf_handles_.
+    if (evo_pack_out) {
+        cudaFree(evo_pack_out);
+        evo_pack_out    = nullptr;
+        evo_pack_floats = 0;
+    }
+
     allocated_ = false;
     snap_prev = snap_curr = snap_future = GPUSnapshot{};
     dwmn      = nullptr;

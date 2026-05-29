@@ -169,6 +169,14 @@ public:
     float* a_buf     = nullptr;
     float* sigma_buf = nullptr;
 
+    // Phase 2b: scratch buffer for the GPU-packed ideal evolution output
+    // (8 floats per down-sampled cell). Lazily (re)allocated by
+    // CUDAPipelines::pack_evolution_ideal to fit n_out; managed (cudaMallocManaged)
+    // and freed in release(). Not registered in buf_handles_ (it is re-sized
+    // independently of the one-shot allocate()).
+    float* evo_pack_out    = nullptr;
+    size_t evo_pack_floats = 0;
+
     // Upload pre-sampled EOS tables (P, dP/de, s, T) to GPU shared memory.
     // P / dP/de are sampled at linearly-spaced e ∈ [e_min, e_max]; s and T
     // are sampled at log-spaced e ∈ [1e-6, e_max] (both are strongly
