@@ -207,16 +207,18 @@ Target files: `gpu/GPUGrid_cuda.cu` + `gpu/music_kernels.cu(.cuh)`
 ## Phase 3 — make the GPU pack pay off on discrete GPUs (output-path follow-up)
 
 **Motivation (measured 2026-05-29, discrete RTX 3090, full resolution — see
-`PORT_GPU_CUDA.md` §10 for the full table).** Phase 2b *as built* is **net
-neutral-to-slightly-negative at `OMP_NUM_THREADS=16`**: the `EvolveIt` hydro wall is
-**12.8 s with the pack vs 11.3 s with the Phase-1 host loop** (~13% worse). The pack
-*kernel* is cheap (13.9 ms/frame), but `evo_pack_out` is a `cudaMallocManaged`
-buffer and the `std::memcpy(host_out, evo_pack_out, …)` readback fault-migrates
-~19 MB/frame over PCIe. At full resolution (`n_out == Ncells`) that transfer costs
-more than the host EOS loop it replaces, so on a discrete card with many host
-threads the pack should not be the default. (The pack still wins at low thread
-counts — 1T: 19.8 s vs 24.5 s — and, by design, on coherent memory / with
-down-sampling.)
+`PORT_GPU_CUDA.md` §10 for the full table).** Phase 2b *as built* is roughly
+**break-even with the Phase-1 host path at `OMP_NUM_THREADS=16`** (single run:
+`EvolveIt` hydro wall 12.8 s with the pack vs 11.3 s with the host loop, but the
+pack's *timed* output is actually marginally cheaper and the ~1.5 s gap is untimed
+overhead within ±10% run-to-run noise — needs repeat-averaging to pin the sign).
+The pack *kernel* is cheap (13.9 ms/frame); the suspect cost is that `evo_pack_out`
+is a `cudaMallocManaged` buffer whose `std::memcpy(host_out, …)` readback
+fault-migrates ~19 MB/frame over PCIe. At full resolution (`n_out == Ncells`) that
+transfer is large enough to cancel the GPU-EOS saving, so on a discrete card with
+many host threads the pack is (at best) break-even rather than a clear win — which
+is the point of the Phase 3 work below. (The pack already wins at low thread counts
+— 1T: 19.8 s vs 24.5 s — and, by design, on coherent memory / with down-sampling.)
 
 ### Phase 3a — explicit device buffer + pinned-staging readback
 Mirror the snapshot discrete path: make `evo_pack_out` a `cudaMalloc` **device**

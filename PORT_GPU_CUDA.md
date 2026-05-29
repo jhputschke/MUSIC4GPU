@@ -519,18 +519,25 @@ GPU-path wall cost outside the physics step.  Three phases (design doc:
 - **Phase 2a:** sync calls **328 → 165** (halved when the pack path is active);
   wall-neutral at 16T (~1 s either way — the remaining syncs are cheap cached/ideal
   copies) but it cuts D2H volume.
-- **Phase 2b:** the pack kernel is cheap (13.9 ms/frame), **but at full resolution
-  the 19 MB managed-buffer readback fault-migrates over PCIe**, so the Phase-1 host
-  path (11.3 s) actually **beats the pack (12.8 s) by ~13% at 16 threads**.  The pack
-  wins only at low thread counts (1T: 19.8 vs 24.5 s = **+24%**, offloading the
-  serial EOS loop) and — by design — on coherent memory (GB10, zero-copy) or with
-  down-sampling (`n_out ≪ Ncells`).  Fix tracked as **Phase 3** in
-  `AddGPUImprovements.md` (device-buffer + pinned-staging `cudaMemcpyAsync` readback;
-  gate the pack to where it wins).
-- **Net:** serial-output baseline → fully-optimized (pack @ 16T) = 24.5 → 12.8 s ≈
-  **1.9×**; the best config (Phase 1 only @ 16T) is **2.2×**.  ~9.6 s of the saving is
-  the output/IO path (Phase 1+2a: 12.9 → 3.3 s ≈ 3.9×); the remaining ~4 s is the
-  GPU port's general 16-thread host work (`AdvanceRK` 8.5 → 4.6 s), not these phases.
+- **Phase 2b:** roughly **break-even with the Phase-1 host path at 16T, full
+  resolution — and the sign is within single-run noise, so don't over-read it.**
+  The pack kernel is cheap (13.9 ms/frame) and its *timed* output is in fact
+  marginally cheaper than the host loop (output+sync 3.30 s vs 3.55 s); but the
+  total per-step loop came out ~1.5 s higher in the pack run (12.8 vs 11.3 s),
+  sitting almost entirely in the **untimed remainder** — most plausibly the 19 MB
+  `cudaMallocManaged` readback fault-migrating over PCIe, though with a single run at
+  ≈±10% variance this could also be noise.  This is consistent with the original
+  "As built" figure (≈31 vs 30 s total wall).  **A repeat-averaged run is needed to
+  call break-even vs. marginally-negative.**  The pack is a clear win at low thread
+  counts (1T: 19.8 vs 24.5 s, offloading the serial EOS loop) and — by design — on
+  coherent memory (GB10, zero-copy) or with down-sampling (`n_out ≪ Ncells`).  The
+  discrete/full-res readback is addressed by **Phase 3** in `AddGPUImprovements.md`
+  (device-buffer + pinned-staging `cudaMemcpyAsync`; gate the pack to where it wins).
+- **Net:** serial-output baseline → 16T = **~2×** on the hydro wall (24.5 → 11–13 s;
+  the pack and Phase-1-host configs, 12.8 and 11.3 s, are within run-to-run noise of
+  each other).  ~9.6 s of the saving is the output/IO path (Phase 1+2a: 12.9 → 3.3 s
+  ≈ 3.9×); the remaining ~4 s is the GPU port's general 16-thread host work
+  (`AdvanceRK` 8.5 → 4.6 s), not these phases.
 
 ### 10.2 What changed (commit `0e4ba78`, branch `AddGPUTuning`)
 
