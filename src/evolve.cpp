@@ -1048,6 +1048,11 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                         aFreezeCell.shear_pi[ii] = static_cast<float>(
                                                 fluid_center.Wmunu[ii]*hbarc);
                     }
+                    // surfaceCellVec_ is shared across the omp parallel-for over
+                    // eta-slices; concurrent push_back races on the backing
+                    // buffer (heap corruption).  Serialize just the append; the
+                    // expensive Cornelius/interp/EOS work above stays parallel.
+                    #pragma omp critical(surfaceCellVecPush)
                     surfaceCellVec_.push_back(aFreezeCell);
                 } else if (surface_in_binary) {
                     const int FOsize = 36 + DATA.output_vorticity*(24 + 14);
