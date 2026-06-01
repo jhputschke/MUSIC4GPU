@@ -864,3 +864,41 @@ These match the CUDA Phase-2b numbers to the digit.  Surface-cell count
 **49697**, identical to the host-loop run; pack fired 133× and with
 `MUSIC_GPU_NO_PACK=1` correctly reverts to `grid.output_evolution_memory`.  See
 `AddGPUImprovements.md` §"As built (Metal)" for the full write-up.
+
+### 9.10 OpenMP wait-policy default for GPU builds (2026-06-01)
+
+Symptom (GB10): a run reported `CPU time: 106 s` against `Real time: 6 s` —
+~18 of the 20 Grace cores pinned — while the M3 Max showed `5.3 s / 4 s`
+(~1 core) for the same work. The coherent path was correctly detected
+(`coherent host memory: yes`), so this was **not** a transfer/architecture
+issue.
+
+Root cause: the GPU path runs **many short host-side OpenMP regions** (the
+AoS↔SoA repacks in `GPUGrid*::copy_*` / `sync_arena_from_gpu`, the per-frame
+output pack/host loop, diagnostics) interleaved with GPU-bound waits. Under the
+OpenMP default `OMP_WAIT_POLICY=active`, idle worker threads **busy-spin** at the
+barrier between regions instead of sleeping; on a 20-core CPU that burns nearly
+all cores for the whole run with no useful work. `CPU time / Real time` is just
+the average number of busy cores, so it ballooned. The Mac didn't show it
+because its libomp effectively wasn't spinning those threads.
+
+Fix (`advance.cpp`, GPU builds only): a load `__attribute__((constructor))`
+defaults `OMP_WAIT_POLICY=passive` via `setenv(..., overwrite=0)` before the
+OpenMP runtime reads the env on its first parallel region (there is no standard
+runtime setter for the wait policy), plus `kmp_set_blocktime(0)` (weak symbol —
+libomp/LLVM only; skipped on libgomp/GCC). Confirmed on the Mac with
+`OMP_DISPLAY_ENV=TRUE`: `[host] OMP_WAIT_POLICY='PASSIVE'` with the env unset,
+output unchanged (surface 49697). On GB10 `OMP_WAIT_POLICY=passive
+OMP_NUM_THREADS=8` brought CPU time from 106 s → ~9 s at ~5 s wall.
+
+Notes:
+- It is a *default*: an explicit `OMP_WAIT_POLICY` in the environment still wins,
+  and `MUSIC_OMP_DEFAULTS=0` disables the whole thing.
+- OpenMP has one per-process runtime, so this is process-wide (3DGlauber, iSS,
+  …); passive only changes idle-thread behavior, so the cost to other modules is
+  a small per-region thread wake-up — negligible for their coarse-grained loops.
+- Secondary (not addressed): `cudaStreamSynchronize` spin-polls one host thread;
+  a `cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)` init flag would reclaim
+  it. Left as a follow-up — ~1 core vs the ~18 the wait policy fixed.
+- User-facing summary + revert knobs are in the top-level `README.md`
+  ("OpenMP defaults for GPU builds").

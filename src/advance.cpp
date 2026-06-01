@@ -51,6 +51,44 @@ static bool gpu_no_pack() {
     return no_pack;
 }
 
+// ── OpenMP runtime defaults for the GPU path ─────────────────────────────────
+#ifdef MUSIC_USE_GPU
+// The GPU path interleaves many short host-side OpenMP regions (AoS<->SoA
+// repacks, per-frame output packing) with GPU-bound waits.  Under the OpenMP
+// default *active* wait policy, idle worker threads busy-spin between regions;
+// on a many-core host (e.g. the 20-core GB10 Grace) that pins nearly every core
+// and inflates CPU time ~18x for zero wall-time benefit (one GB10 run: 106 s CPU
+// / 6 s wall; passive brought it to ~9 s / 5 s).  GPU builds therefore default
+// the OpenMP wait policy to *passive* (idle threads sleep).
+//
+//   - Set as a DEFAULT via setenv(..., overwrite=0): an explicit OMP_WAIT_POLICY
+//     already in the environment still wins.
+//   - Runs as a load constructor, i.e. before the OpenMP runtime reads the env
+//     on its first parallel region (there is no standard runtime setter for the
+//     wait policy once the runtime is up).
+//   - kmp_set_blocktime(0) is the equivalent libomp (LLVM/Intel) runtime knob;
+//     declared weak so this still links on libgomp (GCC), where the symbol is
+//     absent and the call is skipped.
+//   - Opt out of the whole thing with MUSIC_OMP_DEFAULTS=0.
+//
+// Scope: OpenMP has one per-process runtime, so this affects all OpenMP code in
+// the process (3DGlauber, iSS, ...), not only MUSIC.  passive only changes
+// idle-thread behavior, so the cost to other modules is a small per-region
+// thread wake-up — negligible for their coarse-grained loops.  See the X-SCAPE
+// README.md ("OpenMP defaults for GPU builds") and PORT_GPU.md.
+extern "C" void kmp_set_blocktime(int) __attribute__((weak));
+
+namespace {
+__attribute__((constructor))
+void music_gpu_set_omp_defaults() {
+    const char* off = getenv("MUSIC_OMP_DEFAULTS");
+    if (off != nullptr && off[0] == '0') return;     // explicit opt-out
+    setenv("OMP_WAIT_POLICY", "passive", 0);         // default only; user wins
+    if (kmp_set_blocktime) kmp_set_blocktime(0);     // libomp; no-op on libgomp
+}
+}  // namespace
+#endif  // MUSIC_USE_GPU
+
 void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
