@@ -176,15 +176,23 @@ Target files: `gpu/GPUGrid_cuda.cu` + `gpu/music_kernels.cu(.cuh)`
   and consumed by `Advance::pack_evolution_ideal`, wired into both output sites
   in `evolve.cpp` (used only when `store_hydro_info_in_memory==1 &&
   outputEvolutionData==0 && gpu_owns_state()`; host path is the fallback).
-- **The pack scratch buffer lives on `CUDAPipelines` (the singleton), NOT on
-  `GPUGrid`.** ⚠️ Adding a member to `GPUGrid` (which is embedded in
-  `Advance`→`Evolve`) changes `Evolve`'s object layout and **triggers a
-  pre-existing latent heap out-of-bounds write** that stomps
-  `Evolve::surfaceCellVec_` (garbage surface count ~3.6e16 → segfault in
-  `PassHydroSurfaceToFramework`). Baseline d64e102 is clean; any `GPUGrid` size
-  change reproduces the crash. Keeping the buffer off `GPUGrid` leaves the layout
-  byte-identical so the latent bug stays dormant. **The latent OOB is a separate,
-  real bug to fix (tracked separately).**
+- **The pack scratch buffer now lives on `GPUGrid` (`evo_pack_out` /
+  `evo_pack_floats`), allocated via `cudaMallocManaged` in
+  `CUDAPipelines::pack_evolution_ideal` and freed in `GPUGrid::release()`**
+  (`gpu/GPUGrid_cuda.cu`). It was *initially* kept on the `CUDAPipelines`
+  singleton instead, because `GPUGrid` is embedded in `Advance`→`Evolve` and
+  growing it shifted `Evolve::surfaceCellVec_` in a way that **tripped a
+  pre-existing latent heap out-of-bounds write** (garbage surface count ~3.6e16
+  → segfault in `PassHydroSurfaceToFramework`; baseline d64e102 was clean). ✅
+  Commit `0e4ba78` then (a) **fixed the real OOB** — bounds-checked
+  `Polygon::add_line` / `Polyhedron::add_polygon` against their fixed
+  `MAX_LINES` / `MAX_POLYGONS` heap arrays (`src/cornelius.cpp`) — and (b) moved
+  the buffer onto `GPUGrid`, dropping the layout-preserving singleton workaround.
+  After the Cornelius fix the GPUGrid-layout crash **could not be reproduced**
+  across exhaustive configs (see `OOB_Bug.md`). **NB the Metal port keeps its
+  scratch buffer on the `MetalPipelines` singleton** — it needs an
+  `id<MTLBuffer>` handle and there was no reason to grow `GPUGrid` again — so the
+  two backends differ here by design (see §"As built (Metal)").
 - **Correctness (`OO_one_event`, EOS 91, RTX 3090):** surface cells = 97477
   (identical to baseline — layout safe); `ux/uy/ueta` bit-exact, `ed` rel err
   1e-7; in the physical region (T>0.1 GeV) `p/s/T` agree with the host EOS to
