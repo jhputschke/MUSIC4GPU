@@ -93,6 +93,26 @@ void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
 
+    // Surface the effective OpenMP wait policy (GPU builds default it to passive
+    // — see the load constructor above) ahead of the backend's [MUSIC-GPU]
+    // device lines, so the active/passive choice and thread count are visible.
+    {
+        const char* wp = getenv("OMP_WAIT_POLICY");
+        const char* od = getenv("MUSIC_OMP_DEFAULTS");
+        const bool defaults_off = (od != nullptr && od[0] == '0');
+#ifdef _OPENMP
+        const int nthreads = omp_get_max_threads();
+#else
+        const int nthreads = 1;
+#endif
+        fprintf(stderr, "[MUSIC-GPU] OMP wait policy: %s (max threads %d) — %s\n",
+                wp ? wp : "runtime-default", nthreads,
+                defaults_off
+                    ? "music4gpu OMP defaults disabled (MUSIC_OMP_DEFAULTS=0)"
+                    : "music4gpu default=passive; override via OMP_WAIT_POLICY "
+                      "or MUSIC_OMP_DEFAULTS=0");
+    }
+
     auto& mp = GPUPipelines::instance();
     if (!mp.initialize()) {
         music_message << "[MUSIC-GPU] Metal init failed, falling back to CPU.";
