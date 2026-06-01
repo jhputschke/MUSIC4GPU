@@ -4,6 +4,7 @@
 // advance.cpp can be shared between the two back-ends.
 
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -232,16 +233,12 @@ void CUDAPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max) 
     }
     auto stream = static_cast<cudaStream_t>(compute_stream_);
 
-    cudaMemsetAsync(gpu.reduce_eps_out,  0, sizeof(float), stream);
-    cudaMemsetAsync(gpu.reduce_rhob_out, 0, sizeof(float), stream);
-
-    const int block = 256;
-    const int grid  = std::min((gpu.Ncells() + block - 1) / block, 1024);
-    const size_t smem = 2 * static_cast<size_t>(block) * sizeof(float);
-    gpu_reduce_max_eps_rhob<<<grid, block, smem, stream>>>(
-        gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.Ncells(),
-        gpu.reduce_eps_out, gpu.reduce_rhob_out);
-    check_launch("gpu_reduce_max_eps_rhob");
+    cub::DeviceReduce::Max(gpu.cub_reduce_temp, gpu.cub_reduce_temp_bytes,
+                           gpu.snap_curr.epsilon, gpu.reduce_eps_out,
+                           gpu.Ncells(), stream);
+    cub::DeviceReduce::Max(gpu.cub_reduce_temp, gpu.cub_reduce_temp_bytes,
+                           gpu.snap_curr.rhob, gpu.reduce_rhob_out,
+                           gpu.Ncells(), stream);
 
     cudaStreamSynchronize(stream);
     eps_max  = static_cast<double>(*gpu.reduce_eps_out);

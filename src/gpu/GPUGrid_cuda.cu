@@ -20,6 +20,7 @@
 // configurations.
 
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -147,9 +148,16 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
     reduce_eps_out  = alloc_managed_buf(sizeof(float), buf_handles_, n_handles_);
     reduce_rhob_out = alloc_managed_buf(sizeof(float), buf_handles_, n_handles_);
 
+    // Query CUB DeviceReduce::Max temp-storage requirement for Ncells_ floats.
+    cub::DeviceReduce::Max(nullptr, cub_reduce_temp_bytes,
+                           (const float*)nullptr, (float*)nullptr, Ncells_);
+    if (cub_reduce_temp_bytes > 0)
+        cudaMalloc(&cub_reduce_temp, cub_reduce_temp_bytes);
+
     ok = ok && dwmn && qi_out && uwrhs_out && uprhs_out && qi_source_buf
             && theta_buf && a_buf && sigma_buf
-            && reduce_eps_out && reduce_rhob_out;
+            && reduce_eps_out && reduce_rhob_out
+            && (cub_reduce_temp_bytes == 0 || cub_reduce_temp != nullptr);
 
     allocated_ = ok;
     return ok;
@@ -233,6 +241,8 @@ void GPUGrid::release() {
     eos_params = {};
     reduce_eps_out  = nullptr;
     reduce_rhob_out = nullptr;
+    if (cub_reduce_temp) { cudaFree(cub_reduce_temp); cub_reduce_temp = nullptr; }
+    cub_reduce_temp_bytes = 0;
 }
 
 // ── AoS → SoA (double → float) ───────────────────────────────────────────────

@@ -153,6 +153,11 @@ public:
     float* reduce_eps_out  = nullptr;   // max epsilon across snap_curr [1]
     float* reduce_rhob_out = nullptr;   // max rhob   across snap_curr [1]
 
+    // Scratch buffer for CUB DeviceReduce::Max (CUDA path only).
+    // Sized once in allocate() for Ncells floats; reused for both reductions.
+    void*  cub_reduce_temp       = nullptr;
+    size_t cub_reduce_temp_bytes = 0;
+
     // Input buffer: qi_source[5 * Ncells] populated by the CPU when
     // flag_add_hydro_source is true.  Layout matches qi_out:
     //   qi_source[alpha * Ncells + cell] = tau_rk * j^alpha(τ, x, u_cell)
