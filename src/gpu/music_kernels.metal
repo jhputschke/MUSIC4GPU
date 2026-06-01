@@ -2189,3 +2189,61 @@ kernel void gpu_first_rk_step_w_full(
         Wmunu_future[m * Ncells + c] = Wf[m];
     pi_b_future[c] = pi_b_out;
 }
+
+// ── Phase 2b: pack ideal-hydro evolution output on the GPU ────────────────────
+// One thread per down-sampled output cell.  Metal port of the CUDA
+// gpu_pack_evolution_ideal kernel (music_kernels.cu) and mirror of the host
+// Cell_info::OutputEvolutionDataXYEta_memory loop, but the EOS lookups run on
+// the GPU through the resident log-spaced tables (sampled at rhob=0 — the same
+// approximation the GPU evolution itself uses).  Output is written in host
+// fluidCell_ideal field order so the host can bulk-copy it directly.
+kernel void gpu_pack_evolution_ideal(
+    device const float*       epsilon [[buffer(0)]],
+    device const float*       u       [[buffer(1)]],
+    device const float*       eos_P   [[buffer(2)]],
+    device const float*       eos_s   [[buffer(3)]],
+    device const float*       eos_T   [[buffer(4)]],
+    device       float*       out     [[buffer(5)]],
+    constant GPUEosParams&    eos_p   [[buffer(6)]],
+    constant GPUPackParams&   pp      [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int o     = (int)gid;
+    const int n_out = pp.nx_out * pp.ny_out * pp.neta_out;
+    if (o >= n_out) return;
+
+    // Decode flat output index in the host push order (ix outer, iy middle,
+    // ieta inner): o = (ix_idx*ny_out + iy_idx)*neta_out + ieta_idx.
+    const int ieta_idx = o % pp.neta_out;
+    const int t        = o / pp.neta_out;
+    const int iy_idx   = t % pp.ny_out;
+    const int ix_idx   = t / pp.ny_out;
+
+    const int ix   = ix_idx   * pp.skip_x;
+    const int iy   = iy_idx   * pp.skip_y;
+    const int ieta = ieta_idx * pp.skip_eta;
+
+    // Device snapshot cell index: cell = ix + Nx*(iy + Ny*ieta).
+    const int Ncells = pp.Ncells;
+    const int c      = ix + pp.Nx * (iy + pp.Ny * ieta);
+
+    const float e = epsilon[c];
+    const float p = gpu_log_interp(e, eos_P, eos_p);
+    const float s = gpu_log_interp(e, eos_s, eos_p);
+    const float T = gpu_log_interp(e, eos_T, eos_p);
+
+    float eta = 0.f;
+    if (!pp.boost_invariant)
+        eta = (float)ieta * pp.delta_eta - pp.eta_size * 0.5f;
+
+    // fluidCell_ideal: { eta; sd, ed, pressure, temperature; ux, uy, ueta }.
+    device float* cell = out + (size_t)o * 8;
+    cell[0] = eta;
+    cell[1] = s;
+    cell[2] = e * pp.hbarc;
+    cell[3] = p * pp.hbarc;
+    cell[4] = T * pp.hbarc;
+    cell[5] = u[1 * Ncells + c];
+    cell[6] = u[2 * Ncells + c];
+    cell[7] = u[3 * Ncells + c];
+}

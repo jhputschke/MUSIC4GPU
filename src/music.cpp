@@ -148,6 +148,8 @@ int MUSIC::run_hydro() {
     }
     evolve_ptr_->EvolveIt(arenaFieldsPrev_, arenaFieldsCurr_, arenaFieldsNext_,
                           (*hydro_info_ptr));
+    if (DATA.store_hydro_info_in_memory == 1)
+        hydro_info_ptr->dump_ideal_lattice_if_requested();
     flag_hydro_run = 1;
     return(0);
 }

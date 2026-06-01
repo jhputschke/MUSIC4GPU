@@ -38,6 +38,19 @@ static bool gpu_force_cpu() {
     return forced;
 }
 
+// Runtime override: MUSIC_GPU_NO_PACK=1 disables the Phase-2b GPU evolution
+// packing kernel so the memory-ideal output falls back to the parallel host
+// loop, while the rest of the GPU evolution is unchanged.  Lets a single GPU
+// build A/B the GPU-table-EOS pack against the host formula-EOS loop on
+// identical fp32 state (validation), and provides a kill-switch.  Cached.
+static bool gpu_no_pack() {
+    static const bool no_pack = []{
+        const char* e = getenv("MUSIC_GPU_NO_PACK");
+        return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return no_pack;
+}
+
 void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
@@ -527,7 +540,7 @@ void Advance::sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr) {
 }
 
 bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
-    if (!gpu_owns_state_ || !gpu_ready_) return false;
+    if (!gpu_owns_state_ || !gpu_ready_ || gpu_no_pack()) return false;
     bench::Timer _bt("advance.output_pack_gpu");
 
     GPUPackParams pp;

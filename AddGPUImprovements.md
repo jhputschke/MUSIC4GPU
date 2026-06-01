@@ -202,6 +202,41 @@ Target files: `gpu/GPUGrid_cuda.cu` + `gpu/music_kernels.cu(.cuh)`
   coherent memory** (the managed buffer is zero-copy → no D2H, pack ≈ kernel
   time) and **with spatial down-sampling** (`n_out ≪ Ncells` → tiny transfer).
 
+### As built (Metal) and measured (2026-06-01)
+
+- Metal port of the kernel: `gpu_pack_evolution_ideal`
+  (`gpu/music_kernels.metal`), a line-for-line mirror of the CUDA kernel, reusing
+  the resident log-spaced EOS tables via the same `gpu_log_interp` the Metal
+  evolution already uses. PSO built in `MetalPipelines::initialize` (step 11),
+  dispatched by `MetalPipelines::pack_evolution_ideal` (1-D, one thread per
+  down-sampled cell), consumed through the shared `Advance::pack_evolution_ideal`
+  path — no host-side branching between backends.
+- **The pack scratch buffer lives on the `MetalPipelines` singleton
+  (`evo_pack_buf_`), NOT on `GPUGrid`.** Unlike the CUDA build (which moved it
+  onto `GPUGrid` after hardening Cornelius, commit `0e4ba78`), the Metal buffer
+  needs an `id<MTLBuffer>` handle, and keeping it off `GPUGrid` leaves that
+  object's layout byte-identical — sidestepping the latent freeze-out OOB
+  (`OOB_Bug.md`) entirely rather than relying on the Cornelius guard. On Apple
+  unified memory the shared buffer is host-readable, so the readback is a plain
+  `memcpy` with zero D2H — the coherent-memory win the CUDA notes predicted.
+- **Validation (A/B on identical GPU state, `OO_one_event_fastgrid`, EOS 91,
+  beastMode 1, 100×100×60, M3 Max).** `MUSIC_GPU_NO_PACK` toggles only the output
+  path (GPU pack vs the Phase-1 host loop) while the fp32 GPU evolution is
+  byte-identical, so the diff isolates exactly the table-EOS-vs-formula-EOS gap.
+  Over 80.4 M cells (134 frames): `ux/uy/ueta` **100% bit-exact**; `ed` max rel
+  err **1.2e-7** (99.2% bit-exact); in the physical region (T>0.1 GeV)
+  `pressure/entropy/temperature` agree to **8.5e-5 / 2.1e-5 / 3.6e-5** — matching
+  the CUDA Phase-2b numbers to the digit; `eta` max abs diff **4.8e-7** (1-ULP
+  float rounding; the large all-cell relative figure is the divide-by-zero at
+  mid-rapidity, irrelevant). Surface-cell count **49697**, identical to the
+  host-loop run. The pack fired 133× (`advance.output_pack_gpu`); with
+  `MUSIC_GPU_NO_PACK=1` it correctly falls back to `grid.output_evolution_memory`.
+- **Validation knobs (env, default off):** `MUSIC_GPU_NO_PACK=1` forces the host
+  output path (kill-switch / A/B baseline; mirrors the Phase 3b gating intent);
+  `MUSIC_PACK_DUMP=<path>` writes the raw `lattice_ideal` (int64 count, then
+  count×8 floats) for byte-level comparison
+  (`HydroinfoMUSIC::dump_ideal_lattice_if_requested`).
+
 ---
 
 ## Phase 3 — make the GPU pack pay off on discrete GPUs (output-path follow-up)

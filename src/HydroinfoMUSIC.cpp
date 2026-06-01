@@ -1,7 +1,31 @@
 // Copyright Chun Shen @ 2018
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
 #include "util.h"
 #include "HydroinfoMUSIC.h"
+
+void HydroinfoMUSIC::dump_ideal_lattice_if_requested() const {
+    const char* path = getenv("MUSIC_PACK_DUMP");
+    if (path == nullptr || path[0] == '\0') return;
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[MUSIC-PACK-DUMP] could not open %s for writing\n", path);
+        return;
+    }
+    const int64_t n = static_cast<int64_t>(lattice_ideal.size());
+    fwrite(&n, sizeof(int64_t), 1, f);
+    static_assert(sizeof(fluidCell_ideal) == 8 * sizeof(float),
+                  "fluidCell_ideal must be 8 contiguous floats for the dump");
+    if (n > 0)
+        fwrite(lattice_ideal.data(), sizeof(fluidCell_ideal),
+               lattice_ideal.size(), f);
+    fclose(f);
+    fprintf(stderr, "[MUSIC-PACK-DUMP] wrote %lld cells (%lld floats) to %s\n",
+            static_cast<long long>(n), static_cast<long long>(n) * 8, path);
+}
 
 HydroinfoMUSIC::HydroinfoMUSIC() {
     hydroTauMax = 0.0;
