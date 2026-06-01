@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <cmath>
 #include <string>
@@ -678,7 +679,7 @@ int Evolve::FindFreezeOutSurface_Cornelius(double tau,
             i_freezesurf++) {
         const double epsFO = epsFO_list[i_freezesurf]/hbarc;   // 1/fm^4
 
-        //#pragma omp parallel for reduction(+:intersections)
+        #pragma omp parallel for reduction(+:intersections)
         for (int ieta = 0; ieta < (neta-fac_eta); ieta += fac_eta) {
             int thread_id = omp_get_thread_num();
             intersections += FindFreezeOutSurface_Cornelius_XY(
@@ -798,14 +799,13 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                 || !std::isfinite(arena_freezeout.e_[Idx101])
                 || !std::isfinite(arena_freezeout.e_[Idx011])
                 || !std::isfinite(arena_freezeout.e_[Idx111])) {
-                static bool warned_nonfinite = false;
-                if (!warned_nonfinite) {
+                static std::atomic<bool> warned_nonfinite{false};
+                if (!warned_nonfinite.exchange(true)) {
                     music_message << "[freeze-out] skipping cell with non-finite "
                                      "energy density (likely fp32 GPU instability "
                                      "at the dilute edge); compare with "
                                      "MUSIC_FORCE_CPU=1.";
                     music_message.flush("warning");
-                    warned_nonfinite = true;
                 }
                 continue;
             }
