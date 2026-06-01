@@ -350,16 +350,21 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         // determine freeze-out surface
         int frozen = 0;
         if (freezeout_flag == 1) {
-#ifdef MUSIC_USE_GPU
-            // Freezeout always reads the full arenas — sync once before
-            // any of the freezeout entry points.
-            advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
             if (freezeout_lowtemp_flag == 1 && it == iFreezeStart) {
+#ifdef MUSIC_USE_GPU
+                // Equal-tau surface only reads the current arena.
+                advance.sync_curr_from_gpu_readonly(*fpCurr);
+#endif
                 frozen = FreezeOut_equal_tau_Surface(tau, *fpCurr);
             }
             // avoid freeze-out at the first time step
             if ((it - iFreezeStart)%facTau == 0 && it > iFreezeStart) {
+#ifdef MUSIC_USE_GPU
+                // Sync the host arenas only on the steps where the surface
+                // is actually evaluated (every facTau steps), not every step.
+                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+#endif
+                bench::Timer _bt_fo("evolve.freezeout_surface");
                 if (!DATA.boost_invariant) {
                     frozen = FindFreezeOutSurface_Cornelius(
                                 tau, *fpPrev, *fpCurr,
@@ -606,14 +611,21 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         //determine freeze-out surface
         int frozen = 0;
         if (freezeout_flag == 1) {
-#ifdef MUSIC_USE_GPU
-            advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
             if (freezeout_lowtemp_flag == 1 && tauIdx == iFreezeStart) {
+#ifdef MUSIC_USE_GPU
+                // Equal-tau surface only reads the current arena.
+                advance.sync_curr_from_gpu_readonly(*fpCurr);
+#endif
                 frozen = FreezeOut_equal_tau_Surface(tau, *fpCurr);
             }
             // avoid freeze-out at the first time step
             if ((tauIdx - iFreezeStart) % DATA.facTau == 0 && tauIdx > iFreezeStart) {
+#ifdef MUSIC_USE_GPU
+                // Sync the host arenas only on the steps where the surface
+                // is actually evaluated (every facTau steps), not every step.
+                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+#endif
+                bench::Timer _bt_fo("evolve.freezeout_surface");
                 if (!DATA.boost_invariant) {
                     frozen = FindFreezeOutSurface_Cornelius(
                                 tau, *fpPrev, *fpCurr,
