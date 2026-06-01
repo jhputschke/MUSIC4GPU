@@ -145,6 +145,11 @@ class Advance {
     // No-op if GPU residency is not active.
     void reduce_max_gpu(double& eps_max, double& rhob_max);
 
+    // GPU conservation-law reduction: fills gpu_grid_.conservation_sums[5]
+    // = { T_tau_t, T_tau_x, T_tau_y, T_tau_z, N_B } (unscaled integrands).
+    // Returns false if the GPU path is not active (caller should fall back).
+    bool reduce_conservation_gpu(double* sums_out5) const;
+
     // Bring snap_curr/snap_prev back into the host arenas if the GPU has
     // been authoritative across the timestep boundary.  Multiple flavours
     // for different consumers' needs:

@@ -134,6 +134,10 @@ class Cell_info {
     void check_conservation_law(Fields &arena, Fields &arena_prev,
                                 const double tau);
 
+    //! GPU path: output conservation-law results from pre-integrated sums.
+    //! sums[5] = { T_tau_t, T_tau_x, T_tau_y, T_tau_z, N_B } (unscaled).
+    void check_conservation_law_from_gpu(const double* sums, double tau);
+
     //! This function outputs the evolution of hydrodynamic variables at a
     //! give fluid cell
     void monitor_a_fluid_cell(Fields &arena_curr, Fields &arena_prev,

@@ -56,6 +56,17 @@ public:
     // call).  Launches on the compute stream and synchronizes before returning.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // GPU conservation-law sums: integrate T^{tau,mu} and N_B over snap_curr
+    // using snap_prev for the viscous contributions, avoiding a full arena D2H.
+    // Results land in gpu.conservation_sums[5] = {T_tt, T_tx, T_ty, T_tz, N_B}
+    // (managed memory).  Synchronizes before returning.
+    // coord_type: 0 = Milne tau-eta coordinates, else Cartesian.
+    // Returns false on coherent-memory hardware (GB10/NVLink-C2C) where the
+    // full arena is already CPU-accessible after a stream sync — no PCIe
+    // transfer to avoid, so falling back to the CPU loop is preferred.
+    bool reduce_conservation(GPUGrid& gpu, const MUSICGridParams& params,
+                             int coord_type);
+
     // Phase 4 (dual-stream): prefetch the freshly-packed snap_curr / snap_prev
     // SoA buffers to the device on a dedicated copy stream, then gate the
     // compute stream on completion via an event.  On a discrete GPU this moves

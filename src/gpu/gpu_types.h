@@ -24,6 +24,7 @@ struct MUSICGridParams {
     float delta_x;
     float delta_y;
     float delta_eta;
+    float eta_size;          // total rapidity range (DATA.eta_size)
     float delta_tau;
     float tau;            // current tau (rk-corrected) = tau_orig + rk_flag*delta_tau
     int   boost_invariant;

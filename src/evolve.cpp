@@ -226,13 +226,18 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             // (cheap on small grids but full-arena on 3D, where it can
             // cost ~10 % of step time at 64x64x32).
             if (!DATA.boost_invariant && it % Nskip_diag == 0) {
-#ifdef MUSIC_USE_GPU
-                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
-                {
                 bench::Timer _bt_cons("evolve.check_conservation_law");
-                grid_info.check_conservation_law(*fpCurr, *fpPrev, tau);
+#ifdef MUSIC_USE_GPU
+                double gpu_sums[5];
+                if (advance.reduce_conservation_gpu(gpu_sums)) {
+                    grid_info.check_conservation_law_from_gpu(gpu_sums, tau);
+                } else {
+                    advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+                    grid_info.check_conservation_law(*fpCurr, *fpPrev, tau);
                 }
+#else
+                grid_info.check_conservation_law(*fpCurr, *fpPrev, tau);
+#endif
             }
             if (!DATA.boost_invariant && DATA.output_vorticity == 1) {
                 if (   std::abs(tau -  1.0) < 1e-8

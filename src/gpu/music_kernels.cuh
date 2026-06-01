@@ -115,3 +115,19 @@ __global__ void gpu_reduce_max_eps_rhob(
     int Ncells,
     float* out_eps,
     float* out_rhob);
+
+// Reduce conservation-law sums from snap_curr + snap_prev.
+// out[5] = { T_tau_t, T_tau_x, T_tau_y, T_tau_z, N_B }; must be pre-zeroed.
+__global__ void gpu_reduce_conservation(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ rhob,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ u_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ eos_P,
+    const GPUEosParams eos_params,
+    int Nx, int Ny, int Neta, int Ncells,
+    float delta_eta, float eta_size,
+    int coord_type,
+    double* __restrict__ out);

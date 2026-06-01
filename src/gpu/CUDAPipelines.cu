@@ -245,6 +245,42 @@ void CUDAPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max) 
     rhob_max = static_cast<double>(*gpu.reduce_rhob_out);
 }
 
+// ── reduce_conservation ──────────────────────────────────────────────────────
+
+bool CUDAPipelines::reduce_conservation(GPUGrid& gpu,
+                                        const MUSICGridParams& params,
+                                        int coord_type) {
+    // On coherent-memory hardware the arena is already CPU-accessible after a
+    // stream sync; running an extra GPU kernel buys nothing — fall back.
+    if (!ready_ || !gpu.conservation_sums || coherent_memory_) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+
+    // Zero the output before the kernel writes atomicAdds into it.
+    cudaMemsetAsync(gpu.conservation_sums, 0, 5 * sizeof(double), stream);
+
+    constexpr int block = 128;
+    const int grid = std::min((gpu.Ncells() + block - 1) / block, 1024);
+    const size_t smem = static_cast<size_t>(block) * 5 * sizeof(double);
+
+    gpu_reduce_conservation<<<grid, block, smem, stream>>>(
+        gpu.snap_curr.epsilon,
+        gpu.snap_curr.rhob,
+        gpu.snap_curr.u,
+        gpu.snap_prev.Wmunu,
+        gpu.snap_prev.u,
+        gpu.snap_prev.pi_b,
+        gpu.eos_P,
+        gpu.eos_params,
+        gpu.Nx(), gpu.Ny(), gpu.Neta(), gpu.Ncells(),
+        params.delta_eta, params.eta_size,
+        coord_type,
+        gpu.conservation_sums);
+    check_launch("gpu_reduce_conservation");
+
+    cudaStreamSynchronize(stream);
+    return true;
+}
+
 // ── dispatch_w_source ─────────────────────────────────────────────────────────
 
 void CUDAPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& params) {

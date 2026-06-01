@@ -107,6 +107,7 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     p.delta_x   = static_cast<float>(DATA.delta_x);
     p.delta_y   = static_cast<float>(DATA.delta_y);
     p.delta_eta = static_cast<float>(DATA.delta_eta);
+    p.eta_size  = static_cast<float>(DATA.eta_size);
     p.delta_tau = static_cast<float>(DATA.delta_tau);
     p.tau       = static_cast<float>(tau_rk);
     p.boost_invariant = DATA.boost_invariant ? 1 : 0;
@@ -208,6 +209,18 @@ void Advance::rotate_snapshots_gpu() {
 void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
     if (!gpu_owns_state_ || !gpu_ready_) { eps_max = rhob_max = 0.0; return; }
     GPUPipelines::instance().reduce_max(gpu_grid_, eps_max, rhob_max);
+}
+
+bool Advance::reduce_conservation_gpu(double* sums_out5) const {
+    if (!gpu_owns_state_ || !gpu_ready_ || !gpu_grid_.conservation_sums)
+        return false;
+    MUSICGridParams p;
+    make_gpu_params(0.0, 0, p);  // tau/rk_flag not used by the conservation kernel
+    const int coord_type = DATA.CoorType;
+    GPUPipelines::instance().reduce_conservation(
+        const_cast<GPUGrid&>(gpu_grid_), p, coord_type);
+    for (int k = 0; k < 5; ++k) sums_out5[k] = gpu_grid_.conservation_sums[k];
+    return true;
 }
 
 // ── Feature support predicate ────────────────────────────────────────────────

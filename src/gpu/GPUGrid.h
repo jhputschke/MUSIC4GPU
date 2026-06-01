@@ -158,6 +158,10 @@ public:
     void*  cub_reduce_temp       = nullptr;
     size_t cub_reduce_temp_bytes = 0;
 
+    // Output buffer for gpu_reduce_conservation: 5 doubles in managed memory.
+    // Layout: { T_tau_t, T_tau_x, T_tau_y, T_tau_z, N_B }
+    double* conservation_sums = nullptr;
+
     // Input buffer: qi_source[5 * Ncells] populated by the CPU when
     // flag_add_hydro_source is true.  Layout matches qi_out:
     //   qi_source[alpha * Ncells + cell] = tau_rk * j^alpha(τ, x, u_cell)

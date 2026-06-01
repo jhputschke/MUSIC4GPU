@@ -1208,9 +1208,47 @@ void Cell_info::check_conservation_law(Fields &arena, Fields &arena_prev,
                   << ", net strangeness N_S = " << N_S;
     music_message.flush("info");
     output_file << scientific << setprecision(6)
-                << tau << "  " << T_tau_t << "  " << T_tau_x << "  " 
+                << tau << "  " << T_tau_t << "  " << T_tau_x << "  "
                 << T_tau_y << "  " << T_tau_z << "  " << N_B << "  "
                 << N_Q << "  " << N_S << std::endl;
+    output_file.close();
+}
+
+void Cell_info::check_conservation_law_from_gpu(const double* sums,
+                                                double tau) {
+    double factor = DATA.delta_x * DATA.delta_y * DATA.delta_eta;
+    if (DATA.CoorType == 0) factor *= tau;
+    const double T_tau_t = sums[0] * factor * Util::hbarc;
+    const double T_tau_x = sums[1] * factor * Util::hbarc;
+    const double T_tau_y = sums[2] * factor * Util::hbarc;
+    const double T_tau_z = sums[3] * factor * Util::hbarc;
+    const double N_B     = sums[4] * factor;
+
+    music_message << "total energy T^{taut} = " << T_tau_t << " GeV";
+    music_message.flush("info");
+    music_message << "net longitudinal momentum Pz = " << T_tau_z << " GeV";
+    music_message.flush("info");
+    music_message << "net baryon number N_B = " << N_B;
+    if (N_B > 0. || N_B < 500.) {
+        music_message.flush("info");
+    } else {
+        music_message.flush("error");
+        exit(1);
+    }
+
+    std::string filename = "global_conservation_laws.dat";
+    ofstream output_file;
+    if (std::abs(tau - DATA.tau0) < 1e-10) {
+        output_file.open(filename.c_str(), std::ofstream::out);
+        output_file << "# tau(fm)  E(GeV)  Px(GeV)  Py(GeV)  Pz(GeV)  N_B "
+                    << std::endl;
+    } else {
+        output_file.open(filename.c_str(), std::fstream::out | std::fstream::app);
+    }
+    output_file << scientific << setprecision(6)
+                << tau << "  " << T_tau_t << "  " << T_tau_x << "  "
+                << T_tau_y << "  " << T_tau_z << "  " << N_B << "  "
+                << 0.0 << "  " << 0.0 << std::endl;
     output_file.close();
 }
 

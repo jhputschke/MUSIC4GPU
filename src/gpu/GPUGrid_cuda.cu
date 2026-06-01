@@ -154,10 +154,18 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
     if (cub_reduce_temp_bytes > 0)
         cudaMalloc(&cub_reduce_temp, cub_reduce_temp_bytes);
 
+    // 5 doubles for conservation-law sums (managed so CPU can read after sync).
+    {
+        void* p = nullptr;
+        cudaMallocManaged(&p, 5 * sizeof(double));
+        conservation_sums = static_cast<double*>(p);
+    }
+
     ok = ok && dwmn && qi_out && uwrhs_out && uprhs_out && qi_source_buf
             && theta_buf && a_buf && sigma_buf
             && reduce_eps_out && reduce_rhob_out
-            && (cub_reduce_temp_bytes == 0 || cub_reduce_temp != nullptr);
+            && (cub_reduce_temp_bytes == 0 || cub_reduce_temp != nullptr)
+            && conservation_sums != nullptr;
 
     allocated_ = ok;
     return ok;
@@ -243,6 +251,7 @@ void GPUGrid::release() {
     reduce_rhob_out = nullptr;
     if (cub_reduce_temp) { cudaFree(cub_reduce_temp); cub_reduce_temp = nullptr; }
     cub_reduce_temp_bytes = 0;
+    if (conservation_sums) { cudaFree(conservation_sums); conservation_sums = nullptr; }
 }
 
 // ── AoS → SoA (double → float) ───────────────────────────────────────────────

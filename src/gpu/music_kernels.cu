@@ -1907,3 +1907,94 @@ __global__ void gpu_reduce_max_eps_rhob(
         atomicMax(reinterpret_cast<int*>(out_rhob), __float_as_int(s_rhob[0]));
     }
 }
+
+// ── gpu_reduce_conservation ───────────────────────────────────────────────────
+// Computes the 5 integrated conservation-law sums needed by
+// check_conservation_law(), avoiding the full arena D2H on discrete GPUs.
+//
+// Output layout: out[5] = { T_tau_t, T_tau_x, T_tau_y, T_tau_z, N_B }
+// (N_Q and N_S are zero in the GPU path which excludes rhoq/rhos charges.)
+//
+// Uses double atomicAdd for accuracy; sm_60+ guarantees hardware support.
+//
+__global__ void gpu_reduce_conservation(
+    const float* __restrict__ epsilon,    // snap_curr [Ncells]
+    const float* __restrict__ rhob,       // snap_curr [Ncells]
+    const float* __restrict__ u_curr,     // snap_curr [4*Ncells]
+    const float* __restrict__ Wmunu_prev, // snap_prev [14*Ncells]
+    const float* __restrict__ u_prev,     // snap_prev [4*Ncells]
+    const float* __restrict__ pi_b_prev,  // snap_prev [Ncells]
+    const float* __restrict__ eos_P,
+    const GPUEosParams eos_params,
+    int Nx, int Ny, int Neta, int Ncells,
+    float delta_eta, float eta_size,
+    int coord_type,                        // 0 = Milne τ-η, else Cartesian
+    double* __restrict__ out)              // [5] zero-initialised by caller
+{
+    constexpr int NSUMS = 5;
+    extern __shared__ double smem_cons[];  // [blockDim.x * NSUMS]
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int stride = static_cast<int>(blockDim.x * gridDim.x);
+    int       idx    = static_cast<int>(blockIdx.x * blockDim.x) + tid;
+
+    double loc[NSUMS] = {0.0, 0.0, 0.0, 0.0, 0.0};
+
+    for (; idx < Ncells; idx += stride) {
+        const int iz = idx / (Nx * Ny);
+
+        const float e   = __ldg(&epsilon[idx]);
+        const float rho = __ldg(&rhob[idx]);
+        const float u0  = __ldg(&u_curr[0*Ncells+idx]);
+        const float u1  = __ldg(&u_curr[1*Ncells+idx]);
+        const float u2  = __ldg(&u_curr[2*Ncells+idx]);
+        const float u3  = __ldg(&u_curr[3*Ncells+idx]);
+        const float up0 = __ldg(&u_prev[0*Ncells+idx]);
+        const float up1 = __ldg(&u_prev[1*Ncells+idx]);
+        const float up2 = __ldg(&u_prev[2*Ncells+idx]);
+        const float up3 = __ldg(&u_prev[3*Ncells+idx]);
+        const float W00 = __ldg(&Wmunu_prev[ 0*Ncells+idx]);
+        const float W01 = __ldg(&Wmunu_prev[ 1*Ncells+idx]);
+        const float W02 = __ldg(&Wmunu_prev[ 2*Ncells+idx]);
+        const float W03 = __ldg(&Wmunu_prev[ 3*Ncells+idx]);
+        const float W10 = __ldg(&Wmunu_prev[10*Ncells+idx]);  // baryon q^τ
+        const float pib = __ldg(&pi_b_prev[idx]);
+
+        const float P        = gpu_P(e, eos_P, eos_params);
+        const float enthalpy = e + P;
+
+        const float T_tt  = enthalpy*u0*u0 - P + W00 + pib*(up0*up0 - 1.f);
+        const float T_tx  = enthalpy*u0*u1 + W01 + pib*up0*up1;
+        const float T_ty  = enthalpy*u0*u2 + W02 + pib*up0*up2;
+        const float T_teta= enthalpy*u0*u3 + W03 + pib*up0*up3;
+        const float N_B   = rho*u0 + W10;
+
+        float cosh_eta = 1.f, sinh_eta = 0.f;
+        if (coord_type == 0) {
+            const float eta_s = delta_eta*(float)iz - eta_size*0.5f;
+            cosh_eta = coshf(eta_s);
+            sinh_eta = sinhf(eta_s);
+        }
+
+        loc[0] += static_cast<double>(T_tt*cosh_eta + T_teta*sinh_eta);
+        loc[1] += static_cast<double>(T_tx);
+        loc[2] += static_cast<double>(T_ty);
+        loc[3] += static_cast<double>(T_tt*sinh_eta + T_teta*cosh_eta);
+        loc[4] += static_cast<double>(N_B);
+    }
+
+    for (int k = 0; k < NSUMS; ++k)
+        smem_cons[tid*NSUMS + k] = loc[k];
+    __syncthreads();
+
+    for (int s = static_cast<int>(blockDim.x) >> 1; s > 0; s >>= 1) {
+        if (tid < s)
+            for (int k = 0; k < NSUMS; ++k)
+                smem_cons[tid*NSUMS+k] += smem_cons[(tid+s)*NSUMS+k];
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        for (int k = 0; k < NSUMS; ++k)
+            atomicAdd(&out[k], smem_cons[k]);
+}
