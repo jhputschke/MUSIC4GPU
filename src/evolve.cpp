@@ -328,16 +328,18 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         // determine freeze-out surface
         int frozen = 0;
         if (freezeout_flag == 1) {
-#ifdef MUSIC_USE_GPU
-            // Freezeout always reads the full arenas — sync once before
-            // any of the freezeout entry points.
-            advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
             if (freezeout_lowtemp_flag == 1 && it == iFreezeStart) {
+#ifdef MUSIC_USE_GPU
+                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+#endif
                 frozen = FreezeOut_equal_tau_Surface(tau, *fpCurr);
             }
             // avoid freeze-out at the first time step
             if ((it - iFreezeStart)%facTau == 0 && it > iFreezeStart) {
+#ifdef MUSIC_USE_GPU
+                // Sync only when Cornelius actually runs — not every step.
+                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+#endif
                 if (!DATA.boost_invariant) {
                     frozen = FindFreezeOutSurface_Cornelius(
                                 tau, *fpPrev, *fpCurr,
