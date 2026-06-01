@@ -79,10 +79,17 @@ static bool gpu_no_pack() {
 extern "C" void kmp_set_blocktime(int) __attribute__((weak));
 
 namespace {
+// True if OMP_WAIT_POLICY was already present in the environment at process
+// load (i.e. the user exported it).  Captured before our setenv default so the
+// init-time diagnostic can tell a user-supplied policy — which every runtime
+// honors — apart from our own default, which libgomp ignores (see below).
+bool g_user_set_wait_policy = false;
+
 __attribute__((constructor))
 void music_gpu_set_omp_defaults() {
     const char* off = getenv("MUSIC_OMP_DEFAULTS");
     if (off != nullptr && off[0] == '0') return;     // explicit opt-out
+    g_user_set_wait_policy = (getenv("OMP_WAIT_POLICY") != nullptr);
     setenv("OMP_WAIT_POLICY", "passive", 0);         // default only; user wins
     if (kmp_set_blocktime) kmp_set_blocktime(0);     // libomp; no-op on libgomp
 }
@@ -93,24 +100,52 @@ void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
 
-    // Surface the effective OpenMP wait policy (GPU builds default it to passive
-    // — see the load constructor above) ahead of the backend's [MUSIC-GPU]
-    // device lines, so the active/passive choice and thread count are visible.
+    // Surface the *effective* OpenMP wait policy ahead of the backend's
+    // [MUSIC-GPU] device lines, so the active/passive choice and thread count
+    // are visible.  Be honest about whether the passive default is actually in
+    // force, which depends on the OpenMP runtime:
+    //   - LLVM/Intel libomp: kmp_set_blocktime(0) (the load constructor above)
+    //     puts idle threads to sleep at runtime, so passive is genuinely in
+    //     effect irrespective of env timing.
+    //   - GCC libgomp: kmp_set_blocktime is absent (weak symbol unresolved) and
+    //     libgomp parses OMP_WAIT_POLICY in its OWN load-time constructor, which
+    //     runs before ours — so our setenv default lands too late and has no
+    //     effect.  getenv() below still reports "passive" (we did set it), but
+    //     idle threads keep busy-spinning unless the user exported the policy
+    //     into the environment *before* launch, which libgomp reads at load.
     {
         const char* wp = getenv("OMP_WAIT_POLICY");
         const char* od = getenv("MUSIC_OMP_DEFAULTS");
         const bool defaults_off = (od != nullptr && od[0] == '0');
+        const bool have_runtime_setter = (kmp_set_blocktime != nullptr);
 #ifdef _OPENMP
         const int nthreads = omp_get_max_threads();
 #else
         const int nthreads = 1;
 #endif
-        fprintf(stderr, "[MUSIC-GPU] OMP wait policy: %s (max threads %d) — %s\n",
-                wp ? wp : "runtime-default", nthreads,
-                defaults_off
-                    ? "music4gpu OMP defaults disabled (MUSIC_OMP_DEFAULTS=0)"
-                    : "music4gpu default=passive; override via OMP_WAIT_POLICY "
-                      "or MUSIC_OMP_DEFAULTS=0");
+        fprintf(stderr, "[MUSIC-GPU] OMP wait policy: %s (max threads %d)\n",
+                wp ? wp : "runtime-default", nthreads);
+        if (defaults_off) {
+            fprintf(stderr, "[MUSIC-GPU]   music4gpu OMP defaults disabled "
+                            "(MUSIC_OMP_DEFAULTS=0)\n");
+        } else if (have_runtime_setter || g_user_set_wait_policy) {
+            // libomp applied blocktime=0, or the user exported the policy and
+            // every runtime (libgomp included) honored it at load.
+            fprintf(stderr, "[MUSIC-GPU]   in effect (%s)\n",
+                    g_user_set_wait_policy
+                        ? "set in environment before launch"
+                        : "kmp_set_blocktime(0), libomp runtime");
+        } else {
+            // libgomp build with no user-supplied policy: our default was too
+            // late, so idle threads still busy-spin.
+            fprintf(stderr,
+                    "[MUSIC-GPU]   WARNING: NOT in effect — this is a GCC/libgomp "
+                    "build, which reads OMP_WAIT_POLICY before the music4gpu "
+                    "default is set and has no runtime setter.\n"
+                    "[MUSIC-GPU]            Idle worker threads will busy-spin and "
+                    "inflate CPU time. To fix, 'export OMP_WAIT_POLICY=passive' "
+                    "(or GOMP_SPINCOUNT=0) BEFORE launching.\n");
+        }
     }
 
     auto& mp = GPUPipelines::instance();
