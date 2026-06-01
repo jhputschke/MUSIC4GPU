@@ -56,6 +56,16 @@ public:
     // call).  Launches on the compute stream and synchronizes before returning.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // Phase 2b: launch gpu_pack_evolution_ideal over the down-sampled grid into
+    // a pipeline-owned managed scratch buffer, synchronize, and copy the packed
+    // records into host_out (8 floats per cell, fluidCell_ideal layout).  The
+    // scratch buffer lives here, NOT on GPUGrid, so the GPUGrid object embedded
+    // in Advance/Evolve keeps its original size and layout.  Returns false
+    // (no-op) if the pipeline isn't ready, so the caller falls back to the host
+    // output path.
+    bool pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
+                              float* host_out);
+
     // Phase 4 (dual-stream): prefetch the freshly-packed snap_curr / snap_prev
     // SoA buffers to the device on a dedicated copy stream, then gate the
     // compute stream on completion via an event.  On a discrete GPU this moves
@@ -83,6 +93,9 @@ private:
     // discrete transfer to overlap, so the dual-stream prefetch+gate is skipped
     // (it would only add migration latency).  Kept active on discrete GPUs.
     bool  coherent_memory_ = false;
+    // Phase 2b: the packed-evolution scratch buffer now lives on GPUGrid
+    // (gpu.evo_pack_out / gpu.evo_pack_floats), tying its lifetime to the grid
+    // and freeing it in GPUGrid::release().
     // Occupancy-tuned upper bound on threads per block (Phase 2).  The 3-D
     // block is factored from this at dispatch time, adapting to Neta so 2-D
     // (Neta==1) grids don't waste the eta thread dimension.

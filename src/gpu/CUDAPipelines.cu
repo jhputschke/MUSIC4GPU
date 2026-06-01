@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "CUDAPipelines.h"
 #include "GPUGrid.h"
 #include "gpu_types.h"
@@ -246,6 +247,45 @@ void CUDAPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max) 
     cudaStreamSynchronize(stream);
     eps_max  = static_cast<double>(*gpu.reduce_eps_out);
     rhob_max = static_cast<double>(*gpu.reduce_rhob_out);
+}
+
+// ── pack_evolution_ideal ──────────────────────────────────────────────────────
+
+bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
+                                         float* host_out) {
+    if (!ready_ || !host_out) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+
+    const int n_out = pp.nx_out * pp.ny_out * pp.neta_out;
+    if (n_out <= 0) return false;
+    const size_t need = static_cast<size_t>(n_out) * 8;   // 8 floats per cell
+
+    // Lazily (re)allocate the managed scratch buffer to fit.  The buffer lives
+    // on GPUGrid (Phase 2b) so its lifetime is tied to the grid; it is freed in
+    // GPUGrid::release().
+    if (gpu.evo_pack_floats < need) {
+        if (gpu.evo_pack_out) cudaFree(gpu.evo_pack_out);
+        gpu.evo_pack_out    = nullptr;
+        gpu.evo_pack_floats = 0;
+        if (cudaMallocManaged(&gpu.evo_pack_out, need * sizeof(float))
+                != cudaSuccess || !gpu.evo_pack_out) {
+            gpu.evo_pack_out = nullptr;
+            return false;
+        }
+        gpu.evo_pack_floats = need;
+    }
+
+    const int block = 256;
+    const int grid  = (n_out + block - 1) / block;
+    gpu_pack_evolution_ideal<<<grid, block, 0, stream>>>(
+        gpu.snap_curr.epsilon, gpu.snap_curr.u,
+        gpu.eos_P, gpu.eos_s, gpu.eos_T,
+        gpu.evo_pack_out, gpu.eos_params, pp);
+    check_launch("gpu_pack_evolution_ideal");
+
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+    std::memcpy(host_out, gpu.evo_pack_out, need * sizeof(float));
+    return true;
 }
 
 // ── dispatch_w_source ─────────────────────────────────────────────────────────

@@ -1,7 +1,31 @@
 // Copyright Chun Shen @ 2018
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
 #include "util.h"
 #include "HydroinfoMUSIC.h"
+
+void HydroinfoMUSIC::dump_ideal_lattice_if_requested() const {
+    const char* path = getenv("MUSIC_PACK_DUMP");
+    if (path == nullptr || path[0] == '\0') return;
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[MUSIC-PACK-DUMP] could not open %s for writing\n", path);
+        return;
+    }
+    const int64_t n = static_cast<int64_t>(lattice_ideal.size());
+    fwrite(&n, sizeof(int64_t), 1, f);
+    static_assert(sizeof(fluidCell_ideal) == 8 * sizeof(float),
+                  "fluidCell_ideal must be 8 contiguous floats for the dump");
+    if (n > 0)
+        fwrite(lattice_ideal.data(), sizeof(fluidCell_ideal),
+               lattice_ideal.size(), f);
+    fclose(f);
+    fprintf(stderr, "[MUSIC-PACK-DUMP] wrote %lld cells (%lld floats) to %s\n",
+            static_cast<long long>(n), static_cast<long long>(n) * 8, path);
+}
 
 HydroinfoMUSIC::HydroinfoMUSIC() {
     hydroTauMax = 0.0;
@@ -352,6 +376,19 @@ void HydroinfoMUSIC::set_grid_infomatioin(const InitData &DATA) {
                                 /DATA.output_evolution_every_N_y) + 1);
     ietamax = (static_cast<int>((DATA.neta - 1)
                                 /DATA.output_evolution_every_N_eta) + 1);
+
+    // Pre-size the in-memory lattice so the per-frame appends don't trigger
+    // O(N) reallocation across the run.  cells-per-frame is exact; the frame
+    // count is an estimate (beastMode == 2 can change the output cadence
+    // mid-run) and reserve is only a capacity hint, so an over/under-estimate
+    // is harmless.
+    int n_skip_tau = DATA.output_evolution_every_N_timesteps;
+    if (n_skip_tau < 1) n_skip_tau = 1;
+    const size_t cells_per_frame =
+        static_cast<size_t>(ixmax)*iymax*ietamax;
+    const size_t est_frames =
+        static_cast<size_t>(DATA.nt/n_skip_tau) + 2;
+    lattice_ideal.reserve(cells_per_frame*est_frames);
 }
 
 void HydroinfoMUSIC::print_grid_information() {
@@ -387,4 +424,17 @@ void HydroinfoMUSIC::dump_ideal_info_to_memory(double tau, float eta,
     new_cell.uy = uy;
     new_cell.ueta = ueta;
     lattice_ideal.push_back(new_cell);
+}
+
+void HydroinfoMUSIC::dump_ideal_info_frame_to_memory(
+        double tau, const std::vector<fluidCell_ideal> &frame) {
+    // All cells in a frame share tau, so the tau bookkeeping that
+    // dump_ideal_info_to_memory did per-cell is done once here.  The frame is
+    // pre-ordered (ix outer, iy middle, ieta inner) to match the former
+    // push_back sequence, so the appended lattice is byte-identical.
+    if (tau > hydroTauMax) {
+        hydroTauMax = tau;
+        itaumax++;
+    }
+    lattice_ideal.insert(lattice_ideal.end(), frame.begin(), frame.end());
 }

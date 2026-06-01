@@ -435,6 +435,18 @@ void Polygon::init(int c)
  */
 bool Polygon::add_line(Line *l, int donotcheck)
 {
+  // Bounds guard: lines[] is a fixed MAX_LINES heap array; without this an
+  // edge-case cube yielding > MAX_LINES lines writes a pointer/double out of
+  // bounds (latent heap corruption). See OOB_Bug.md.
+  if ( Nlines >= MAX_LINES ) {
+    static bool warned = false;
+    if ( !warned ) {
+      fprintf(stderr, "[cornelius] WARNING: Polygon::add_line reached MAX_LINES=%d; "
+              "dropping extra line(s). (Previously an unchecked out-of-bounds write.)\n", MAX_LINES);
+      warned = true;
+    }
+    return false;
+  }
   double eps = 1e-10;
   //If this is the first line or we do not want to check, line is added
   //automatically
@@ -742,6 +754,18 @@ void Polyhedron::init()
  */
 bool Polyhedron::add_polygon(Polygon *p, int donocheck)
 {
+  // Bounds guard: polygons[] is a fixed MAX_POLYGONS heap array; without this an
+  // edge-case yielding > MAX_POLYGONS polygons writes out of bounds (latent heap
+  // corruption). See OOB_Bug.md.
+  if ( Npolygons >= MAX_POLYGONS ) {
+    static bool warned = false;
+    if ( !warned ) {
+      fprintf(stderr, "[cornelius] WARNING: Polyhedron::add_polygon reached MAX_POLYGONS=%d; "
+              "dropping extra polygon(s). (Previously an unchecked out-of-bounds write.)\n", MAX_POLYGONS);
+      warned = true;
+    }
+    return false;
+  }
   //If this is the first polygon or we want to add it in any case, we
   //just add it automatically
   if ( donocheck || Npolygons == 0 ) {

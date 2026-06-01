@@ -38,9 +38,80 @@ static bool gpu_force_cpu() {
     return forced;
 }
 
+// Runtime override: MUSIC_GPU_NO_PACK=1 disables the Phase-2b GPU evolution
+// packing kernel so the memory-ideal output falls back to the parallel host
+// loop, while the rest of the GPU evolution is unchanged.  Lets a single GPU
+// build A/B the GPU-table-EOS pack against the host formula-EOS loop on
+// identical fp32 state (validation), and provides a kill-switch.  Cached.
+static bool gpu_no_pack() {
+    static const bool no_pack = []{
+        const char* e = getenv("MUSIC_GPU_NO_PACK");
+        return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return no_pack;
+}
+
+// ── OpenMP runtime defaults for the GPU path ─────────────────────────────────
+#ifdef MUSIC_USE_GPU
+// The GPU path interleaves many short host-side OpenMP regions (AoS<->SoA
+// repacks, per-frame output packing) with GPU-bound waits.  Under the OpenMP
+// default *active* wait policy, idle worker threads busy-spin between regions;
+// on a many-core host (e.g. the 20-core GB10 Grace) that pins nearly every core
+// and inflates CPU time ~18x for zero wall-time benefit (one GB10 run: 106 s CPU
+// / 6 s wall; passive brought it to ~9 s / 5 s).  GPU builds therefore default
+// the OpenMP wait policy to *passive* (idle threads sleep).
+//
+//   - Set as a DEFAULT via setenv(..., overwrite=0): an explicit OMP_WAIT_POLICY
+//     already in the environment still wins.
+//   - Runs as a load constructor, i.e. before the OpenMP runtime reads the env
+//     on its first parallel region (there is no standard runtime setter for the
+//     wait policy once the runtime is up).
+//   - kmp_set_blocktime(0) is the equivalent libomp (LLVM/Intel) runtime knob;
+//     declared weak so this still links on libgomp (GCC), where the symbol is
+//     absent and the call is skipped.
+//   - Opt out of the whole thing with MUSIC_OMP_DEFAULTS=0.
+//
+// Scope: OpenMP has one per-process runtime, so this affects all OpenMP code in
+// the process (3DGlauber, iSS, ...), not only MUSIC.  passive only changes
+// idle-thread behavior, so the cost to other modules is a small per-region
+// thread wake-up — negligible for their coarse-grained loops.  See the X-SCAPE
+// README.md ("OpenMP defaults for GPU builds") and PORT_GPU.md.
+extern "C" void kmp_set_blocktime(int) __attribute__((weak));
+
+namespace {
+__attribute__((constructor))
+void music_gpu_set_omp_defaults() {
+    const char* off = getenv("MUSIC_OMP_DEFAULTS");
+    if (off != nullptr && off[0] == '0') return;     // explicit opt-out
+    setenv("OMP_WAIT_POLICY", "passive", 0);         // default only; user wins
+    if (kmp_set_blocktime) kmp_set_blocktime(0);     // libomp; no-op on libgomp
+}
+}  // namespace
+#endif  // MUSIC_USE_GPU
+
 void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     if (metal_initialized_) return;
     metal_initialized_ = true;
+
+    // Surface the effective OpenMP wait policy (GPU builds default it to passive
+    // — see the load constructor above) ahead of the backend's [MUSIC-GPU]
+    // device lines, so the active/passive choice and thread count are visible.
+    {
+        const char* wp = getenv("OMP_WAIT_POLICY");
+        const char* od = getenv("MUSIC_OMP_DEFAULTS");
+        const bool defaults_off = (od != nullptr && od[0] == '0');
+#ifdef _OPENMP
+        const int nthreads = omp_get_max_threads();
+#else
+        const int nthreads = 1;
+#endif
+        fprintf(stderr, "[MUSIC-GPU] OMP wait policy: %s (max threads %d) — %s\n",
+                wp ? wp : "runtime-default", nthreads,
+                defaults_off
+                    ? "music4gpu OMP defaults disabled (MUSIC_OMP_DEFAULTS=0)"
+                    : "music4gpu default=passive; override via OMP_WAIT_POLICY "
+                      "or MUSIC_OMP_DEFAULTS=0");
+    }
 
     auto& mp = GPUPipelines::instance();
     if (!mp.initialize()) {
@@ -524,6 +595,43 @@ void Advance::sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr) {
     gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_curr, arenaFieldsCurr);
     gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, arenaFieldsCurr);
     host_curr_fresh_ = true;
+}
+
+bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
+    if (!gpu_owns_state_ || !gpu_ready_ || gpu_no_pack()) return false;
+    bench::Timer _bt("advance.output_pack_gpu");
+
+    GPUPackParams pp;
+    pp.Nx     = gpu_grid_.Nx();
+    pp.Ny     = gpu_grid_.Ny();
+    pp.Neta   = gpu_grid_.Neta();
+    pp.Ncells = gpu_grid_.Ncells();
+    int sx = DATA.output_evolution_every_N_x;   if (sx < 1) sx = 1;
+    int sy = DATA.output_evolution_every_N_y;   if (sy < 1) sy = 1;
+    int se = DATA.output_evolution_every_N_eta; if (se < 1) se = 1;
+    pp.skip_x   = sx;
+    pp.skip_y   = sy;
+    pp.skip_eta = se;
+    pp.nx_out   = (pp.Nx   - 1) / sx + 1;
+    pp.ny_out   = (pp.Ny   - 1) / sy + 1;
+    pp.neta_out = (pp.Neta - 1) / se + 1;
+    pp.boost_invariant = DATA.boost_invariant ? 1 : 0;
+    pp.delta_eta = static_cast<float>(DATA.delta_eta);
+    pp.eta_size  = static_cast<float>(DATA.eta_size);
+    pp.hbarc     = static_cast<float>(hbarc);
+
+    // The pipeline writes the packed records straight into `out` (which is laid
+    // out as contiguous fluidCell_ideal == 8 floats per cell), so there is no
+    // per-cell host EOS work.
+    static_assert(sizeof(fluidCell_ideal) == 8 * sizeof(float),
+                  "fluidCell_ideal must be 8 contiguous floats for the pack copy");
+    const size_t n_out =
+        static_cast<size_t>(pp.nx_out) * pp.ny_out * pp.neta_out;
+    out.resize(n_out);
+    if (!GPUPipelines::instance().pack_evolution_ideal(
+            gpu_grid_, pp, reinterpret_cast<float*>(out.data())))
+        return false;
+    return true;
 }
 #endif  // MUSIC_USE_GPU
 

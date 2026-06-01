@@ -76,6 +76,18 @@ public:
     // epsilon/rhob on the host after wait() has ensured the last kernel is done.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // Phase 2b: launch gpu_pack_evolution_ideal over the down-sampled grid into
+    // a pipeline-owned shared scratch buffer, synchronize, and copy the packed
+    // records into host_out (8 floats per cell, fluidCell_ideal layout).
+    // Mirrors CUDAPipelines::pack_evolution_ideal, but the scratch buffer lives
+    // here on the singleton (NOT on GPUGrid) so the GPUGrid object embedded in
+    // Advance/Evolve keeps its byte-identical layout — see OOB_Bug.md.  On
+    // Apple unified memory the buffer is host-readable, so the copy is a plain
+    // memcpy with no D2H transfer.  Returns false (no-op) if the pipeline isn't
+    // ready, so the caller falls back to the host output path.
+    bool pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
+                              float* host_out);
+
     // Block until all pending GPU work is done.
     void wait();
 
@@ -103,6 +115,14 @@ private:
     void*  pso_make_du_   = nullptr;  // id<MTLComputePipelineState>
     void*  pso_w_full_    = nullptr;  // id<MTLComputePipelineState>
     void*  pso_uprhs_     = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_pack_evo_  = nullptr;  // id<MTLComputePipelineState> (Phase 2b)
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
     void*  batch_cb_      = nullptr;  // open batch id<MTLCommandBuffer>, or null
+
+    // Phase 2b: lazily-(re)allocated shared scratch buffer for the GPU-packed
+    // ideal evolution output (8 floats per down-sampled cell).  Owned by the
+    // singleton; freed in the destructor.  evo_pack_floats_ tracks its capacity
+    // in floats so it is only reallocated when a larger frame is needed.
+    void*  evo_pack_buf_    = nullptr;  // id<MTLBuffer>
+    size_t evo_pack_floats_ = 0;
 };

@@ -61,9 +61,17 @@ class HydroinfoMUSIC {
     void dump_ideal_info_to_memory(double tau, float eta, float epsilon,
                                    float pressure, float entropy, float T,
                                    float ux, float uy, float ueta);
+    void dump_ideal_info_frame_to_memory(
+            double tau, const std::vector<fluidCell_ideal> &frame);
 
     int get_number_of_fluid_cells() const {return(lattice_ideal.size());}
     void get_fluid_cell_with_index(const int idx, fluidCell *info) const;
+
+    // Validation hook: when MUSIC_PACK_DUMP=<path> is set, write the raw
+    // lattice_ideal (int64 count, then count*8 floats in struct field order)
+    // to that path.  Used to A/B the GPU pack kernel against the host loop
+    // (set MUSIC_GPU_NO_PACK=1 for the baseline run).  No-op otherwise.
+    void dump_ideal_lattice_if_requested() const;
 };
 
 #endif  // SRC_HYDROINFO_MUSIC_H_

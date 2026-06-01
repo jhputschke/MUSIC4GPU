@@ -39,6 +39,8 @@ MetalPipelines& MetalPipelines::instance() {
 }
 
 MetalPipelines::~MetalPipelines() {
+    if (evo_pack_buf_) { CFRelease(evo_pack_buf_); }
+    if (pso_pack_evo_) { CFRelease(pso_pack_evo_); }
     if (pso_uprhs_)    { CFRelease(pso_uprhs_); }
     if (pso_w_full_)   { CFRelease(pso_w_full_); }
     if (pso_make_du_)  { CFRelease(pso_make_du_); }
@@ -226,6 +228,21 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     }
     pso_uprhs_ = (__bridge_retained void*)pso_up;
 
+    // 11. Build pipeline state for gpu_pack_evolution_ideal (Phase 2b).
+    id<MTLFunction> fn_pk = [lib newFunctionWithName:@"gpu_pack_evolution_ideal"];
+    if (!fn_pk) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_pack_evolution_ideal' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_pk =
+        [dev newComputePipelineStateWithFunction:fn_pk error:&err];
+    if (!pso_pk) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_pack_evolution_ideal failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_pack_evo_ = (__bridge_retained void*)pso_pk;
+
     ready_ = true;
     return true;
 }
@@ -300,6 +317,77 @@ static id<MTLBuffer> buffer_for_ptr(void** handles, int n_handles, const void* p
 // public accessor that the .mm file adds: GPUGrid exposes buf_handles_ and
 // n_handles_ as public for the GPU layer only (Metal-internal detail).
 // We expose them via a pair of accessors added to GPUGrid:
+
+// ── pack_evolution_ideal ──────────────────────────────────────────────────────
+// Phase 2b: pack the ideal-hydro evolution output on the GPU.  Mirrors
+// CUDAPipelines::pack_evolution_ideal.  The scratch buffer lives on this
+// singleton (NOT on GPUGrid) so the embedded GPUGrid layout is untouched.
+// On Apple unified memory the shared buffer is host-readable, so after
+// committing+waiting the kernel the copy into host_out is a plain memcpy.
+//
+// Caller contract (matches reduce_max): all GPU work that produced snap_curr
+// must already be committed; this issues its own command buffer on the same
+// (serial) queue and blocks on it, so prior committed work is complete too.
+
+bool MetalPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
+                                          float* host_out) {
+    if (!ready_ || !pso_pack_evo_ || !host_out) return false;
+
+    const int n_out = pp.nx_out * pp.ny_out * pp.neta_out;
+    if (n_out <= 0) return false;
+    const size_t need = static_cast<size_t>(n_out) * 8;   // 8 floats per cell
+
+    auto dev = (__bridge id<MTLDevice>)device_;
+
+    // Lazily (re)allocate the shared scratch buffer to fit n_out.
+    if (evo_pack_floats_ < need) {
+        if (evo_pack_buf_) { CFRelease(evo_pack_buf_); evo_pack_buf_ = nullptr; }
+        evo_pack_floats_ = 0;
+        id<MTLBuffer> b = [dev newBufferWithLength:need * sizeof(float)
+                                           options:MTLResourceStorageModeShared];
+        if (!b) return false;
+        evo_pack_buf_    = (__bridge_retained void*)b;
+        evo_pack_floats_ = need;
+    }
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)evo_pack_buf_;
+
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    auto get_buf = [&](const float* ptr) -> id<MTLBuffer> {
+        return buffer_for_ptr(handles, n_handles, ptr);
+    };
+
+    auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
+    auto pso = (__bridge id<MTLComputePipelineState>)pso_pack_evo_;
+
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+
+    // Binding order — must match gpu_pack_evolution_ideal in music_kernels.metal.
+    [enc setBuffer:get_buf(gpu.snap_curr.epsilon) offset:0 atIndex:0];
+    [enc setBuffer:get_buf(gpu.snap_curr.u)       offset:0 atIndex:1];
+    [enc setBuffer:get_buf(gpu.eos_P)             offset:0 atIndex:2];
+    [enc setBuffer:get_buf(gpu.eos_s)             offset:0 atIndex:3];
+    [enc setBuffer:get_buf(gpu.eos_T)             offset:0 atIndex:4];
+    [enc setBuffer:out_buf                        offset:0 atIndex:5];
+    [enc setBytes:&gpu.eos_params length:sizeof(gpu.eos_params) atIndex:6];
+    [enc setBytes:&pp             length:sizeof(pp)             atIndex:7];
+
+    // 1-D dispatch: one thread per down-sampled output cell.  threadgroups are
+    // launched whole, so the kernel guards o >= n_out.
+    const NSUInteger tgw = 256;
+    MTLSize tpg = MTLSizeMake(tgw, 1, 1);
+    MTLSize ng  = MTLSizeMake((static_cast<NSUInteger>(n_out) + tgw - 1) / tgw,
+                              1, 1);
+    [enc dispatchThreadgroups:ng threadsPerThreadgroup:tpg];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    std::memcpy(host_out, [out_buf contents], need * sizeof(float));
+    return true;
+}
 
 // ── dispatch_w_source ─────────────────────────────────────────────────────────
 

@@ -308,6 +308,14 @@ intervals → ~1e-7 error, far under the fp32 floor). Changes:
   JETSCAPE may mutate Fields between AdvanceIt calls, which would
   silently invalidate residency.  Every substep currently re-uploads
   at rk0.
+- 2026-06-01 | `gpu/music_kernels.metal`, `gpu/MetalPipelines.{h,mm}` |
+  Ported the Phase 2b GPU evolution-output packing kernel
+  (`gpu_pack_evolution_ideal`) to Metal, replacing the `return false` stub |
+  Last CUDA improvement missing on Metal, and the highest-value one on
+  unified memory.  Scratch buffer kept on the `MetalPipelines` singleton (not
+  `GPUGrid`) to keep `Evolve`'s layout byte-identical and avoid the latent
+  freeze-out OOB.  Validated bit-exact for velocities, ≤~1e-4 for p/s/T — see
+  §9.9.
 
 ## 7. Open questions
 
@@ -805,3 +813,92 @@ copy.  See §8.2 for the post-fix bench.
 
 Lessons learnt: don't quote unmeasured residuals as numbers — use a
 timer or shut up.
+
+### 9.9 Phase 2b GPU evolution-output packing — ported to Metal (2026-06-01)
+
+The `output_evolution_*` memory path was the last CUDA improvement without a
+Metal counterpart.  CUDA had a device kernel (`gpu_pack_evolution_ideal`) that
+packs the ideal-hydro output tuple (`eta, sd, ed, pressure, temperature, ux, uy,
+ueta`) for the down-sampled grid straight on the GPU, eliminating the full-arena
+D2H + SoA→AoS repack + serial host EOS loop.  Metal had only a
+`pack_evolution_ideal(...) { return false; }` stub, so on Apple Silicon — the
+*unified-memory* part where the design notes (`AddGPUImprovements.md`) predict
+the largest win — every output frame fell back to the host loop.  Now ported:
+
+- **Kernel** (`gpu/music_kernels.metal`): `gpu_pack_evolution_ideal`, a
+  line-for-line mirror of the CUDA kernel.  One thread per down-sampled output
+  cell, decoding the flat index in the host push order (ix outer, iy middle,
+  ieta inner) so the appended `lattice_ideal` matches the serial order exactly.
+  EOS reads go through the same `gpu_log_interp` + resident log-spaced tables the
+  Metal evolution already uses — no new upload, no new helper.
+- **Pipeline** (`gpu/MetalPipelines.{h,mm}`): PSO built in `initialize()`
+  (step 11); `pack_evolution_ideal` does a 1-D dispatch → commit →
+  `waitUntilCompleted` → `memcpy`, reusing the `buffer_for_ptr` reverse-lookup
+  for the snapshot/EOS buffers.  Consumed through the shared
+  `Advance::pack_evolution_ideal`, so `evolve.cpp` needs no backend branching.
+- **Buffer placement decision:** the scratch buffer (`evo_pack_buf_`) lives on
+  the `MetalPipelines` singleton, **NOT** on `GPUGrid`.  CUDA moved its buffer
+  onto `GPUGrid` (commit `0e4ba78`) and relied on the Cornelius bounds hardening
+  to survive the resulting `Evolve` layout change (the latent freeze-out OOB,
+  `OOB_Bug.md`).  On Metal the buffer needs an `id<MTLBuffer>` handle anyway, so
+  keeping it on the singleton leaves `GPUGrid` byte-identical and sidesteps that
+  OOB entirely rather than depending on the guard.  On unified memory the shared
+  buffer is host-readable → the readback is a plain `memcpy`, zero D2H.
+
+**Verification (A/B, identical fp32 GPU state).** New env `MUSIC_GPU_NO_PACK=1`
+forces the host output path while leaving the GPU evolution untouched, so a
+pack-on vs pack-off pair shares byte-identical arena state and the diff isolates
+exactly the GPU-table-EOS vs host-formula-EOS gap.  `MUSIC_PACK_DUMP=<path>`
+dumps the raw `lattice_ideal` (int64 count + count×8 floats) for a byte-level
+compare.  `OO_one_event_fastgrid` (EOS 91, beastMode 1, 100×100×60, M3 Max),
+80.4 M cells over 134 frames:
+
+| field | pack vs host |
+|---|---|
+| `ux`/`uy`/`ueta` | **100% bit-exact** (same fp32 `u`) |
+| `ed` | max rel **1.2e-7**, 99.2% bit-exact (float vs double × hbarc) |
+| `pressure`/`entropy`/`temperature` (T>0.1 GeV) | **8.5e-5 / 2.1e-5 / 3.6e-5** max rel — table-vs-formula, resampling-level |
+| `eta` | max abs **4.8e-7** (1-ULP; the all-cell relative blow-up is the divide-by-zero at mid-rapidity) |
+
+These match the CUDA Phase-2b numbers to the digit.  Surface-cell count
+**49697**, identical to the host-loop run; pack fired 133× and with
+`MUSIC_GPU_NO_PACK=1` correctly reverts to `grid.output_evolution_memory`.  See
+`AddGPUImprovements.md` §"As built (Metal)" for the full write-up.
+
+### 9.10 OpenMP wait-policy default for GPU builds (2026-06-01)
+
+Symptom (GB10): a run reported `CPU time: 106 s` against `Real time: 6 s` —
+~18 of the 20 Grace cores pinned — while the M3 Max showed `5.3 s / 4 s`
+(~1 core) for the same work. The coherent path was correctly detected
+(`coherent host memory: yes`), so this was **not** a transfer/architecture
+issue.
+
+Root cause: the GPU path runs **many short host-side OpenMP regions** (the
+AoS↔SoA repacks in `GPUGrid*::copy_*` / `sync_arena_from_gpu`, the per-frame
+output pack/host loop, diagnostics) interleaved with GPU-bound waits. Under the
+OpenMP default `OMP_WAIT_POLICY=active`, idle worker threads **busy-spin** at the
+barrier between regions instead of sleeping; on a 20-core CPU that burns nearly
+all cores for the whole run with no useful work. `CPU time / Real time` is just
+the average number of busy cores, so it ballooned. The Mac didn't show it
+because its libomp effectively wasn't spinning those threads.
+
+Fix (`advance.cpp`, GPU builds only): a load `__attribute__((constructor))`
+defaults `OMP_WAIT_POLICY=passive` via `setenv(..., overwrite=0)` before the
+OpenMP runtime reads the env on its first parallel region (there is no standard
+runtime setter for the wait policy), plus `kmp_set_blocktime(0)` (weak symbol —
+libomp/LLVM only; skipped on libgomp/GCC). Confirmed on the Mac with
+`OMP_DISPLAY_ENV=TRUE`: `[host] OMP_WAIT_POLICY='PASSIVE'` with the env unset,
+output unchanged (surface 49697). On GB10 `OMP_WAIT_POLICY=passive
+OMP_NUM_THREADS=8` brought CPU time from 106 s → ~9 s at ~5 s wall.
+
+Notes:
+- It is a *default*: an explicit `OMP_WAIT_POLICY` in the environment still wins,
+  and `MUSIC_OMP_DEFAULTS=0` disables the whole thing.
+- OpenMP has one per-process runtime, so this is process-wide (3DGlauber, iSS,
+  …); passive only changes idle-thread behavior, so the cost to other modules is
+  a small per-region thread wake-up — negligible for their coarse-grained loops.
+- Secondary (not addressed): `cudaStreamSynchronize` spin-polls one host thread;
+  a `cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)` init flag would reclaim
+  it. Left as a follow-up — ~1 core vs the ~18 the wait policy fixed.
+- User-facing summary + revert knobs are in the top-level `README.md`
+  ("OpenMP defaults for GPU builds").
