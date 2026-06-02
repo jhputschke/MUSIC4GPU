@@ -17,18 +17,17 @@ MUSIC is a 3+1D relativistic second-order viscous hydrodynamics for heavy ion co
 > - **Authorship.** The GPU ports, benchmarks, and GPU documentation were
 >   produced with **Claude Opus 4.7**.
 >
-> > ### ⚠️ EXPERIMENTAL — NOT VALIDATED FOR PHYSICS PRODUCTION
+> > ### ⚠️ (EXPERIMENTAL) — PASSED SIMPLE PHYSICS VALIDATION 
 > >
 > > The GPU paths reproduce the CPU build's `eps_max` evolution to better than
 > > **1e-3** on the tested cases — but that is a numerical smoke test, **not** a
-> > physics validation. **No full, production-style MUSIC run has yet been
+> > physics validation. The physics has been validated by comparing the hydro evolution output for a single O+O events (3d Glauber + MUSIC4GPU), energy-density, vx, yy, yz agree to better than **1e-3**. **BUT: No full, production-style MUSIC run has yet been
 > > compared against the CPU build at the level of final-state observables**
 > > (particle spectra, anisotropic-flow harmonics, freeze-out surfaces).
 > >
 > > **Until such an end-to-end comparison is performed and documented, the GPU
-> > back-ends must be treated as EXPERIMENTAL and must NOT be used to produce
-> > physics results.** Use the CPU build for anything that matters; use the GPU
-> > build only for development, benchmarking, and validation work.
+> > back-ends must be treated as EXPERIMENTAL and if used to produce
+> > physics results w/o this production test document, it is on your own risk!**
 
 
 
