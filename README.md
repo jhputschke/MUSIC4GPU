@@ -167,23 +167,21 @@ slower:
 
 ### Benchmarks (indicative)
 
-Production grid 64×64×32 (131k cells), `Initial_profile 0`, shear viscosity on:
+With (more relevant for discete GPUs):
 
-| Back-end | GPU | CPU baseline | Speedup @ 64×64×32 |
+    output_evolution_every_N_timesteps>1</output_evolution_every_N_timesteps>
+
+
+| Back-end | GPU | CPU baseline | Speedup @ single O+O event tauMax > 3fm |
 |----------|-----|--------------|--------------------|
-| **Metal** | Apple M3 Max | 12-thread | **1.50×** (wall, 40 steps) |
-| **CUDA**  | NVIDIA GB10  | 20-thread | **2.40×** (wall, 40 steps) · **~5.8×** (per-step) |
+| **Metal** | Apple M3 Max | 16-thread | **~8×** (wall) |
+| **CUDA**  | NVIDIA GB10  | 20-thread | **~5.5×** (wall) |
+|           | RTX3090       | 48-thread | **~3.5×** (wall) |
 
 These are **not** a controlled head-to-head: the two back-ends run on different
-machines, different CPUs/thread counts, and (for CUDA) a different measurement
-methodology, so read each number as a speedup over *its own* host CPU, not as
+machines, different CPUs/thread counts, so read each number as a speedup over *its own* host CPU, not as
 Metal-vs-CUDA. The "wall" figures are total run time (including ~0.5 s of
-one-time GPU init); the CUDA "per-step" figure isolates the evolution cost by
-differencing two step counts. The gap between CUDA's 2.4× wall and ~5.8×
-per-step reflects the key finding that at this grid the run is **host-bound**
-(GPU kernels are only ~5–6 % of wall time on GB10 — the AoS↔SoA conversion and
-per-step diagnostics dominate), so wall-clock understates the kernel speedup.
-Full per-phase and per-grid tables, the methodology, and the reproduction
+one-time GPU init); Full per-phase and per-grid tables, the methodology, and the reproduction
 scripts (`tests/cuda_vs_cpu_bench*.sh`, `tests/cuda_perstep_bench.sh`) are in
 the per-back-end READMEs.
 
