@@ -18,10 +18,13 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <fstream>
 
 class pretty_ostream {
  private:
     std::ostringstream message_stream;
+    std::ofstream null_stream_;
+    std::ostream* output_stream_;
 
  public:
     pretty_ostream();

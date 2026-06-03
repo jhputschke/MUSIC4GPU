@@ -7,6 +7,74 @@
 #include <algorithm>
 
 #include "pretty_ostream.h"
+
+//Original MUSIC Code from get script in XSCAPE:
+
+using std::string;
+
+pretty_ostream::pretty_ostream() : null_stream_("/dev/null"), output_stream_(&null_stream_) {}
+
+pretty_ostream::~pretty_ostream() {}
+
+
+//! This function flushes out message to the screen
+void pretty_ostream::flush(string type) {
+    //std::transform(type.begin(), type.end(), type.begin(), ::tolower);
+    if (type == "info") {
+        //info(message_stream.str());
+    } else if (type == "warning") {
+        warning(message_stream.str());
+    } else if (type == "error") {
+        error(message_stream.str());
+    } else if (type == "debug") {
+        debug(message_stream.str());
+    }
+    message_stream.str("");
+    message_stream.clear();
+}
+
+//! This function output information message
+void pretty_ostream::info(string message) {
+    //*output_stream_ << "[Info] " << get_memory_usage() << " " << message << std::endl;
+}
+
+
+//! This function output debug message
+void pretty_ostream::debug(string message) {}
+
+
+//! This function output warning message
+void pretty_ostream::warning(string message) {
+    *output_stream_ << "[Warning] " << message << std::endl;
+}
+
+
+//! This function output error message
+void pretty_ostream::error(string message) {
+    *output_stream_ << "[Error] " << message << std::endl;
+}
+
+//! This function returns a string for the memory usage
+//! of the current program in MB
+string pretty_ostream::get_memory_usage() {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        double memory_usage_in_MB = 0.0;
+#ifdef APPLE
+        memory_usage_in_MB = usage.ru_maxrss/1024./1024.;  // MB in Apple
+#else
+        memory_usage_in_MB = usage.ru_maxrss/1024.;   // MB in linux
+#endif
+        std::ostringstream memory_usage;
+        //memory_usage << std::setprecision(4)
+                     //<< memory_usage_in_MB << " MB";
+        return(0); //memory_usage.str());
+    } else {
+        return(0);
+    }
+}
+
+/* 
 #include "emoji.h"
 
 using std::cout;
@@ -80,3 +148,4 @@ string pretty_ostream::get_memory_usage() {
         return(0);
     }
 }
+ */
