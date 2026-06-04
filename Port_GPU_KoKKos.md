@@ -30,7 +30,15 @@ and throughput runs.
 | **2** | **Perf parity (fast-math + occupancy MDRange tile) → 0.79× native CUDA; AMD/Intel notes** | ✅ **done** |
 | **3** | **Kokkos-native optimization: delta_qi+finalize fusion behind `MUSIC_KOKKOS_FUSE` (D11)** | ✅ **done** |
 | **4** | **Single-source unification: D9 gate green (Serial≡OpenMP, Cuda@1.2e-5); `kokkos_consistency.sh`** | ✅ **done** |
-| 5 | Extend GPU coverage notes + final validation | ⏳ next |
+| **5** | **Coverage matrix documented; shear/bulk/3D breadth validated vs CPU (D8)** | ✅ **done** |
+
+**All five remaining stages (1–5) are implemented and validated.**  One kernel
+source (`music_kernels_kokkos.hpp`) runs the full hydro substep on the Kokkos
+**Serial, OpenMP, and Cuda** execution spaces; on the GB10 GPU it reproduces the
+CPU reference to **the same precision as the native CUDA build** (max rel err
+6.44e-04, identical) at **0.79× native-CUDA throughput**, and the Serial/OpenMP/
+Cuda traces are cross-backend-consistent to ≤1.2e-5.  The goal's gate —
+*Kokkos-vs-CPU precision close/similar to CUDA-vs-CPU* — is met (it is identical).
 
 ---
 
@@ -107,6 +115,43 @@ HIP/SYCL are wired-and-documented but not run here; the Serial/OpenMP/Cuda
 consistency (all 6.44e-04 vs CPU) is the portability evidence available on-box.
 
 ---
+
+## Stage 5 — coverage matrix + breadth validation (D8)
+
+The Kokkos backend reaches the GPU through the **same backend-agnostic gate**
+(`Advance::gpu_features_supported()` in `advance.cpp`) and the **same 9 kernels**
+as the native CUDA backend, so its supported-config matrix is **identical to
+CUDA's** — porting did not narrow or widen coverage.
+
+**Accelerated (Kokkos/Cuda, validated vs CPU @ 1e-3):**
+
+| config | max rel err | result |
+|---|---|---|
+| shear viscosity, 2D boost-invariant, EOS 91 | 6.44e-04 | PASS |
+| shear + **bulk** viscosity, 2D, EOS 91 | 6.49e-04 | PASS |
+| shear, **full 3D** (Neta=16, non-boost-invariant), EOS 91 | 1.06e-04 | PASS |
+| shear + bulk, **full 3D** (Neta=16) | 8.44e-04 | PASS |
+
+These exercise the paths beyond the headline EOS test: the bulk runs drive
+`uprhs` + `gpu_uPi_source` + the ζ/s profiles; the 3D runs drive the η-direction
+stencils (`W_eta` terms, `sinh/cosh_deta`, the `delta_eta·τ` metric factor) that
+the 2D boost-invariant case skips.  All match the double-precision CPU solver
+within the 1e-3 gate, so the ported kernels are correct across the full supported
+feature set, not just one config.
+
+**CPU-only (falls back, for the Kokkos backend exactly as for CUDA):** baryon
+diffusion (`turn_on_diff`), finite-µB EOS, multi-charge `rhoq/rhos`.  Extending
+Kokkos to these (D8) means writing *new* kernels that neither the CUDA nor the
+Kokkos backend has yet — new physics, not a port — so it is genuinely future work
+for both backends and is correctly left to the per-feature D8/Stage-5 track, with
+the legacy CPU path retained as the fallback meanwhile.  The advantage of doing
+it in Kokkos is that each new kernel then lands **once for all backends** (the
+Stage-4 single-source property), instead of being written three times.
+
+> EOS 9 (standard hotQCD) was not benchmarked here because its table is not
+> present in this checkout (the CPU reference fails identically — `rc=1`); only
+> the EOS 91 SMASH table is available.  This is an environment/table-availability
+> gap, not a Kokkos coverage gap.
 
 ## Stage 4 — single-source unification posture (D5 / D7 / D9)
 

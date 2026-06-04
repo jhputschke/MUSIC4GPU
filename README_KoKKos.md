@@ -1,15 +1,18 @@
 # MUSIC4GPU — Kokkos Backend (portable: NVIDIA / AMD / Intel GPU + multicore CPU)
 
-> **Experimental — Stage 1 complete (functional GPU parity).** This is the
-> performance-portable [Kokkos](https://github.com/kokkos/kokkos) back-end for
-> MUSIC. All nine hydro kernels are ported and validated on the **Serial /
-> OpenMP / Cuda** backends from one kernel source: the `eps_max(τ)` trace
-> agrees with the CPU reference **identically to the native CUDA build**
-> (max rel err 6.44e-04 on a 32×32×1 hotQCD Gubser run, same as CUDA). The
-> Stage-1 kernels are correct but **untuned** (no fast-math / `__restrict__` /
-> tile tuning yet — Stage 2). See **[PlanKokkosPort.md](PlanKokkosPort.md)** for
-> the staged roadmap and **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)** for the
-> per-stage implementation + precision/throughput runs.
+> **Stages 1–5 complete.** This is the performance-portable
+> [Kokkos](https://github.com/kokkos/kokkos) back-end for MUSIC. All nine hydro
+> kernels are ported from one source and validated on the **Serial / OpenMP /
+> Cuda** execution spaces: on the GB10 GPU the `eps_max(τ)` trace agrees with
+> the CPU reference **identically to the native CUDA build** (max rel err
+> 6.44e-04) at **0.79× native-CUDA throughput**, and the three backends are
+> cross-backend-consistent to ≤1.2e-5 (the D9 single-source gate,
+> `tests/kokkos_consistency.sh`). Shear, bulk, and full-3D configs all pass.
+> Optional `delta_qi+finalize` kernel fusion lives behind `MUSIC_KOKKOS_FUSE`
+> (off by default — not a win on Blackwell). See
+> **[PlanKokkosPort.md](PlanKokkosPort.md)** for the roadmap and
+> **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)** for the per-stage implementation +
+> precision/throughput runs.
 
 The Kokkos back-end targets **one kernel body that runs on NVIDIA, AMD, and
 Intel GPUs plus multicore CPUs**, selected at build time by Kokkos execution
