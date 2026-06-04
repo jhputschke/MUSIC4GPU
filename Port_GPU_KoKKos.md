@@ -28,8 +28,8 @@ and throughput runs.
 | 0 | Infrastructure (build, lifecycle, seam, skeletons) | ✅ done (pre-existing) |
 | **1** | **Functional GPU parity — all 9 kernels ported; Serial/OpenMP/Cuda validated** | ✅ **done** |
 | **2** | **Perf parity (fast-math + occupancy MDRange tile) → 0.79× native CUDA; AMD/Intel notes** | ✅ **done** |
-| 3 | Kokkos-native optimizations (kernel fusion behind a flag) | ⏳ next |
-| 4 | Single-source unification posture (OpenMP replaces CPU loops; D9 gate) | ⏳ |
+| **3** | **Kokkos-native optimization: delta_qi+finalize fusion behind `MUSIC_KOKKOS_FUSE` (D11)** | ✅ **done** |
+| 4 | Single-source unification posture (OpenMP replaces CPU loops; D9 gate) | ⏳ next |
 | 5 | Extend GPU coverage notes + final validation | ⏳ |
 
 ---
@@ -107,6 +107,43 @@ HIP/SYCL are wired-and-documented but not run here; the Serial/OpenMP/Cuda
 consistency (all 6.44e-04 vs CPU) is the portability evidence available on-box.
 
 ---
+
+## Stage 3 — kernel fusion behind a flag (D11)
+
+The two heaviest data-path kernels — `delta_qi` (build the ideal `qi` update) and
+`finalize_ideal` (Newton-reconstruct it into the next-step primitives) — exchange
+`qi` through a `5·Ncells` global buffer (`qi_out`).  Stage 3 adds a fused kernel
+(`apply_delta_qi_finalize`) that keeps `qi` in registers and runs the
+reconstruction immediately, eliminating that round-trip.  It is gated by
+`-DMUSIC_KOKKOS_FUSE=ON`; default builds keep the two unfused kernels as the
+**D6/D11 golden reference**, and the fusion is wired so `advance.cpp`'s dispatch
+sequence is untouched (`dispatch_delta_qi` becomes a no-op, `dispatch_finalize_ideal`
+runs the fused kernel).
+
+**Correctness:** the fused build is **bit-identical to the unfused golden** —
+both give max rel err **6.44e-04** / mean **1.87e-04** vs CPU (the only change is
+that `qi` skips a `float` store+load, which is exact).
+
+**Throughput on GB10 (128²×1, min of 4):**
+
+| Kokkos/Cuda | per-step |
+|---|---|
+| unfused (default) | 3.52 ms |
+| fused (`MUSIC_KOKKOS_FUSE=ON`) | 3.67 ms |
+
+**Fusion does *not* pay on Blackwell here**, and is correctly left **OFF by
+default**.  `delta_qi` is **compute/register-bound** (Newton-Brent solve + 12
+reconstructions/cell, ~60% of runtime), not bandwidth-bound — so removing the
+`qi_out` traffic saves little, while the extra in-register reconstruction nudges
+register pressure and trims occupancy (the same Blackwell sensitivity that made
+`__restrict__` a regression in Stage 2).  This is exactly the outcome D11 is
+designed for: implement the optimization behind a switch, validate it against the
+unfused golden, and enable it per-backend *only* once it passes a perf gate —
+which it does not on this GPU.  A bandwidth-bound fusion (the plan's other
+candidate, `uwrhs`+`uprhs`, which reuse the same ±2-cell `u` neighbourhood) is
+the more promising next target and uses the identical gating mechanism; it is
+bulk-viscosity-only (`turn_on_bulk`), so it is left for when that path is
+benchmarked.
 
 ## What Stage 1 implemented
 

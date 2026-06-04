@@ -218,6 +218,13 @@ void KokkosPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params
 
 void KokkosPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& params) {
     if (!ready_) return;
+#ifdef MUSIC_KOKKOS_FUSE
+    // Fused build: the delta_qi work is folded into dispatch_finalize_ideal so
+    // the ideal qi never round-trips through the qi_out global buffer.  This
+    // call becomes a no-op (advance.cpp's dispatch sequence is unchanged).
+    (void)gpu; (void)params;
+    return;
+#else
     const float* eps = gpu.snap_curr.epsilon;
     const float* rho = gpu.snap_curr.rhob;
     const float* u   = gpu.snap_curr.u;
@@ -230,10 +237,39 @@ void KokkosPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& par
         KOKKOS_LAMBDA(int ieta, int iy, int ix) {
             mkok::apply_make_delta_qi(ix, iy, ieta, eps, rho, u, eP, eD, out, p, ep);
         });
+#endif
 }
 
 void KokkosPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams& params) {
     if (!ready_) return;
+#ifdef MUSIC_KOKKOS_FUSE
+    // Fused delta_qi + finalize: build the ideal qi in registers and run the
+    // Newton reconstruction immediately, skipping the qi_out global round-trip.
+    {
+        const float* eps  = gpu.snap_curr.epsilon;
+        const float* rho  = gpu.snap_curr.rhob;
+        const float* uc   = gpu.snap_curr.u;
+        const float* dwmn = gpu.dwmn;
+        const float* ep_  = gpu.snap_prev.epsilon;
+        const float* rp   = gpu.snap_prev.rhob;
+        const float* up   = gpu.snap_prev.u;
+        float* ef = gpu.snap_future.epsilon;
+        float* rf = gpu.snap_future.rhob;
+        float* uf = gpu.snap_future.u;
+        const float* eP = gpu.eos_P;
+        const float* eD = gpu.eos_dPde;
+        const float* qsrc = gpu.qi_source_buf;
+        const MUSICGridParams p = params;
+        const GPUEosParams ep = gpu.eos_params;
+        Kokkos::parallel_for("delta_qi_finalize_fused", range3(gpu),
+            KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+                mkok::apply_delta_qi_finalize(ix, iy, ieta, eps, rho, uc, dwmn,
+                                              ep_, rp, up, ef, rf, uf, eP, eD,
+                                              p, ep, qsrc);
+            });
+        return;
+    }
+#else
     const float* qi   = gpu.qi_out;
     const float* dwmn = gpu.dwmn;
     const float* ec   = gpu.snap_curr.epsilon;
@@ -254,6 +290,7 @@ void KokkosPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParam
             mkok::apply_finalize_ideal(ix, iy, ieta, qi, dwmn, ec, uc, ep_, rp, up,
                                        ef, rf, uf, eP, eD, p, ep, qsrc);
         });
+#endif
 }
 
 void KokkosPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,

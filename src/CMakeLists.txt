@@ -175,6 +175,10 @@ endif()
 if (USE_KOKKOS)
     set(CompileFlags "${CompileFlags} -DUSE_KOKKOS")
     target_compile_definitions(${libname} PRIVATE USE_KOKKOS)
+    if (MUSIC_KOKKOS_FUSE)
+        target_compile_definitions(${libname} PRIVATE MUSIC_KOKKOS_FUSE)
+        message(STATUS "Kokkos: delta_qi+finalize_ideal kernel fusion ENABLED.")
+    endif()
     target_link_libraries(${libname} Kokkos::kokkos)
     target_include_directories(${libname} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu

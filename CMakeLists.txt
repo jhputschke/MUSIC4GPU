@@ -88,6 +88,9 @@ option (link_with_lib "Link executable with the libarary" ON)
 option (USE_METAL "Enable Metal GPU acceleration (macOS/Apple Silicon)" OFF)
 option (USE_CUDA  "Enable CUDA GPU acceleration (NVIDIA)" OFF)
 option (USE_KOKKOS "Enable Kokkos backend (NVIDIA/AMD/Intel GPU + multicore CPU)" OFF)
+# Stage 3 (D11): fuse delta_qi+finalize_ideal into one kernel (skips the qi_out
+# global round-trip).  OFF keeps the unfused kernels as the golden reference.
+option (MUSIC_KOKKOS_FUSE "Kokkos: fuse the delta_qi + finalize_ideal kernels" OFF)
 
 if (USE_METAL AND NOT APPLE)
     message(FATAL_ERROR "USE_METAL is only supported on macOS (Apple Silicon).")

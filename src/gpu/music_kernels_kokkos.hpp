@@ -959,6 +959,140 @@ KOKKOS_INLINE_FUNCTION void apply_finalize_ideal(
         u_future[m * Ncells + c] = r.u[m];
 }
 
+// ── FUSED gpu_make_delta_qi + gpu_finalize_ideal (Stage 3, behind a flag) ─────
+//
+// The two heaviest data-path kernels exchange qi via a 5*Ncells global buffer
+// (qi_out).  Fusing them keeps the ideal qi in registers and runs the Newton
+// reconstruction immediately, eliminating that global round-trip.  Bit-identical
+// to running apply_make_delta_qi (into qi_out) then apply_finalize_ideal (reading
+// qi_out): the delta_qi block below reproduces qi[]+rhs[] exactly, and the
+// finalize tail consumes it in place.  Default builds keep the two unfused
+// kernels as the D6/D11 golden reference; enable with MUSIC_KOKKOS_FUSE.
+KOKKOS_INLINE_FUNCTION void apply_delta_qi_finalize(
+    int ix, int iy, int ieta,
+    const float* epsilon_curr, const float* rhob_curr, const float* u_curr,
+    const float* dwmn_buf,
+    const float* epsilon_prev, const float* rhob_prev, const float* u_prev,
+    float* e_future, float* rhob_future, float* u_future,
+    const float* eos_P, const float* eos_dPde,
+    const MUSICGridParams& params, const GPUEosParams& eos_p,
+    const float* qi_source_in)
+{
+    const int Nx = params.Nx, Ny = params.Ny, Neta = params.Neta, Ncells = params.Ncells;
+    const float tau   = params.tau;
+    const float theta = params.minmod_theta;
+    const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    float e_c = epsilon_curr[c];
+    float u_c[4];
+    for (int m = 0; m < 4; m++) u_c[m] = u_curr[m * Ncells + c];
+
+    // ── delta_qi: build the ideal qi update in registers (no qi_out store) ────
+    float qi[5];
+    for (int alpha = 0; alpha < 5; alpha++)
+        qi[alpha] = tau * gpu_TJb0(alpha, c, Ncells,
+                                   epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+
+    const float delta[4]   = {0.f, params.delta_x, params.delta_y, params.delta_eta};
+    const float tau_fac[4] = {0.f, tau, tau, 1.f};
+    float rhs[5]     = {0.f, 0.f, 0.f, 0.f, 0.f};
+    float T_eta_m[4] = {0.f, 0.f, 0.f, 0.f};
+    float T_eta_p[4] = {0.f, 0.f, 0.f, 0.f};
+    const int DX[3]   = {1, 0, 0};
+    const int DY[3]   = {0, 1, 0};
+    const int DETA[3] = {0, 0, 1};
+
+    for (int dir = 0; dir < 3; dir++) {
+        int direction = dir + 1;
+        int ip1 = clamped_cell(ix+  DX[dir], iy+  DY[dir], ieta+  DETA[dir], Nx, Ny, Neta);
+        int ip2 = clamped_cell(ix+2*DX[dir], iy+2*DY[dir], ieta+2*DETA[dir], Nx, Ny, Neta);
+        int im1 = clamped_cell(ix-  DX[dir], iy-  DY[dir], ieta-  DETA[dir], Nx, Ny, Neta);
+        int im2 = clamped_cell(ix-2*DX[dir], iy-2*DY[dir], ieta-2*DETA[dir], Nx, Ny, Neta);
+
+        float qiphL[5], qiphR[5], qimhL[5], qimhR[5];
+        for (int alpha = 0; alpha < 5; alpha++) {
+            float gc  = qi[alpha];
+            float gp1 = tau * gpu_TJb0(alpha, ip1, Ncells, epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float gp2 = tau * gpu_TJb0(alpha, ip2, Ncells, epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float gm1 = tau * gpu_TJb0(alpha, im1, Ncells, epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float gm2 = tau * gpu_TJb0(alpha, im2, Ncells, epsilon_curr, rhob_curr, u_curr, eos_P, eos_p);
+            float fphL =  0.5f * gpu_minmod_dx(gp1, gc,  gm1, theta);
+            float fphR = -0.5f * gpu_minmod_dx(gp2, gp1, gc,  theta);
+            float fmhL =  0.5f * gpu_minmod_dx(gc,  gm1, gm2, theta);
+            float fmhR = -fphL;
+            qiphL[alpha] = gc  + fphL;
+            qiphR[alpha] = gp1 + fphR;
+            qimhL[alpha] = gm1 + fmhL;
+            qimhR[alpha] = gc  + fmhR;
+        }
+
+        ReconstResult r_phL = gpu_reconst(tau, qiphL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_mhR = gpu_reconst(tau, qimhR, u_c, e_c, eos_P, eos_dPde, eos_p);
+
+        float aiph = fmaxf(gpu_max_speed(tau, direction, r_phL, eos_P, eos_dPde, eos_p),
+                           gpu_max_speed(tau, direction, r_phR, eos_P, eos_dPde, eos_p));
+        float aimh = fmaxf(gpu_max_speed(tau, direction, r_mhL, eos_P, eos_dPde, eos_p),
+                           gpu_max_speed(tau, direction, r_mhR, eos_P, eos_dPde, eos_p));
+
+        float tf = tau_fac[direction];
+        float dx = delta[direction];
+        for (int alpha = 0; alpha < 5; alpha++) {
+            float FiphL = gpu_get_TJb_reconst(r_phL, alpha, direction, tf, eos_P, eos_p);
+            float FiphR = gpu_get_TJb_reconst(r_phR, alpha, direction, tf, eos_P, eos_p);
+            float FimhL = gpu_get_TJb_reconst(r_mhL, alpha, direction, tf, eos_P, eos_p);
+            float FimhR = gpu_get_TJb_reconst(r_mhR, alpha, direction, tf, eos_P, eos_p);
+            float Fiph = 0.5f * ((FiphL + FiphR) - aiph * (qiphR[alpha] - qiphL[alpha]));
+            float Fimh = 0.5f * ((FimhL + FimhR) - aimh * (qimhR[alpha] - qimhL[alpha]));
+            if (direction == 3 && (alpha == 0 || alpha == 3)) {
+                T_eta_m[alpha] = Fimh;
+                T_eta_p[alpha] = Fiph;
+            } else {
+                rhs[alpha] += (Fimh - Fiph) / dx * params.delta_tau;
+            }
+        }
+    }
+    float cd = params.cosh_deta, sd = params.sinh_deta;
+    rhs[0] += ((T_eta_m[0] - T_eta_p[0]) * cd - (T_eta_m[3] + T_eta_p[3]) * sd) * params.delta_tau;
+    rhs[3] += ((T_eta_m[3] - T_eta_p[3]) * cd - (T_eta_m[0] + T_eta_p[0]) * sd) * params.delta_tau;
+
+    float qi_full[5];
+    for (int alpha = 0; alpha < 5; alpha++) qi_full[alpha] = qi[alpha] + rhs[alpha];
+
+    // ── finalize_ideal: consume qi_full in place, no qi_out round-trip ────────
+    const int   rkf      = params.rk_flag;
+    const float dt       = params.delta_tau;
+    const float tau_org  = params.tau_orig;
+    const float tau_next = tau_org + dt;
+    const float rk_norm  = 1.f / (1.f + (float)rkf);
+
+    float u0p   = u_prev[c];
+    float e_p   = epsilon_prev[c];
+    float rho_p = rhob_prev[c];
+    float P_p   = (rkf > 0) ? gpu_P(e_p, eos_P, eos_p) : 0.f;
+    const int has_src = params.has_hydro_source;
+
+    float qf[5];
+    for (int a = 0; a < 5; a++) {
+        float qv = qi_full[a] - dwmn_buf[a * Ncells + c] * dt;
+        if (has_src) qv += qi_source_in[a * Ncells + c] * dt;
+        if (rkf > 0) {
+            float prev_TJb0;
+            if (a == 4)      prev_TJb0 = rho_p * u0p;
+            else if (a == 0) prev_TJb0 = (e_p + P_p) * u0p * u0p - P_p;
+            else             prev_TJb0 = (e_p + P_p) * u_prev[a * Ncells + c] * u0p;
+            qv += (float)rkf * tau_org * prev_TJb0;
+        }
+        qf[a] = qv * rk_norm;
+    }
+
+    ReconstResult r = gpu_reconst(tau_next, qf, u_c, e_c, eos_P, eos_dPde, eos_p);
+    e_future[c]    = r.e;
+    rhob_future[c] = r.rhob;
+    for (int m = 0; m < 4; m++) u_future[m * Ncells + c] = r.u[m];
+}
+
 // ── gpu_make_uwrhs ───────────────────────────────────────────────────────────
 KOKKOS_INLINE_FUNCTION void apply_make_uwrhs(
     int ix, int iy, int ieta,
