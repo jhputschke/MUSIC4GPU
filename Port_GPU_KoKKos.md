@@ -96,18 +96,41 @@ third was tried and rejected:
    no-reload register pressure pushed the heavy kernels over the occupancy
    cliff.  Removing it gave the 3.65 ms result.  Left out.
 
-**Not pursued (diminishing returns past 0.79×, would touch every kernel):**
-RandomAccess EOS Views (`MemoryTraits<RandomAccess>` → `__ldg` texture path) and
-the flat→rank-2 layout-templated Views (D3/§2a).  The flat `comp*Ncells+cell`
-indexing already gives coalesced GPU access; the layout migration mainly buys
-CPU-backend vectorisation and is better folded into the Stage-4 unification,
-where the OpenMP path replaces the legacy CPU loops.
+### Phase-1 parity attempt — launch/memory levers (implemented; gap is structural)
+
+Three **numerically-neutral** levers were added to chase the remaining ~15%, all
+keeping **6.44e-04 exactly** on Serial/OpenMP/Cuda:
+
+1. **Flat `RangePolicy<Ncells>` + in-kernel deindex** (replaced
+   `MDRangePolicy<Rank<3>>`) — matches the native one-thread-per-cell mapping with
+   no tiled-index overhead.
+2. **Per-kernel occupancy via `Kokkos::LaunchBounds<256>`** — the
+   `__launch_bounds__` block cap native sets through its occupancy API. *Required*:
+   an unbounded flat `RangePolicy` picks a block that overflows registers on the
+   heavy kernels and runs ~2× slower (7.9 ms) — the cap restores it.
+3. **Read-only / RandomAccess cache (`__ldg`)** on the data-dependent EOS lookups
+   and the `get_*` stencil neighbours (native's `__ldg` footprint).
+
+**Outcome on GB10: throughput is unchanged at ~0.83× native** (3.64 vs 3.01
+ms/step — within the run-to-run 0.79–0.87× band; no GPU gain over the MDRange+tile
+baseline). A `delta_qi` `LaunchBounds` sweep {128,192,256} confirmed **256 is the
+occupancy sweet spot** (128 starves it). The decisive finding: **at the *same*
+≤256-thread block, native CUDA is still ~15–20% faster**, so the residual gap is
+**structural, not a tuning knob** — it lives in (a) the un-ported shared-memory
+**tiled `w_source`** (`TeamPolicy`+scratch, Stage-3b) and (b) the intrinsic
+codegen difference between a Kokkos lambda kernel and a hand-written `__global__`.
+The OpenMP host backend *did* benefit from the flat policy (~12 → ~9.5 ms/step,
+high-variance metric). **Closing the last ~15% on NVIDIA needs the tiled stencil
+and/or an algorithmic change (Newton warm-start) — not more launch tuning.**
+
+**Still deferred:** the flat→rank-2 **layout-templated Views** (D3/§2a) — mainly a
+CPU-vectorisation win, folded into the Stage-4 unification.
 
 ### AMD (HIP) / Intel (SYCL) — build-matrix only on this box
 
-The port is genuinely backend-agnostic: one kernel source, `MDRangePolicy`,
-`Kokkos::SharedSpace` keyed off the space's unified-memory trait (no `#ifdef`),
-`parallel_reduce<Max>` (no vendor atomics).  Bringing up AMD/Intel is a configure
+The port is genuinely backend-agnostic: one kernel source, flat `RangePolicy` +
+`LaunchBounds`, `Kokkos::SharedSpace` keyed off the space's unified-memory trait
+(no `#ifdef`), `parallel_reduce<Max>` (no vendor atomics).  Bringing up AMD/Intel is a configure
 flip — `-DKokkos_ENABLE_HIP=ON -DKokkos_ARCH_AMD_GFX90A=ON` (MI250X/Frontier) or
 `-DKokkos_ENABLE_SYCL=ON -DKokkos_ARCH_INTEL_PVC=ON` (Aurora) — plus the same
 `tests/eos_gpu_vs_cpu.sh` gate.  **This machine has only the NVIDIA GB10**, so
@@ -277,12 +300,15 @@ A line-for-line port of `music_kernels.cu` to portable Kokkos:
 
 ### `src/gpu/KokkosPipelines.cpp`  (rewrite — the dispatch layer)
 - `initialize()` confirms the runtime (brought up by the guard) and reports the
-  execution space + CUDA device.  `dispatch_*` launch
-  `parallel_for(MDRangePolicy<Rank<3>>({0,0,0},{Neta,Ny,Nx}), …)` with **ix
-  innermost** (coalesced loads / cache-friendly).  All launches go on the
-  default execution-space instance, so they serialise in issue order like the
-  CUDA single compute stream — the pipeline's producer→consumer dependencies
-  hold with no inter-kernel fence.  `wait()` is one `Kokkos::fence()`.
+  execution space + CUDA device.  `dispatch_*` launch a **flat
+  `parallel_for(RangePolicy<Ncells, LaunchBounds<256>>, …)`** and deindex the
+  linear id to `(ix,iy,ieta)` in-kernel (adjacent ids = adjacent cells →
+  coalesced; matches the native one-thread-per-cell mapping; `LaunchBounds`
+  caps the block to keep the register-heavy kernels off the occupancy cliff —
+  see the Phase-1 section).  All launches go on the default execution-space
+  instance, so they serialise in issue order like the CUDA single compute stream
+  — the pipeline's producer→consumer dependencies hold with no inter-kernel
+  fence.  `wait()` is one `Kokkos::fence()`.
 - `reduce_max` is a `parallel_reduce` with `Kokkos::Max<float>` (drops the
   hand-rolled `atomicMax` bit-trick).  `pack_evolution_ideal` is a 1-D
   `parallel_for` into a managed scratch View + a host `memcpy`.

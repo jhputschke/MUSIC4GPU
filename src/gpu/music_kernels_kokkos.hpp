@@ -51,23 +51,47 @@ KOKKOS_FORCEINLINE_FUNCTION int clamped_cell(int ix, int iy, int ieta,
     return cell_idx(ix, iy, ieta, Nx, Ny);
 }
 
+// Read-only-data load.  On CUDA/HIP device code this routes through the
+// read-only / texture cache (`__ldg`) — what `View<const T*, RandomAccess>`
+// lowers to, restored here for the EOS-table + stencil-neighbour reads without
+// threading View types through every device helper.  Returns the exact same
+// float (a cache hint, not a value change), so it is numerically neutral; on
+// host / SYCL it is a plain load.
+KOKKOS_FORCEINLINE_FUNCTION float ldg_ro(const float* p, int i) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return __ldg(&p[i]);
+#else
+    return p[i];
+#endif
+}
+
+// Flat 1-D work index -> (ix, iy, ieta).  Inverse of cell_idx, so a
+// RangePolicy<Ncells> work item maps to the same cell the MDRange did.
+KOKKOS_FORCEINLINE_FUNCTION void deindex(int c, int Nx, int Ny,
+                                         int& ix, int& iy, int& ieta) {
+    ix = c % Nx;
+    int t = c / Nx;
+    iy = t % Ny;
+    ieta = t / Ny;
+}
+
 KOKKOS_FORCEINLINE_FUNCTION float get_Wmunu(const float* W, int comp,
                                             int ix, int iy, int ieta,
                                             int Nx, int Ny, int Neta, int Ncells) {
     int c = clamped_cell(ix, iy, ieta, Nx, Ny, Neta);
-    return W[comp * Ncells + c];
+    return ldg_ro(W, comp * Ncells + c);
 }
 KOKKOS_FORCEINLINE_FUNCTION float get_u(const float* u, int comp,
                                         int ix, int iy, int ieta,
                                         int Nx, int Ny, int Neta, int Ncells) {
     int c = clamped_cell(ix, iy, ieta, Nx, Ny, Neta);
-    return u[comp * Ncells + c];
+    return ldg_ro(u, comp * Ncells + c);
 }
 KOKKOS_FORCEINLINE_FUNCTION float get_pi_b(const float* pi_b,
                                            int ix, int iy, int ieta,
                                            int Nx, int Ny, int Neta, int Ncells) {
     int c = clamped_cell(ix, iy, ieta, Nx, Ny, Neta);
-    return pi_b[c];
+    return ldg_ro(pi_b, c);
 }
 
 // Wmunu 2D->1D index table (= Util::map_2d_idx_to_1d / gpu_types.h WMUNU_IDX).
@@ -93,7 +117,10 @@ KOKKOS_INLINE_FUNCTION float gpu_log_interp(float e, const float* tab,
     float fe   = (le - ep.log_e_min) / ep.log_delta_e;
     int   idx  = clampi((int)fe, 0, ep.n_pts - 2);
     float frac = fe - (float)idx;
-    return fmaxf(0.f, tab[idx] * (1.f - frac) + tab[idx + 1] * frac);
+    // EOS tables are read-only for the whole run -> read-only cache (RandomAccess
+    // / __ldg). Data-dependent index, so warp lanes hit different entries; the
+    // read-only L1 path handles that far better than the default load.
+    return fmaxf(0.f, ldg_ro(tab, idx) * (1.f - frac) + ldg_ro(tab, idx + 1) * frac);
 }
 KOKKOS_INLINE_FUNCTION float gpu_P(float e, const float* P_tab, const GPUEosParams& ep) {
     return fmaxf(1.e-20f, gpu_log_interp(e, P_tab, ep));
@@ -126,12 +153,12 @@ KOKKOS_INLINE_FUNCTION float gpu_TJb0(int alpha, int c, int Ncells,
                                       const float* eps_buf, const float* rhob_buf,
                                       const float* u_buf, const float* P_tab,
                                       const GPUEosParams& ep) {
-    float u0 = u_buf[0 * Ncells + c];
-    if (alpha == 4) return rhob_buf[c] * u0;
-    float e = eps_buf[c];
+    float u0 = ldg_ro(u_buf, 0 * Ncells + c);
+    if (alpha == 4) return ldg_ro(rhob_buf, c) * u0;
+    float e = ldg_ro(eps_buf, c);
     float P = gpu_P(e, P_tab, ep);
     if (alpha == 0) return (e + P) * u0 * u0 - P;
-    return (e + P) * u_buf[alpha * Ncells + c] * u0;
+    return (e + P) * ldg_ro(u_buf, alpha * Ncells + c) * u0;
 }
 
 // ── Newton-Brent reconstruction helpers ──────────────────────────────────────

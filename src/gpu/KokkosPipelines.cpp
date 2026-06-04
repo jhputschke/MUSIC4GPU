@@ -24,38 +24,29 @@
 #include <cstring>
 
 using ExecSpace = Kokkos::DefaultExecutionSpace;
-using Range3    = Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>;
 using Range1    = Kokkos::RangePolicy<ExecSpace>;
 
 // Defined in GPUGrid_kokkos.cpp: (re)size + fetch the device pack scratch View.
 float* kokkos_grid_evo_pack(GPUGrid& gpu, size_t floats);
 
-// 3-D iteration space.  ix is the innermost (last) index so adjacent work-items
-// hit adjacent cells (cell = ix + Nx*(iy + Ny*ieta)) — coalesced on the GPU,
-// cache-friendly on the CPU.  Bounds {Neta, Ny, Nx} -> lambda (ieta, iy, ix).
+// Flat one-work-item-per-cell iteration over [0, Ncells); each kernel deindexes
+// the linear id to (ix, iy, ieta) with mkok::deindex (cell = ix + Nx*(iy +
+// Ny*ieta), so adjacent ids = adjacent cells -> coalesced on the GPU, sequential
+// on the CPU).  This matches the native CUDA kernels' flat one-thread-per-cell
+// mapping directly (no MDRange tiled-index overhead).  Numerically identical:
+// same work items, same per-cell apply_* bodies.
 //
-// The tile {tEta, tY, tX} (last = innermost = threadIdx.x on CUDA) reproduces
-// the native-CUDA launch geometry (compute_launch in CUDAPipelines.cu): eta
-// capped at 4, x at 32 for coalescing, the rest of a ~256-thread block in y.
-// Capping the block at 256 is what keeps the register-heavy delta_qi / w_full
-// kernels (Newton solve + reconstructions, marked __restrict__) below the
-// occupancy cliff — the default MDRange tile overflows it and runs ~3x slower.
-static inline Range3 range3(const GPUGrid& gpu) {
-    const int Nx = gpu.Nx(), Ny = gpu.Ny(), Neta = gpu.Neta();
-    // On a host execution space the default MDRange tiling vectorises well;
-    // the explicit small block only helps (and is only needed by) the GPU.
-    if constexpr (Kokkos::SpaceAccessibility<ExecSpace,
-                                             Kokkos::HostSpace>::accessible) {
-        return Range3({0, 0, 0}, {Neta, Ny, Nx});
-    } else {
-        int tEta = (Neta >= 4) ? 4 : (Neta < 1 ? 1 : Neta);
-        int tX   = (Nx   >= 32) ? 32 : (Nx < 1 ? 1 : Nx);
-        int budget = 256 / (tEta * tX);
-        if (budget < 1) budget = 1;
-        int tY = (Ny < budget) ? Ny : budget;
-        if (tY < 1) tY = 1;
-        return Range3({0, 0, 0}, {Neta, Ny, Nx}, {tEta, tY, tX});
-    }
+// MaxThreads is the CUDA block cap via Kokkos::LaunchBounds (== __launch_bounds__,
+// the per-kernel occupancy control, analogous to native's compute_launch capping
+// the block at <=256): it limits registers so a full block stays resident,
+// keeping the register-heavy delta_qi / w_full kernels off the occupancy cliff
+// that an unbounded RangePolicy block falls into (~2x slower). No-op on host.
+template <int MaxThreads = 256>
+using RangeB = Kokkos::RangePolicy<ExecSpace, Kokkos::LaunchBounds<MaxThreads, 1>>;
+
+template <int MaxThreads = 256>
+static inline RangeB<MaxThreads> range_cells(const GPUGrid& gpu) {
+    return RangeB<MaxThreads>(0, gpu.Ncells());
 }
 
 // ── singleton ─────────────────────────────────────────────────────────────────
@@ -170,8 +161,9 @@ void KokkosPipelines::dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& para
     float* a     = gpu.a_buf;
     float* sigma = gpu.sigma_buf;
     const MUSICGridParams p = params;
-    Kokkos::parallel_for("make_du", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    Kokkos::parallel_for("make_du", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_make_du(ix, iy, ieta, u_curr, u_prev, theta, a, sigma, p);
         });
 }
@@ -182,8 +174,9 @@ void KokkosPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params
     const float* u = gpu.snap_curr.u;
     float* out = gpu.uwrhs_out;
     const MUSICGridParams p = params;
-    Kokkos::parallel_for("make_uwrhs", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    Kokkos::parallel_for("make_uwrhs", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_make_uwrhs(ix, iy, ieta, W, u, out, p);
         });
 }
@@ -198,8 +191,9 @@ void KokkosPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& par
     const float* upv = gpu.snap_prev.u;
     float* out = gpu.dwmn;
     const MUSICGridParams p = params;
-    Kokkos::parallel_for("make_w_source", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    Kokkos::parallel_for("make_w_source", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_make_w_source(ix, iy, ieta, Wc, pc, uc, Wp, pp_, upv, out, p);
         });
 }
@@ -210,8 +204,9 @@ void KokkosPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params
     const float* u  = gpu.snap_curr.u;
     float* out = gpu.uprhs_out;
     const MUSICGridParams p = params;
-    Kokkos::parallel_for("make_uprhs", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    Kokkos::parallel_for("make_uprhs", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_make_uprhs(ix, iy, ieta, pi, u, out, p);
         });
 }
@@ -233,8 +228,12 @@ void KokkosPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& par
     float* out = gpu.qi_out;
     const MUSICGridParams p = params;
     const GPUEosParams ep = gpu.eos_params;
-    Kokkos::parallel_for("make_delta_qi", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    // delta_qi is the register-heavy bottleneck (Newton solve + 12 reconstructions
+    // /cell); LaunchBounds<256> is its occupancy sweet spot — a sweep of
+    // {128,192,256} on GB10 confirmed 256 is fastest (128 starves occupancy).
+    Kokkos::parallel_for("make_delta_qi", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_make_delta_qi(ix, iy, ieta, eps, rho, u, eP, eD, out, p, ep);
         });
 #endif
@@ -261,8 +260,9 @@ void KokkosPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParam
         const float* qsrc = gpu.qi_source_buf;
         const MUSICGridParams p = params;
         const GPUEosParams ep = gpu.eos_params;
-        Kokkos::parallel_for("delta_qi_finalize_fused", range3(gpu),
-            KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+        Kokkos::parallel_for("delta_qi_finalize_fused", range_cells(gpu),
+            KOKKOS_LAMBDA(int cc_) {
+                int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
                 mkok::apply_delta_qi_finalize(ix, iy, ieta, eps, rho, uc, dwmn,
                                               ep_, rp, up, ef, rf, uf, eP, eD,
                                               p, ep, qsrc);
@@ -285,8 +285,9 @@ void KokkosPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParam
     const float* qsrc = gpu.qi_source_buf;
     const MUSICGridParams p = params;
     const GPUEosParams ep = gpu.eos_params;
-    Kokkos::parallel_for("finalize_ideal", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    Kokkos::parallel_for("finalize_ideal", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_finalize_ideal(ix, iy, ieta, qi, dwmn, ec, uc, ep_, rp, up,
                                        ef, rf, uf, eP, eD, p, ep, qsrc);
         });
@@ -320,8 +321,9 @@ void KokkosPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     const float* rf = gpu.snap_future.rhob;
     const MUSICGridParams p = params;
     const GPUEosParams ep = gpu.eos_params;
-    Kokkos::parallel_for("first_rk_step_w_full", range3(gpu),
-        KOKKOS_LAMBDA(int ieta, int iy, int ix) {
+    Kokkos::parallel_for("first_rk_step_w_full", range_cells(gpu),
+        KOKKOS_LAMBDA(int cc_) {
+            int ix, iy, ieta; mkok::deindex(cc_, p.Nx, p.Ny, ix, iy, ieta);
             mkok::apply_first_rk_step_w_full(ix, iy, ieta, Wc, pc, uc, Wp, pp_, up,
                                              ec, ep_, uf, uwrhs, theta, a, sigma,
                                              Wf, pf, eP, eS, eT, eD, uprhs, p, ep,

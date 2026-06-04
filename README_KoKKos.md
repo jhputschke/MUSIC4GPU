@@ -183,28 +183,36 @@ throughput parity** with the hand-written native CUDA backend. Per-step compute
 
 | backend | per-step | ratio |
 |---|---|---|
-| native CUDA | 3.07 ms | 1.0× |
-| Kokkos / Cuda | 3.54 ms | **0.87× native** |
+| native CUDA | 3.01 ms | 1.0× |
+| Kokkos / Cuda (post-Phase-1) | 3.64 ms | **0.83× native** |
 
 So **native CUDA is the faster backend — by ~1.15×** (run-to-run the ratio sits
 in the **0.79–0.87× native** band). **Precision is identical** (both 6.44e-04 vs
-CPU); the gap is throughput only, and it is **closable, not structural** — three
-deferred items, all things the native backend does and the port does not yet:
+CPU); the gap is throughput only.
 
-1. **Per-kernel occupancy tuning** — native CUDA picks a block size per kernel
-   (`cudaOccupancyMaxPotentialBlockSize`); the port uses one MDRange tile for all
-   nine. The register-heavy `delta_qi` (~60% of runtime) likely wants its own.
-2. **`__ldg` / RandomAccess EOS** — native routes the data-dependent EOS lookups
-   through the read-only cache; the Stage-1 port uses plain global loads.
-3. **Shared-memory tiled `w_source`** — native has a hand-tiled stencil kernel;
-   the port runs the plain version (the `TeamPolicy`+scratch port is the Stage-3b
-   item in [PlanKokkosPort.md](PlanKokkosPort.md)).
+**The launch/memory levers are now implemented — and they confirm the gap is
+*structural*, not a tuning oversight.** A Phase-1 pass added, all keeping
+6.44e-04 **exactly**:
 
-The work stopped at ~0.8–0.87× because the goal was *precision* parity; the
-Stage-2/3 throughput targets (≈1.0× CUDA, then `>`CUDA via fusion/scratch) remain
-open. (The `delta_qi+finalize` fusion behind `MUSIC_KOKKOS_FUSE` was tried and is
-**not** a win on Blackwell — `delta_qi` is register-bound — so it stays off; see
-Port_GPU_KoKKos.md Stage 3.)
+1. **Flat `RangePolicy<Ncells>`** (in-kernel deindex) replacing
+   `MDRangePolicy<Rank<3>>` — the native one-thread-per-cell mapping.
+2. **Per-kernel occupancy** via `Kokkos::LaunchBounds<256>` (native's
+   `__launch_bounds__`/occupancy-API cap). A `delta_qi` sweep {128,192,256}
+   showed **256 is the sweet spot** (128 starves occupancy).
+3. **`__ldg` / RandomAccess** on the EOS lookups + `get_*` stencil reads
+   (native's read-only-cache footprint).
+
+Result: **throughput is unchanged at ~0.83× native** — these knobs *match* native
+but don't close the gap. The tell: at the **same ≤256-thread block**, native is
+still ~15–20% faster, so the residual is **structural** —
+(a) the un-ported shared-memory **tiled `w_source`** (`TeamPolicy`+scratch,
+Stage-3b) and (b) the intrinsic codegen difference between a Kokkos lambda kernel
+and a hand-written `__global__`. Closing the last ~15% on NVIDIA therefore needs
+the tiled stencil and/or an **algorithmic** change (seed the Newton solve from the
+previous step's u⁰), **not** more launch tuning — and the Newton change is
+higher-risk and not Kokkos-exclusive. (The `delta_qi+finalize` fusion behind
+`MUSIC_KOKKOS_FUSE` was also tried and is **not** a win on Blackwell —
+`delta_qi` is register-bound — so it stays off; see Port_GPU_KoKKos.md Stage 3.)
 
 **The trade-off.** You give up ~15–25% of peak NVIDIA throughput and get, from
 **one** kernel source: NVIDIA **plus** the same physics on AMD / Intel GPUs and
