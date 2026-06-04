@@ -5,7 +5,8 @@
 > kernels are ported from one source and validated on the **Serial / OpenMP /
 > Cuda** execution spaces: on the GB10 GPU the `eps_max(τ)` trace agrees with
 > the CPU reference **identically to the native CUDA build** (max rel err
-> 6.44e-04) at **0.79× native-CUDA throughput**, and the three backends are
+> 6.44e-04) at **~0.8× native-CUDA throughput** (native CUDA stays the faster
+> NVIDIA backend — see the Performance section), and the three backends are
 > cross-backend-consistent to ≤1.2e-5 (the D9 single-source gate,
 > `tests/kokkos_consistency.sh`). Shear, bulk, and full-3D configs all pass.
 > Optional `delta_qi+finalize` kernel fusion lives behind `MUSIC_KOKKOS_FUSE`
