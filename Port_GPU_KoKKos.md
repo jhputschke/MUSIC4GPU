@@ -263,7 +263,10 @@ A line-for-line port of `music_kernels.cu` to portable Kokkos:
   build, so the host AoS↔SoA pack/unpack loops write/read the View `data()`
   pointer directly on every backend — the same in-place, zero-copy model the
   native CUDA backend uses on this coherent GB10 box (`upload_snapshots_async`
-  is a no-op).
+  is a no-op).  **On a *discrete* GPU this managed path is correct but not
+  optimal** (demand-paged migration instead of pinned bulk DMA + overlap); the
+  native CUDA backend's discrete-specific path is not yet carried over —
+  **[PlanKoKKosDiscrete.md](PlanKoKKosDiscrete.md)** is the pick-up plan for it.
 - `GPUGrid.h` stays Kokkos-free (PIMPL, D7): the owning Views live in a
   TU-static store keyed by the `GPUGrid` instance; only the raw `float*` aliases
   (shared with all backends) sit on the struct.  Snapshot rotation/swizzle
