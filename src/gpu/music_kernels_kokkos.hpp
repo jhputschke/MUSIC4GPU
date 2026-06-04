@@ -676,8 +676,10 @@ KOKKOS_INLINE_FUNCTION float gpu_uWRHS_geom(const float W_local[4][4], const flo
 // ── gpu_make_w_source (non-tiled; Stage 3 adds the scratch-tiled variant) ─────
 KOKKOS_INLINE_FUNCTION void apply_make_w_source(
     int ix, int iy, int ieta,
-    const float* Wmunu_curr, const float* pi_b_curr, const float* u_curr,
-    const float* Wmunu_prev, const float* pi_b_prev, const float* u_prev,
+    const float* Wmunu_curr, const float* pi_b_curr,
+    const float* u_curr,
+    const float* Wmunu_prev, const float* pi_b_prev,
+    const float* u_prev,
     float* dwmn_out, const MUSICGridParams& params)
 {
     const int Nx = params.Nx, Ny = params.Ny, Neta = params.Neta, Ncells = params.Ncells;
@@ -793,7 +795,8 @@ KOKKOS_INLINE_FUNCTION void apply_make_w_source(
 // ── gpu_make_delta_qi ─────────────────────────────────────────────────────────
 KOKKOS_INLINE_FUNCTION void apply_make_delta_qi(
     int ix, int iy, int ieta,
-    const float* epsilon_curr, const float* rhob_curr, const float* u_curr,
+    const float* epsilon_curr, const float* rhob_curr,
+    const float* u_curr,
     const float* eos_P, const float* eos_dPde,
     float* qi_out, const MUSICGridParams& params, const GPUEosParams& eos_p)
 {
@@ -899,8 +902,10 @@ KOKKOS_INLINE_FUNCTION void apply_finalize_ideal(
     int ix, int iy, int ieta,
     const float* qi_buf, const float* dwmn_buf,
     const float* epsilon_curr, const float* u_curr,
-    const float* epsilon_prev, const float* rhob_prev, const float* u_prev,
-    float* e_future, float* rhob_future, float* u_future,
+    const float* epsilon_prev, const float* rhob_prev,
+    const float* u_prev,
+    float* e_future, float* rhob_future,
+    float* u_future,
     const float* eos_P, const float* eos_dPde,
     const MUSICGridParams& params, const GPUEosParams& eos_p,
     const float* qi_source_in)
@@ -1126,7 +1131,8 @@ KOKKOS_INLINE_FUNCTION void apply_make_uprhs(
 KOKKOS_INLINE_FUNCTION void apply_make_du(
     int ix, int iy, int ieta,
     const float* u_curr, const float* u_prev,
-    float* theta_out, float* a_out, float* sigma_out,
+    float* theta_out, float* a_out,
+    float* sigma_out,
     const MUSICGridParams& params)
 {
     const int Nx = params.Nx, Ny = params.Ny, Neta = params.Neta, Ncells = params.Ncells;
@@ -1243,13 +1249,19 @@ KOKKOS_INLINE_FUNCTION void apply_make_du(
 // ── gpu_first_rk_step_w_full ─────────────────────────────────────────────────
 KOKKOS_INLINE_FUNCTION void apply_first_rk_step_w_full(
     int ix, int iy, int ieta,
-    const float* Wmunu_curr, const float* pi_b_curr, const float* u_curr,
-    const float* Wmunu_prev, const float* pi_b_prev, const float* u_prev,
-    const float* epsilon_curr, const float* epsilon_prev, const float* u_future,
-    const float* uwrhs_in, const float* theta_in, const float* a_in, const float* sigma_in,
+    const float* Wmunu_curr, const float* pi_b_curr,
+    const float* u_curr,
+    const float* Wmunu_prev, const float* pi_b_prev,
+    const float* u_prev,
+    const float* epsilon_curr, const float* epsilon_prev,
+    const float* u_future,
+    const float* uwrhs_in, const float* theta_in,
+    const float* a_in, const float* sigma_in,
     float* Wmunu_future, float* pi_b_future,
-    const float* eos_P, const float* eos_s, const float* eos_T, const float* eos_dPde,
-    const float* uprhs_in, const MUSICGridParams& params, const GPUEosParams& eos_p,
+    const float* eos_P, const float* eos_s,
+    const float* eos_T, const float* eos_dPde,
+    const float* uprhs_in, const MUSICGridParams& params,
+    const GPUEosParams& eos_p,
     const float* epsilon_future, const float* rhob_future)
 {
     const int Nx = params.Nx, Ny = params.Ny, Ncells = params.Ncells;
@@ -1440,7 +1452,8 @@ KOKKOS_INLINE_FUNCTION void apply_first_rk_step_w_full(
 KOKKOS_INLINE_FUNCTION void apply_pack_evolution_ideal(
     int o,
     const float* epsilon, const float* u,
-    const float* eos_P, const float* eos_s, const float* eos_T,
+    const float* eos_P, const float* eos_s,
+    const float* eos_T,
     float* out, const GPUEosParams& eos_p, const GPUPackParams& pp)
 {
     const int ieta_idx = o % pp.neta_out;

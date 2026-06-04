@@ -33,8 +33,29 @@ float* kokkos_grid_evo_pack(GPUGrid& gpu, size_t floats);
 // 3-D iteration space.  ix is the innermost (last) index so adjacent work-items
 // hit adjacent cells (cell = ix + Nx*(iy + Ny*ieta)) — coalesced on the GPU,
 // cache-friendly on the CPU.  Bounds {Neta, Ny, Nx} -> lambda (ieta, iy, ix).
+//
+// The tile {tEta, tY, tX} (last = innermost = threadIdx.x on CUDA) reproduces
+// the native-CUDA launch geometry (compute_launch in CUDAPipelines.cu): eta
+// capped at 4, x at 32 for coalescing, the rest of a ~256-thread block in y.
+// Capping the block at 256 is what keeps the register-heavy delta_qi / w_full
+// kernels (Newton solve + reconstructions, marked __restrict__) below the
+// occupancy cliff — the default MDRange tile overflows it and runs ~3x slower.
 static inline Range3 range3(const GPUGrid& gpu) {
-    return Range3({0, 0, 0}, {gpu.Neta(), gpu.Ny(), gpu.Nx()});
+    const int Nx = gpu.Nx(), Ny = gpu.Ny(), Neta = gpu.Neta();
+    // On a host execution space the default MDRange tiling vectorises well;
+    // the explicit small block only helps (and is only needed by) the GPU.
+    if constexpr (Kokkos::SpaceAccessibility<ExecSpace,
+                                             Kokkos::HostSpace>::accessible) {
+        return Range3({0, 0, 0}, {Neta, Ny, Nx});
+    } else {
+        int tEta = (Neta >= 4) ? 4 : (Neta < 1 ? 1 : Neta);
+        int tX   = (Nx   >= 32) ? 32 : (Nx < 1 ? 1 : Nx);
+        int budget = 256 / (tEta * tX);
+        if (budget < 1) budget = 1;
+        int tY = (Ny < budget) ? Ny : budget;
+        if (tY < 1) tY = 1;
+        return Range3({0, 0, 0}, {Neta, Ny, Nx}, {tEta, tY, tX});
+    }
 }
 
 // ── singleton ─────────────────────────────────────────────────────────────────

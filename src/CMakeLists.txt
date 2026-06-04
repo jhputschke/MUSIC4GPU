@@ -198,6 +198,14 @@ if (USE_KOKKOS)
         if (GSL_FOUND)
             target_include_directories(${libname} PRIVATE ${GSL_INCLUDE_DIR})
         endif()
+        # Stage 2 perf parity: fast-math intrinsics for the compute-bound device
+        # kernels (Newton reconstruction sqrtf/divides, transport expf/powf) —
+        # exactly what the native CUDA backend already enables (CMakeLists.txt).
+        # The hydro state is FP32 (~6e-4 vs the double CPU); fast-math stays far
+        # inside the 1e-3 gate while ~halving the delta_qi/w_full cost.  Applied
+        # only to the CUDA-language TUs (our kernels), not Kokkos' own sources.
+        target_compile_options(${libname} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
     endif()
 endif()
 

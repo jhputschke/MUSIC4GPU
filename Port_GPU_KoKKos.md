@@ -27,8 +27,8 @@ and throughput runs.
 |---|---|---|
 | 0 | Infrastructure (build, lifecycle, seam, skeletons) | ✅ done (pre-existing) |
 | **1** | **Functional GPU parity — all 9 kernels ported; Serial/OpenMP/Cuda validated** | ✅ **done** |
-| 2 | Perf parity (fast-math, `__restrict__`, RandomAccess EOS, MDRange tiling) + AMD/Intel notes | ⏳ next |
-| 3 | Kokkos-native optimizations (kernel fusion behind a flag) | ⏳ |
+| **2** | **Perf parity (fast-math + occupancy MDRange tile) → 0.79× native CUDA; AMD/Intel notes** | ✅ **done** |
+| 3 | Kokkos-native optimizations (kernel fusion behind a flag) | ⏳ next |
 | 4 | Single-source unification posture (OpenMP replaces CPU loops; D9 gate) | ⏳ |
 | 5 | Extend GPU coverage notes + final validation | ⏳ |
 
@@ -53,36 +53,58 @@ validated CUDA kernels (same float32 ops, same order), so they reproduce the
 solver.  This is also the **D9 cross-backend single-source consistency gate**:
 OpenMP and Cuda, compiled from one kernel source, agree with CPU identically.
 
-## Throughput (untuned Stage-1 baseline)
+## Throughput — Stage 1 (untuned) → Stage 2 (perf parity)
 
 128×128×1 Gubser viscous, per-step compute isolated as
 `(T(220 steps) − T(20 steps)) / 200`, min of 3 runs:
 
-| Backend | per-step | speedup vs CPU | vs native CUDA |
+| Backend | Stage-1 per-step | **Stage-2 per-step** | vs native CUDA |
 |---|---|---|---|
-| CPU (OpenMP, 20 threads) | 12.98 ms | 1.0× | — |
-| native CUDA (GB10) | 2.95 ms | 4.4× | 1.0× |
-| Kokkos / Cuda (GB10) | 11.76 ms | 1.1× | 0.25× |
-| Kokkos / OpenMP (20 threads) | 10.53 ms | 1.2× | — |
+| CPU (OpenMP, 20 threads) | 12.98 ms | 13.11 ms | — |
+| native CUDA (GB10) | 2.95 ms | **2.89 ms** | 1.0× |
+| Kokkos / Cuda (GB10) | 11.76 ms | **3.65 ms** | **0.79×** |
+| Kokkos / OpenMP (20 threads) | 10.53 ms | 12.08 ms | — |
 
-**Stage 1 is correct but untuned** — by design (PlanKokkosPort.md Stage 1 =
-"~0.8–1.0× native CUDA, correct, untuned").  The Kokkos/Cuda kernels are ~4×
-off native CUDA because they are missing the three levers the native build
-already has, all of which are **Stage 2** work:
+**Stage 2 brought Kokkos/Cuda from 0.25× → 0.79× native CUDA** (3.2× faster),
+into the plan's Stage-2 band ("≈1.0× CUDA"), with **precision unchanged**
+(6.44e-04, mean now exactly the native-CUDA 1.87e-04).  Two levers did it; a
+third was tried and rejected:
 
-1. **`--use_fast_math`** — native CUDA compiles the kernels with it
-   (`src/CMakeLists.txt`); the Kokkos device TUs do not yet.  The pipeline is
-   dominated (~60%) by `delta_qi`'s Newton-Brent solve + 12 reconstructions/cell,
-   all transcendental-heavy (`sqrtf`/`logf`/`expf`/`powf`/division) — fast-math
-   is the single biggest win here.
-2. **`__restrict__` aliasing** — native kernels mark every pointer
-   `__restrict__`; the Stage-1 Kokkos lambdas capture plain `float*`, so the
-   compiler must assume aliasing and loses reorderings.
-3. **MDRangePolicy tiling / RandomAccess EOS** — native uses a hand-tuned
-   8×8×4 block + `__ldg` read-only EOS cache; Stage-1 Kokkos uses the default
-   MDRange tiling and plain global loads.
+1. **`--use_fast_math`** on the Kokkos CUDA TUs (`src/CMakeLists.txt`, mirroring
+   the native backend): 11.76 → 6.69 ms.  The pipeline is dominated (~60%) by
+   `delta_qi`'s Newton-Brent solve + 12 reconstructions/cell, all transcendental
+   (`sqrtf`/`logf`/`expf`/`powf`/division), so fast-math is the biggest single
+   win.  FP32 truncation dominates the error budget, so precision is untouched.
+2. **Occupancy-capped MDRange tile** (`range3()` in `KokkosPipelines.cpp`):
+   `{tEta≤4, tY, tX≤32}` with product ≤256, reproducing the native
+   `compute_launch` geometry (eta≤4, x=32 coalesced, ≤256-thread block).  With
+   fast-math this took 6.69 → **3.65 ms**.  The cap is what keeps the
+   register-heavy `delta_qi`/`w_full` below the occupancy cliff.  Applied to GPU
+   spaces only (`if constexpr` on `SpaceAccessibility`); host keeps the default
+   tiling, which auto-vectorises.
+3. **`__restrict__` on the kernel pointers — *rejected*.**  Native CUDA marks
+   every pointer `__restrict__`, but on Blackwell + Kokkos it *regressed*
+   throughput (6.69 → 9.99 ms, and 7.71 ms even with the tile): the extra
+   no-reload register pressure pushed the heavy kernels over the occupancy
+   cliff.  Removing it gave the 3.65 ms result.  Left out.
 
-None of these affects correctness, which is why Stage 1 ships them deferred.
+**Not pursued (diminishing returns past 0.79×, would touch every kernel):**
+RandomAccess EOS Views (`MemoryTraits<RandomAccess>` → `__ldg` texture path) and
+the flat→rank-2 layout-templated Views (D3/§2a).  The flat `comp*Ncells+cell`
+indexing already gives coalesced GPU access; the layout migration mainly buys
+CPU-backend vectorisation and is better folded into the Stage-4 unification,
+where the OpenMP path replaces the legacy CPU loops.
+
+### AMD (HIP) / Intel (SYCL) — build-matrix only on this box
+
+The port is genuinely backend-agnostic: one kernel source, `MDRangePolicy`,
+`Kokkos::SharedSpace` keyed off the space's unified-memory trait (no `#ifdef`),
+`parallel_reduce<Max>` (no vendor atomics).  Bringing up AMD/Intel is a configure
+flip — `-DKokkos_ENABLE_HIP=ON -DKokkos_ARCH_AMD_GFX90A=ON` (MI250X/Frontier) or
+`-DKokkos_ENABLE_SYCL=ON -DKokkos_ARCH_INTEL_PVC=ON` (Aurora) — plus the same
+`tests/eos_gpu_vs_cpu.sh` gate.  **This machine has only the NVIDIA GB10**, so
+HIP/SYCL are wired-and-documented but not run here; the Serial/OpenMP/Cuda
+consistency (all 6.44e-04 vs CPU) is the portability evidence available on-box.
 
 ---
 
