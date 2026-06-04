@@ -92,7 +92,10 @@ endif()
 
 add_library(${libname} SHARED ${SOURCES})
 # Bind pretty_ostream symbols locally so iSS/3dMCGlauber's copies don't override
-target_link_options(${libname} PRIVATE "-Wl,-Bsymbolic-functions")
+# -Bsymbolic-functions is Linux/GNU ld only; Apple ld64 doesn't support it
+if (NOT APPLE)
+    target_link_options(${libname} PRIVATE "-Wl,-Bsymbolic-functions")
+endif()
 set(CompileFlags "")
 if (APPLE)
     set(CompileFlags "${CompileFlags} -DAPPLE")
