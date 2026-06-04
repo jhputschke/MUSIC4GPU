@@ -33,9 +33,8 @@ back-end at configure time.
 - A **C++20** compiler (Kokkos 5.x requires C++20) — e.g. GCC ≥ 10 or Clang ≥ 13.
   The `USE_KOKKOS` configuration raises MUSIC to C++20 automatically.
 - **git** (used by `get_kokkos.sh` to clone Kokkos and resolve the latest tag).
-- For a GPU build (Stage 2): the vendor toolchain — CUDA (NVIDIA), ROCm/HIP
-  (AMD), or oneAPI/SYCL (Intel). Stage 0 builds on the **Serial / OpenMP** host
-  back-end and needs none of these.
+- For a GPU build: the vendor toolchain — CUDA (NVIDIA), ROCm/HIP (AMD), or
+  oneAPI/SYCL (Intel). The **Serial / OpenMP** host back-ends need none of these.
 
 ---
 
@@ -111,14 +110,16 @@ options passed to the `cmake` line:
 
 | Backend | Flags | Status |
 |---|---|---|
-| Serial (host) | `-DKokkos_ENABLE_SERIAL=ON` | **Stage 0 — works** |
-| OpenMP (multicore host) | `-DKokkos_ENABLE_OPENMP=ON` | **Stage 0 — works** |
-| CUDA (NVIDIA) | `-DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_<GPU>=ON` (e.g. `Kokkos_ARCH_HOPPER90`) | Stage 1–2 |
-| HIP (AMD) | `-DKokkos_ENABLE_HIP=ON -DKokkos_ARCH_AMD_GFX90A=ON` (MI250X) | Stage 2 |
-| SYCL (Intel) | `-DKokkos_ENABLE_SYCL=ON -DKokkos_ARCH_INTEL_PVC=ON` (Aurora) | Stage 2 |
+| Serial (host) | `-DKokkos_ENABLE_SERIAL=ON` | ✅ validated (6.44e-04 vs CPU) |
+| OpenMP (multicore host) | `-DKokkos_ENABLE_OPENMP=ON` | ✅ validated (6.44e-04 vs CPU) |
+| CUDA (NVIDIA) | `-DKokkos_ENABLE_CUDA=ON -DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON -DKokkos_ARCH_<GPU>=ON` (GB10 = `Kokkos_ARCH_BLACKWELL121`; also `HOPPER90`, …) | ✅ validated on GB10 (6.44e-04, 0.79× native CUDA) |
+| HIP (AMD) | `-DKokkos_ENABLE_HIP=ON -DKokkos_ARCH_AMD_GFX90A=ON` (MI250X) | wired; not run (no AMD HW here) |
+| SYCL (Intel) | `-DKokkos_ENABLE_SYCL=ON -DKokkos_ARCH_INTEL_PVC=ON` (Aurora) | wired; not run (no Intel HW here) |
 
-Until Stage 1 lands the kernels, every back-end build runs the CPU reference
-path regardless of the execution space selected.
+The CUDA build uses the **CMake CUDA-language** path
+(`-DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON`) so only the Kokkos device TUs go
+through `nvcc` and the rest of MUSIC stays plain host `g++`. The full GB10 line is
+in **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)**.
 
 ---
 
@@ -158,15 +159,17 @@ GPU_BIN=$PWD/build_kokkos/src/MUSIChydro bash tests/eos_gpu_vs_cpu.sh
 
 - `tests/eos_gpu_vs_cpu.sh` — **correctness** oracle: compares `eps_max(τ)` of
   the CPU and GPU binaries within `TOL` (1e-3), default EOS 91 (hotQCD).
-- `tests/cuda_vs_cpu_bench.sh`, `tests/cuda_perstep_bench.sh` — **throughput**
-  and **per-step** benchmarks (meaningful once Stage 1 dispatches to the GPU;
-  to be renamed to backend-explicit variants, e.g. `kokkos_vs_cpu_bench.sh`).
+- `tests/kokkos_consistency.sh` — **D9 single-source gate**: runs the same input
+  on every built Kokkos backend (Serial/OpenMP/Cuda) + CPU and checks each vs CPU
+  (1e-3) and the Kokkos backends vs each other (1e-4).
+- `tests/cuda_vs_cpu_bench.sh`, `tests/cuda_perstep_bench.sh` — throughput / per-step.
 
-**Stage-0 result on this branch:** `eos_gpu_vs_cpu.sh` reports **[3/3] PASS,
-max rel error `0.00e+00`** (the `USE_KOKKOS` build reproduces the CPU reference
-bit-for-bit) and **[2/3] PASS**. Check **[1/3] ("GPU dispatch") FAILs by
-design** — the skeleton's `KokkosPipelines::initialize()` returns false, so
-MUSIC runs the CPU path; [1/3] flips to PASS at Stage 1.
+**Current result (Stages 1–5):** all three Kokkos backends PASS `eos_gpu_vs_cpu.sh`
+**[1/3][2/3][3/3]** at **max rel error 6.44e-04** vs CPU — *identical to the native
+CUDA build*. `kokkos_consistency.sh` is green: Serial ≡ OpenMP (0.00e+00), Cuda
+within 1.2e-5. Shear, bulk, and full-3D configs all pass. Throughput on GB10 is
+**0.79× native CUDA**. See **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)** for the
+per-stage precision/throughput tables.
 
 ---
 
@@ -178,8 +181,9 @@ MUSIC runs the CPU path; [1/3] flips to PASS at Stage 1.
 | `CMakeLists.txt` | `USE_KOKKOS` option, mutual exclusion, C++20 + PIC, Kokkos discovery (`add_subdirectory` / `find_package`) |
 | `src/CMakeLists.txt` | Kokkos source branch; links `Kokkos::kokkos` into `libmusic` |
 | `src/advance.h` | Third `GPUPipelines` alias branch + `MUSIC_USE_GPU` guard for `USE_KOKKOS` |
-| `src/gpu/KokkosPipelines.{h,cpp}` | Singleton mirroring `CUDAPipelines.h` (7 `dispatch_*`, `reduce_max`, `wait`, …); PIMPL, Kokkos-free header |
-| `src/gpu/GPUGrid_kokkos.cpp` | Kokkos backing for the existing `GPUGrid` class (counterpart of `GPUGrid_cuda.cu`) |
+| `src/gpu/music_kernels_kokkos.hpp` | The 9 ported hydro kernels + device helpers (`KOKKOS_INLINE_FUNCTION`); single source for all backends (counterpart of `music_kernels.cu`) |
+| `src/gpu/KokkosPipelines.{h,cpp}` | Singleton mirroring `CUDAPipelines.h` (7 `dispatch_*`, `reduce_max`, `wait`, …); PIMPL, Kokkos-free header; `parallel_for` over `MDRangePolicy<Rank<3>>` |
+| `src/gpu/GPUGrid_kokkos.cpp` | Kokkos backing for the existing `GPUGrid` class (`Kokkos::View<float*, SharedSpace>`; counterpart of `GPUGrid_cuda.cu`) |
 | `src/gpu/kokkos_runtime.{h,cpp}` | Host-safe `KokkosRuntimeGuard` (the only TU that includes Kokkos headers) |
 | `src/main.cpp` | Stand-alone `KokkosRuntimeGuard` bracketing the run |
 
@@ -206,8 +210,32 @@ matching `USE_KOKKOS` option and a Kokkos-fetch hint.)
 
 ## Status & roadmap
 
-Stage 0 (this branch) delivers the build integration, the runtime lifecycle, the
-back-end seam, and skeleton TUs — a green build that falls through to the CPU
-reference. Stages 1–5 (kernel port → performance parity → AMD/Intel bring-up →
-kernel fusion → single-source unification) are detailed in
-**[PlanKokkosPort.md](PlanKokkosPort.md)**.
+**Stages 0–5 are done** (roadmap in **[PlanKokkosPort.md](PlanKokkosPort.md)**,
+per-stage results in **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)**):
+
+- **0** infrastructure · **1** all 9 kernels ported (Serial/OpenMP/Cuda parity) ·
+  **2** perf parity on GB10 (fast-math + occupancy tile → 0.79× native CUDA) ·
+  **3** `delta_qi+finalize` fusion behind `MUSIC_KOKKOS_FUSE` (off by default —
+  not a win on Blackwell) · **4** D9 single-source consistency gate green ·
+  **5** coverage matrix + shear/bulk/3D breadth validated.
+
+The Kokkos build reproduces the CPU reference to the **same precision as native
+CUDA** (6.44e-04), from one kernel source running on three execution spaces.
+
+### Next steps
+
+- **Discrete GPUs (A100 / H100 / RTX / MI250X / PVC).** The port was tuned on the
+  GB10's *coherent* unified memory and uses `Kokkos::SharedSpace` (managed) for
+  all buffers — correct on a discrete GPU but not optimal (demand-paged migration
+  instead of pinned bulk DMA + copy/compute overlap). The native CUDA backend's
+  discrete-specific memory path is **not yet carried over**; the pick-up plan —
+  what already carries over, the native-CUDA→Kokkos mapping, a DG0–DG4 roadmap,
+  file-level hooks, and the verification recipe — is in
+  **[PlanKoKKosDiscrete.md](PlanKoKKosDiscrete.md)**. (Needs real discrete
+  hardware to benchmark; precision is unaffected.)
+- **AMD (HIP) / Intel (SYCL).** Backend-agnostic by construction — a configure
+  flip plus the same `eos_gpu_vs_cpu.sh` / `kokkos_consistency.sh` gates; not
+  runnable on this NVIDIA-only box.
+- **Single-source cleanup (deferred Stage-4 tail).** View-back `Fields` and retire
+  the legacy CPU per-cell loops once Stage-5 coverage (baryon diffusion, finite-µB
+  EOS, multi-charge) lands per-feature (D8).
