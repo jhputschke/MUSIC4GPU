@@ -186,6 +186,24 @@ if (USE_KOKKOS)
             find_package(Kokkos REQUIRED)
         endif()
     endif()
+
+    # When Kokkos targets CUDA (NVIDIA), the MUSIC device TUs (the ported
+    # kernels + managed-View allocation in KokkosPipelines.cpp / GPUGrid_kokkos.cpp)
+    # must be compiled by nvcc.  Use the CMake CUDA language so ONLY those TUs go
+    # through nvcc while the rest of MUSIC stays plain host C++ (PIMPL boundary,
+    # D7) — this requires configuring Kokkos with
+    # -DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON.  src/CMakeLists.txt then marks
+    # the two device sources LANGUAGE CUDA.
+    if (Kokkos_ENABLE_CUDA)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 20)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+            set(CMAKE_CUDA_ARCHITECTURES native)
+        endif()
+        message(STATUS "Kokkos targets CUDA — device TUs via nvcc "
+                       "(CC ${CMAKE_CUDA_ARCHITECTURES}).")
+    endif()
     message(STATUS "Kokkos backend enabled (USE_KOKKOS=ON).")
 endif()
 

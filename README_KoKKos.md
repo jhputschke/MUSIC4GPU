@@ -1,14 +1,15 @@
 # MUSIC4GPU — Kokkos Backend (portable: NVIDIA / AMD / Intel GPU + multicore CPU)
 
-> **Experimental — Stage-0 scaffolding, no kernels yet.** This is the
+> **Experimental — Stage 1 complete (functional GPU parity).** This is the
 > performance-portable [Kokkos](https://github.com/kokkos/kokkos) back-end for
-> MUSIC. The build integration, runtime lifecycle, and back-end seam are in
-> place and validated, but the compute kernels are **not yet ported** — a
-> `USE_KOKKOS` build currently **runs the CPU reference path** (it reproduces
-> the CPU result bit-for-bit). Kernel porting is Stage 1. See
-> **[PlanKokkosPort.md](PlanKokkosPort.md)** for the full feasibility study and
-> staged roadmap, and the scope/status disclaimer in the main
-> [README.md](README.md) before use.
+> MUSIC. All nine hydro kernels are ported and validated on the **Serial /
+> OpenMP / Cuda** backends from one kernel source: the `eps_max(τ)` trace
+> agrees with the CPU reference **identically to the native CUDA build**
+> (max rel err 6.44e-04 on a 32×32×1 hotQCD Gubser run, same as CUDA). The
+> Stage-1 kernels are correct but **untuned** (no fast-math / `__restrict__` /
+> tile tuning yet — Stage 2). See **[PlanKokkosPort.md](PlanKokkosPort.md)** for
+> the staged roadmap and **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)** for the
+> per-stage implementation + precision/throughput runs.
 
 The Kokkos back-end targets **one kernel body that runs on NVIDIA, AMD, and
 Intel GPUs plus multicore CPUs**, selected at build time by Kokkos execution

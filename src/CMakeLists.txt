@@ -179,6 +179,26 @@ if (USE_KOKKOS)
     target_include_directories(${libname} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu
     )
+    # CUDA backend: compile the Kokkos-touching TUs with nvcc (CMake CUDA
+    # language), leaving the rest of MUSIC as host C++ TUs (PIMPL boundary, D7).
+    # Any TU that includes <Kokkos_Core.hpp> must go through nvcc once Kokkos is
+    # built with CUDA (the header hard-errors under a non-__CUDACC__ compiler),
+    # so the init/finalize shim is compiled as CUDA too — it still contains no
+    # device code, just Kokkos::initialize/finalize host calls.
+    if (Kokkos_ENABLE_CUDA)
+        set_source_files_properties(
+            gpu/GPUGrid_kokkos.cpp
+            gpu/KokkosPipelines.cpp
+            gpu/kokkos_runtime.cpp
+            PROPERTIES LANGUAGE CUDA
+        )
+        # GSL include must also reach the nvcc compilations (the device TUs pull
+        # grid.h/fields.h, which are GSL-free today, but keep parity with the
+        # CUDA backend's include wiring to be safe).
+        if (GSL_FOUND)
+            target_include_directories(${libname} PRIVATE ${GSL_INCLUDE_DIR})
+        endif()
+    endif()
 endif()
 
 
