@@ -91,6 +91,8 @@ if (USE_CUDA)
 endif()
 
 add_library(${libname} SHARED ${SOURCES})
+# Bind pretty_ostream symbols locally so iSS/3dMCGlauber's copies don't override
+target_link_options(${libname} PRIVATE "-Wl,-Bsymbolic-functions")
 set(CompileFlags "")
 if (APPLE)
     set(CompileFlags "${CompileFlags} -DAPPLE")
