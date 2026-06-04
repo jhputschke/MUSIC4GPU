@@ -203,6 +203,16 @@ Cuda differs only at **1.2e-5** (fast-math FP reordering), an order of magnitude
 inside the D10 cross-backend tolerance.  This is the single-source correctness
 guarantee the unification stage exists to provide.
 
+**Wired into CI (D9 made continuous).** `.github/workflows/BuildTest.yml` gains a
+`kokkos-consistency` job that, on every push, builds the CPU reference + the
+Serial and OpenMP host backends and runs `kokkos_consistency.sh` with **EOS 0**
+(ideal gas — analytic, so no table download is needed on the runner), gating on
+**Serial ≡ OpenMP** and both vs CPU.  The Cuda backend needs a GPU runner, so it
+is auto-skipped in CI and checked on hardware.  This makes the single-source
+"no-drift" guarantee a per-push gate, not just a manual script.  (Kokkos is
+fetched at the **pinned 5.1.1** default — `get_kokkos.sh` now pins by default,
+with `latest` as an opt-in — so the gate builds reproducibly.)
+
 **Deliberately deferred (de-risk; not on the precision critical path):** the
 remaining Stage-4 items in PlanKokkosPort.md — *View-backing `Fields`* (D5) and
 *deleting the legacy CPU per-cell loops* — are a wide refactor of the host

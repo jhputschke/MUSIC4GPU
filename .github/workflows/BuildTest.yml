@@ -44,3 +44,36 @@ jobs:
       - name: net baryon diffusion 1D Test
         run: |
           $GITHUB_WORKSPACE/tests/test_1+1D_with_Akihiko/RunAutoTest.sh
+
+  # ── Kokkos single-source cross-backend consistency gate (PlanKokkosPort.md D9) ─
+  # Builds the CPU reference and two Kokkos host backends (Serial + OpenMP) from
+  # the ONE kernel source, and checks each vs CPU and the Kokkos backends vs each
+  # other (tests/kokkos_consistency.sh).  Uses EOS 0 (ideal gas, analytic — no
+  # table download needed in CI).  The Cuda backend needs a GPU runner, so it is
+  # exercised on hardware (it is auto-skipped here); Serial == OpenMP is the
+  # exec-space-independence proof that catches single-source drift on every push.
+  kokkos-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - name: Fetch Kokkos (pinned 5.1.1)
+        run: bash get_kokkos.sh
+      - name: Build CPU reference
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j2
+      - name: Build Kokkos Serial backend
+        run: |
+          cmake -S . -B build_kokkos_serial -DUSE_KOKKOS=ON \
+                -DKokkos_ENABLE_SERIAL=ON -DKokkos_ENABLE_OPENMP=OFF \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build build_kokkos_serial -j2
+      - name: Build Kokkos OpenMP backend
+        run: |
+          cmake -S . -B build_kokkos -DUSE_KOKKOS=ON \
+                -DKokkos_ENABLE_SERIAL=ON -DKokkos_ENABLE_OPENMP=ON \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build build_kokkos -j2
+      - name: D9 consistency gate (Serial == OpenMP, both vs CPU)
+        run: EOS_ID=0 bash tests/kokkos_consistency.sh

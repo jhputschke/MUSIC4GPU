@@ -45,13 +45,15 @@ Fetch Kokkos with the helper script (run from the music4gpu repo root). It
 clones into `external/kokkos/` (git-ignored), where the build looks for it:
 
 ```bash
-bash get_kokkos.sh            # latest Kokkos release (default)
-bash get_kokkos.sh 5.1.1      # or pin a specific release tag
+bash get_kokkos.sh            # pinned default 5.1.1 (reproducible)
+bash get_kokkos.sh 5.1.1      # an explicit release tag (same as default)
+bash get_kokkos.sh latest     # track the newest release instead
 ```
 
-- **Default = latest release**, resolved with `git ls-remote --sort=-v:refname`
-  (no GitHub API / `jq` needed). **Pin a version** for reproducible CI / HPC
-  builds.
+- **Default = pinned 5.1.1** — the release this backend was developed and
+  validated against, so stand-alone / CI / HPC builds are reproducible out of
+  the box. Pass an explicit tag to override, or `latest` to resolve the newest
+  release (`git ls-remote --sort=-v:refname`; no GitHub API / `jq` needed).
 - The script is **idempotent** — re-running with `external/kokkos` present is a
   no-op (`rm -rf external/kokkos` to re-clone).
 
@@ -162,7 +164,11 @@ GPU_BIN=$PWD/build_kokkos/src/MUSIChydro bash tests/eos_gpu_vs_cpu.sh
   the CPU and GPU binaries within `TOL` (1e-3), default EOS 91 (hotQCD).
 - `tests/kokkos_consistency.sh` — **D9 single-source gate**: runs the same input
   on every built Kokkos backend (Serial/OpenMP/Cuda) + CPU and checks each vs CPU
-  (1e-3) and the Kokkos backends vs each other (1e-4).
+  (1e-3) and the Kokkos backends vs each other (1e-4). **Runs in CI** on every
+  push (`.github/workflows/BuildTest.yml`, `kokkos-consistency` job): it builds
+  the CPU reference + the Serial and OpenMP host backends and gates on
+  Serial ≡ OpenMP (using EOS 0, so no table download is needed). The Cuda backend
+  is auto-skipped in CI (needs a GPU runner) and is checked on hardware.
 - `tests/cuda_vs_cpu_bench.sh`, `tests/cuda_perstep_bench.sh` — throughput / per-step.
 
 **Current result (Stages 1–5):** all three Kokkos backends PASS `eos_gpu_vs_cpu.sh`
@@ -256,8 +262,8 @@ matching `USE_KOKKOS` option and a Kokkos-fetch hint.)
   static archive is built with `-fPIC` (`CMAKE_POSITION_INDEPENDENT_CODE ON`).
   Without it the link fails on AArch64 (`relocation R_AARCH64_* … recompile with
   -fPIC`).
-- **Reproducible builds:** pin the Kokkos tag (`get_kokkos.sh <tag>`); the
-  default pulls whatever the latest release is at clone time.
+- **Reproducible builds:** `get_kokkos.sh` is **pinned to 5.1.1 by default**;
+  pass `latest` only if you intend to track the newest release.
 - **No Apple-Metal target:** on macOS use `-DUSE_METAL=ON` instead; Kokkos does
   not cover Apple GPUs.
 
