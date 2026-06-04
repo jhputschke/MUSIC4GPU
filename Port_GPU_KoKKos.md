@@ -29,8 +29,8 @@ and throughput runs.
 | **1** | **Functional GPU parity — all 9 kernels ported; Serial/OpenMP/Cuda validated** | ✅ **done** |
 | **2** | **Perf parity (fast-math + occupancy MDRange tile) → 0.79× native CUDA; AMD/Intel notes** | ✅ **done** |
 | **3** | **Kokkos-native optimization: delta_qi+finalize fusion behind `MUSIC_KOKKOS_FUSE` (D11)** | ✅ **done** |
-| 4 | Single-source unification posture (OpenMP replaces CPU loops; D9 gate) | ⏳ next |
-| 5 | Extend GPU coverage notes + final validation | ⏳ |
+| **4** | **Single-source unification: D9 gate green (Serial≡OpenMP, Cuda@1.2e-5); `kokkos_consistency.sh`** | ✅ **done** |
+| 5 | Extend GPU coverage notes + final validation | ⏳ next |
 
 ---
 
@@ -107,6 +107,43 @@ HIP/SYCL are wired-and-documented but not run here; the Serial/OpenMP/Cuda
 consistency (all 6.44e-04 vs CPU) is the portability evidence available on-box.
 
 ---
+
+## Stage 4 — single-source unification posture (D5 / D7 / D9)
+
+The unification thesis — *collapse the triplicated CUDA + Metal + CPU per-cell
+physics into one source with no drift* — is **architecturally realized for the
+GPU-supported configs already**: `music_kernels_kokkos.hpp` is the *only* copy
+of those kernels, and it is what runs on Serial, OpenMP, **and** Cuda.  On a
+CPU-only machine a `USE_KOKKOS` + OpenMP build's `try_gpu_advance` path *is* the
+single Kokkos source executing on OpenMP — there is no separate hand-written CPU
+GPU-twin to drift from it.
+
+**The D9 gate makes that concrete** (`tests/kokkos_consistency.sh`): one input,
+the same source compiled three ways, EOS 91 / 32²×1 / 101 steps:
+
+| comparison | max rel err | gate |
+|---|---|---|
+| Kokkos-Serial vs CPU (double) | 6.44e-04 | < 1e-3 ✅ |
+| Kokkos-OpenMP vs CPU (double) | 6.44e-04 | < 1e-3 ✅ |
+| Kokkos-Cuda  vs CPU (double) | 6.44e-04 | < 1e-3 ✅ |
+| **Kokkos-Serial vs Kokkos-OpenMP** | **0.00e+00** | < 1e-4 ✅ |
+| Kokkos-Serial vs Kokkos-Cuda | 1.22e-05 | < 1e-4 ✅ |
+| Kokkos-OpenMP vs Kokkos-Cuda | 1.22e-05 | < 1e-4 ✅ |
+
+Serial and OpenMP are **bit-identical** (same float ops, same order, host libm);
+Cuda differs only at **1.2e-5** (fast-math FP reordering), an order of magnitude
+inside the D10 cross-backend tolerance.  This is the single-source correctness
+guarantee the unification stage exists to provide.
+
+**Deliberately deferred (de-risk; not on the precision critical path):** the
+remaining Stage-4 items in PlanKokkosPort.md — *View-backing `Fields`* (D5) and
+*deleting the legacy CPU per-cell loops* — are a wide refactor of the host
+evolution path (`advance.cpp` / `dissipative.cpp` / `u_derivative.cpp`) whose
+*output* is already validated-equivalent here.  They are pure maintainability
+(remove the still-present legacy CPU fallback), they do not change any precision
+result, and the legacy CPU path must stay anyway until Stage 5 extends Kokkos to
+the currently CPU-only configs (D8).  Doing the deletion now would risk the
+green state for no precision gain, so it is sequenced after Stage 5 coverage.
 
 ## Stage 3 — kernel fusion behind a flag (D11)
 
