@@ -114,37 +114,41 @@ void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
     //     idle threads keep busy-spinning unless the user exported the policy
     //     into the environment *before* launch, which libgomp reads at load.
     {
-        const char* wp = getenv("OMP_WAIT_POLICY");
-        const char* od = getenv("MUSIC_OMP_DEFAULTS");
-        const bool defaults_off = (od != nullptr && od[0] == '0');
-        const bool have_runtime_setter = (kmp_set_blocktime != nullptr);
+        static bool omp_info_printed = false;
+        if (!omp_info_printed) {
+            omp_info_printed = true;
+            const char* wp = getenv("OMP_WAIT_POLICY");
+            const char* od = getenv("MUSIC_OMP_DEFAULTS");
+            const bool defaults_off = (od != nullptr && od[0] == '0');
+            const bool have_runtime_setter = (kmp_set_blocktime != nullptr);
 #ifdef _OPENMP
-        const int nthreads = omp_get_max_threads();
+            const int nthreads = omp_get_max_threads();
 #else
-        const int nthreads = 1;
+            const int nthreads = 1;
 #endif
-        fprintf(stderr, "[MUSIC-GPU] OMP wait policy: %s (max threads %d)\n",
-                wp ? wp : "runtime-default", nthreads);
-        if (defaults_off) {
-            fprintf(stderr, "[MUSIC-GPU]   music4gpu OMP defaults disabled "
-                            "(MUSIC_OMP_DEFAULTS=0)\n");
-        } else if (have_runtime_setter || g_user_set_wait_policy) {
-            // libomp applied blocktime=0, or the user exported the policy and
-            // every runtime (libgomp included) honored it at load.
-            fprintf(stderr, "[MUSIC-GPU]   in effect (%s)\n",
-                    g_user_set_wait_policy
-                        ? "set in environment before launch"
-                        : "kmp_set_blocktime(0), libomp runtime");
-        } else {
-            // libgomp build with no user-supplied policy: our default was too
-            // late, so idle threads still busy-spin.
-            fprintf(stderr,
-                    "[MUSIC-GPU]   WARNING: NOT in effect — this is a GCC/libgomp "
-                    "build, which reads OMP_WAIT_POLICY before the music4gpu "
-                    "default is set and has no runtime setter.\n"
-                    "[MUSIC-GPU]            Idle worker threads will busy-spin and "
-                    "inflate CPU time. To fix, 'export OMP_WAIT_POLICY=passive' "
-                    "(or GOMP_SPINCOUNT=0) BEFORE launching.\n");
+            fprintf(stderr, "[MUSIC-GPU] OMP wait policy: %s (max threads %d)\n",
+                    wp ? wp : "runtime-default", nthreads);
+            if (defaults_off) {
+                fprintf(stderr, "[MUSIC-GPU]   music4gpu OMP defaults disabled "
+                                "(MUSIC_OMP_DEFAULTS=0)\n");
+            } else if (have_runtime_setter || g_user_set_wait_policy) {
+                // libomp applied blocktime=0, or the user exported the policy and
+                // every runtime (libgomp included) honored it at load.
+                fprintf(stderr, "[MUSIC-GPU]   in effect (%s)\n",
+                        g_user_set_wait_policy
+                            ? "set in environment before launch"
+                            : "kmp_set_blocktime(0), libomp runtime");
+            } else {
+                // libgomp build with no user-supplied policy: our default was too
+                // late, so idle threads still busy-spin.
+                fprintf(stderr,
+                        "[MUSIC-GPU]   WARNING: NOT in effect — this is a GCC/libgomp "
+                        "build, which reads OMP_WAIT_POLICY before the music4gpu "
+                        "default is set and has no runtime setter.\n"
+                        "[MUSIC-GPU]            Idle worker threads will busy-spin and "
+                        "inflate CPU time. To fix, 'export OMP_WAIT_POLICY=passive' "
+                        "(or GOMP_SPINCOUNT=0) BEFORE launching.\n");
+            }
         }
     }
 
