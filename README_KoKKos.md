@@ -112,7 +112,7 @@ options passed to the `cmake` line:
 |---|---|---|
 | Serial (host) | `-DKokkos_ENABLE_SERIAL=ON` | ✅ validated (6.44e-04 vs CPU) |
 | OpenMP (multicore host) | `-DKokkos_ENABLE_OPENMP=ON` | ✅ validated (6.44e-04 vs CPU) |
-| CUDA (NVIDIA) | `-DKokkos_ENABLE_CUDA=ON -DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON -DKokkos_ARCH_<GPU>=ON` (GB10 = `Kokkos_ARCH_BLACKWELL121`; also `HOPPER90`, …) | ✅ validated on GB10 (6.44e-04, 0.79× native CUDA) |
+| CUDA (NVIDIA) | `-DKokkos_ENABLE_CUDA=ON -DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON -DKokkos_ARCH_<GPU>=ON` (GB10 = `Kokkos_ARCH_BLACKWELL121`; also `HOPPER90`, …) | ✅ validated on GB10 (6.44e-04; ~0.8× native CUDA — Performance §) |
 | HIP (AMD) | `-DKokkos_ENABLE_HIP=ON -DKokkos_ARCH_AMD_GFX90A=ON` (MI250X) | wired; not run (no AMD HW here) |
 | SYCL (Intel) | `-DKokkos_ENABLE_SYCL=ON -DKokkos_ARCH_INTEL_PVC=ON` (Aurora) | wired; not run (no Intel HW here) |
 
@@ -167,9 +167,55 @@ GPU_BIN=$PWD/build_kokkos/src/MUSIChydro bash tests/eos_gpu_vs_cpu.sh
 **Current result (Stages 1–5):** all three Kokkos backends PASS `eos_gpu_vs_cpu.sh`
 **[1/3][2/3][3/3]** at **max rel error 6.44e-04** vs CPU — *identical to the native
 CUDA build*. `kokkos_consistency.sh` is green: Serial ≡ OpenMP (0.00e+00), Cuda
-within 1.2e-5. Shear, bulk, and full-3D configs all pass. Throughput on GB10 is
-**0.79× native CUDA**. See **[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)** for the
-per-stage precision/throughput tables.
+within 1.2e-5. Shear, bulk, and full-3D configs all pass. On GB10 throughput is
+**~0.8× native CUDA** (Performance section below). See
+**[Port_GPU_KoKKos.md](Port_GPU_KoKKos.md)** for the per-stage precision /
+throughput tables.
+
+---
+
+## Performance — Kokkos/Cuda vs native CUDA
+
+On the GB10 the Kokkos CUDA backend reaches **precision parity but *not*
+throughput parity** with the hand-written native CUDA backend. Per-step compute
+(128×128×1, `(T_long − T_short)/Δsteps`, best of 5):
+
+| backend | per-step | ratio |
+|---|---|---|
+| native CUDA | 3.07 ms | 1.0× |
+| Kokkos / Cuda | 3.54 ms | **0.87× native** |
+
+So **native CUDA is the faster backend — by ~1.15×** (run-to-run the ratio sits
+in the **0.79–0.87× native** band). **Precision is identical** (both 6.44e-04 vs
+CPU); the gap is throughput only, and it is **closable, not structural** — three
+deferred items, all things the native backend does and the port does not yet:
+
+1. **Per-kernel occupancy tuning** — native CUDA picks a block size per kernel
+   (`cudaOccupancyMaxPotentialBlockSize`); the port uses one MDRange tile for all
+   nine. The register-heavy `delta_qi` (~60% of runtime) likely wants its own.
+2. **`__ldg` / RandomAccess EOS** — native routes the data-dependent EOS lookups
+   through the read-only cache; the Stage-1 port uses plain global loads.
+3. **Shared-memory tiled `w_source`** — native has a hand-tiled stencil kernel;
+   the port runs the plain version (the `TeamPolicy`+scratch port is the Stage-3b
+   item in [PlanKokkosPort.md](PlanKokkosPort.md)).
+
+The work stopped at ~0.8–0.87× because the goal was *precision* parity; the
+Stage-2/3 throughput targets (≈1.0× CUDA, then `>`CUDA via fusion/scratch) remain
+open. (The `delta_qi+finalize` fusion behind `MUSIC_KOKKOS_FUSE` was tried and is
+**not** a win on Blackwell — `delta_qi` is register-bound — so it stays off; see
+Port_GPU_KoKKos.md Stage 3.)
+
+**The trade-off.** You give up ~15–25% of peak NVIDIA throughput and get, from
+**one** kernel source: NVIDIA **plus** the same physics on AMD / Intel GPUs and
+multicore CPU, the removal of the CUDA-vs-CPU physics duplication (and its drift),
+and insulation from vendor-API churn. Whether that is worth it depends on how much
+the portability is worth against the last ~15% on NVIDIA specifically.
+
+Two caveats on the number: per-step **isolates kernel cost** — end-to-end
+wall-time narrows the gap, since both backends share the identical host packing,
+EOS load, and I/O; and this is a **GB10 (coherent-memory)** result — on a
+*discrete* GPU the port still lacks the native discrete memory path, so re-measure
+there (see **[PlanKoKKosDiscrete.md](PlanKoKKosDiscrete.md)**).
 
 ---
 
