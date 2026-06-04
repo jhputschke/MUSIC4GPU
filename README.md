@@ -132,11 +132,17 @@ disclaimer at the top of this file).
 |----------|-----------------|-----------|---------------|
 | **CUDA** | NVIDIA GPUs (discrete + Grace-Blackwell) | `-DUSE_CUDA=ON` | [README_CUDA.md](README_CUDA.md) |
 | **Metal** | Apple Silicon (M1 or later) | `-DUSE_METAL=ON` | [README_Metal.md](README_Metal.md) |
+| **Kokkos** | NVIDIA / AMD / Intel GPU + multicore CPU (single source) | `-DUSE_KOKKOS=ON` | [README_KoKKos.md](README_KoKKos.md) |
 
-Both back-ends share the same seven compute kernels and the same host dispatch
-logic in `src/advance.cpp` (the CUDA back-end is a direct port of the Metal
-one). The plain CPU build (no flag) is unchanged and is the reference the GPU
-paths are validated against.
+The **CUDA** and **Metal** back-ends share the same seven compute kernels and the
+same host dispatch logic in `src/advance.cpp` (CUDA is a direct port of Metal).
+**Kokkos** is performance-portable (one kernel body for NVIDIA / AMD / Intel /
+CPU) and plugs into the *same* dispatch seam, but is at **Stage 0** — build,
+lifecycle, and seam are wired and validated, while the kernels are not yet
+ported, so a `-DUSE_KOKKOS=ON` build currently runs the CPU reference (see
+[README_KoKKos.md](README_KoKKos.md) / [PlanKokkosPort.md](PlanKokkosPort.md)).
+The plain CPU build (no flag) is unchanged and is the reference the GPU paths are
+validated against.
 
 ### What is ported to the GPU
 
@@ -184,6 +190,7 @@ one-time GPU init); Full per-phase and per-grid tables, the methodology, and the
 scripts (`tests/cuda_vs_cpu_bench*.sh`, `tests/cuda_perstep_bench.sh`) are in
 the per-back-end READMEs.
 
-See the per-back-end READMEs ([CUDA](README_CUDA.md), [Metal](README_Metal.md))
-for build instructions, kernel-level details, benchmarks, and the full support
-matrix with what each missing piece would take to port.
+See the per-back-end READMEs ([CUDA](README_CUDA.md), [Metal](README_Metal.md),
+[Kokkos](README_KoKKos.md)) for build instructions, kernel-level details,
+benchmarks, and the full support matrix with what each missing piece would take
+to port.

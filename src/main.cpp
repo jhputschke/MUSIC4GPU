@@ -10,8 +10,19 @@
 #include "music_logo.h"
 #include "version.h"
 
+#ifdef USE_KOKKOS
+#include "gpu/kokkos_runtime.h"
+#endif
+
 // main program
 int main(int argc, char *argv[]) {
+#ifdef USE_KOKKOS
+    // Stand-alone Kokkos lifecycle owner (PlanKokkosPort.md D2): one
+    // initialize/finalize brackets the whole run, declared before any object
+    // that allocates Kokkos Views.  Under X-SCAPE the framework driver main()
+    // owns this instead; MUSIC itself stays lifecycle-agnostic.
+    KokkosRuntimeGuard kokkos_guard(argc, argv);
+#endif
     std::string input_file;
     InitData DATA __attribute__ ((aligned (64)));
 

@@ -79,9 +79,9 @@ CPU OpenMP per-cell loops** without writing the physics twice.
 Add `USE_KOKKOS` as a third branch alongside `USE_METAL` / `USE_CUDA`:
 
 ```cpp
-// advance.h — extend the existing alias block (lines 16-27)
+// advance.h — extend the existing alias block (lines 16-31)
 #elif defined(USE_KOKKOS)
-    #include "gpu/KokkosGrid.h"
+    #include "gpu/GPUGrid.h"            // existing class; Kokkos-backed impl
     #include "gpu/KokkosPipelines.h"
     #include "gpu/gpu_types.h"
     using GPUPipelines = KokkosPipelines;   // host dispatch unchanged
@@ -96,12 +96,32 @@ the existing ones 1:1:
   header stays Kokkos-free and `advance.cpp` keeps compiling as a plain host TU —
   exactly how `CUDAPipelines.h` already hides `cudaStream_t` behind `void*`
   (`CUDAPipelines.h:74-76`).
-- **`KokkosGrid`** ⟷ `GPUGrid` — same public API and snapshot/buffer layout
-  (`GPUGrid.h`): three rotating `GPUSnapshot`s, `dwmn/qi_out/uwrhs_out/uprhs_out/
-  theta_buf/a_buf/sigma_buf`, EOS tables, reduce scalars. Internally each `float*`
-  is backed by a `Kokkos::View<float*>`; the existing raw-pointer getters
-  (`host_readable_u_curr()`, `qi_source_buf`) return `View::data()` of a host
-  mirror so the host hydro-source pre-pass in `advance.cpp` is **unchanged**.
+- **`GPUGrid` (Kokkos-backed)** — the Kokkos backend implements the *existing*
+  `GPUGrid` class (`GPUGrid.h`) in `GPUGrid_kokkos.cpp`, exactly as the CUDA
+  backend uses `GPUGrid_cuda.cu` and Metal uses `GPUGrid.mm` — **not** a separate
+  class (so `advance.h`'s `GPUGrid gpu_grid_` member is untouched). Same public
+  API and snapshot/buffer layout: three rotating `GPUSnapshot`s, `dwmn/qi_out/
+  uwrhs_out/uprhs_out/theta_buf/a_buf/sigma_buf`, EOS tables, reduce scalars.
+  Internally each `float*` becomes a `Kokkos::View<float*>` (Stage 1); the
+  raw-pointer getters (`host_readable_u_curr()`, `qi_source_buf`) return a host
+  mirror's `data()` so the host hydro-source pre-pass in `advance.cpp` is
+  **unchanged**.
+
+### Build contexts (X-SCAPE primary, stand-alone secondary)
+
+A **single integration point** — `music4gpu/CMakeLists.txt` — covers both builds,
+because X-SCAPE compiles the GPU MUSIC by `add_subdirectory(./${MUSIC_BACKEND_DIR})`
+(`X-SCAPE/CMakeLists.txt:557`, with `MUSIC_BACKEND_DIR=external_packages/music4gpu`).
+So music4gpu's own CMake drives Kokkos discovery in *both* modes:
+
+- **PRIMARY — X-SCAPE embedded:** the parent only adds the `USE_KOKKOS` option, the
+  `MUSIC_BACKEND_DIR` arm, and the mutual-exclusion check; the `add_subdirectory`
+  at line 557 then triggers music4gpu's Kokkos discovery automatically. Lifecycle:
+  `KokkosRuntimeGuard` in the framework driver `main()` (D2). Fetch:
+  `bash external_packages/music4gpu/get_kokkos.sh`.
+- **SECONDARY — stand-alone `MUSIChydro`:** music4gpu is self-contained (own
+  `CMakeLists.txt`, `src/main.cpp`). `get_kokkos.sh` + the same discovery build it
+  independently; lifecycle is the `KokkosRuntimeGuard` in `src/main.cpp`.
 
 ### Construct mapping
 
@@ -156,8 +176,8 @@ the Stage 3 optimizations and the AMD/Intel bring-up.
 
 | # | Decision | Choice | Why / where it bites |
 |---|---|---|---|
-| **D1** | Kokkos acquisition | `get_kokkos.sh` clone script (pinned tag) + `add_subdirectory`; `find_package` fallback on HPC | Matches the JETSCAPE `get_*.sh` convention; repo has no submodules |
-| **D2** | Init/finalize lifecycle | `Kokkos::ScopeGuard` in the framework `main()`, *before* the `JetScape` object — never a `JetScape` member | `JetScapeTask::tasks` (base) destroyed last → a member guard would `finalize()` before module Views are freed |
+| **D1** | Kokkos acquisition | In-repo `music4gpu/get_kokkos.sh` — **latest release by default**, pin via arg (`get_kokkos.sh 5.1.1`) — clones into `external/kokkos`. CMake discovery: `-DKOKKOS_SOURCE_DIR` override → in-repo `external/kokkos` → `../kokkos` sibling → `find_package(Kokkos)` (HPC/Spack/module). | One script + one discovery path serve **both** the X-SCAPE build (which `add_subdirectory`s music4gpu) and stand-alone. In-repo so stand-alone works; pin the version for reproducible CI/HPC builds. Repo has no submodules. |
+| **D2** | Init/finalize lifecycle | One `KokkosRuntimeGuard` (host-safe RAII over `Kokkos::initialize/finalize`, defined in `kokkos_runtime.cpp`) in the driver `main()`, before the run. **PRIMARY:** the X-SCAPE framework `main()`, before the `JetScape` object — never a `JetScape` member. **SECONDARY:** stand-alone `music4gpu/src/main.cpp`. | `JetScapeTask::tasks` (base) destroyed last → a member guard would `finalize()` before module Views are freed. The shim keeps both mains plain host TUs (D7) and is collision-safe (no double init/finalize if another module brought Kokkos up). |
 | **D3** | Data layout | **Phase**: flat 1D `View<Real*>` (`comp*Ncells+cell`) for Stage-1 parity → layout-templated multi-D Views (`LayoutLeft` GPU / `LayoutRight` CPU) in Stage 2 | Fast parity first; the layout switch is what makes the CPU/OpenMP backend fast, which Stage-4 unification needs |
 | **D4** | Precision | Kernels templated on `Real`: `float` on GPU, `double` on the CPU/OpenMP backend | Matches today's float device path *and* the legacy double CPU reference, from one source |
 | **D5** | Host-data depth | **Shallow now** (pack/`deep_copy` into `KokkosGrid` Views; `Fields` untouched) → **View-back `Fields` in Stage 4** | De-risks Stages 0–2; defers the wide `Fields` refactor (evolve/grid_info/…) to the unification stage |
@@ -190,40 +210,59 @@ are where Kokkos pays back beyond what the hand-written backends could.
 
 ### Stage 0 — Infrastructure
 
-1. **Vendor Kokkos.** Add an `external_packages/get_kokkos.sh` script that clones a
-   pinned Kokkos release tag (e.g. `4.x.xx`) into `external_packages/kokkos`,
-   mirroring the existing `get_music4gpu.sh` / `get_smash.sh` pattern — X-SCAPE
-   pulls *all* external packages via `get_*.sh` clone scripts and has **no
-   `.gitmodules`**, so this is the JETSCAPE-native way to vendor a pinned,
-   reproducible Kokkos. (Alternative: `find_package(Kokkos)` against a
-   system/Spack/module install — preferred on HPC sites like Frontier/Aurora/
-   Perlmutter that already ship a tuned Kokkos. A git submodule is intentionally
-   *not* used: it would be foreign to this repo's workflow.)
+> **Status:** the Stage-0 infrastructure below is **implemented on the
+> `KoKKos-Port` branch** — `get_kokkos.sh`, the `USE_KOKKOS` CMake option +
+> discovery (music4gpu + X-SCAPE parent), the lifecycle shim, and the
+> skeleton TUs. The skeleton's `KokkosPipelines::initialize()` returns `false`,
+> so a `USE_KOKKOS` build runs the CPU reference; Stage 1 ports the kernels.
+
+1. **Vendor Kokkos.** `music4gpu/get_kokkos.sh` clones Kokkos into the in-repo
+   `external/kokkos` (git-ignored), **defaulting to the latest release** and
+   accepting an optional pinned tag (`bash get_kokkos.sh 5.1.1`). It lives *in
+   the music4gpu repo* (not `external_packages/`) so the stand-alone build is
+   self-contained; under X-SCAPE it is reached at
+   `external_packages/music4gpu/get_kokkos.sh`. Latest tag is resolved with
+   `git ls-remote --sort=-v:refname` (no GitHub API / `jq`). Pin a version for
+   reproducible CI/HPC builds. (Alternative on HPC: skip the script and use a
+   system/Spack/module Kokkos via `find_package` — see Step 2. No `.gitmodules`,
+   matching the repo workflow.)
 2. **Build options.** In `music4gpu/CMakeLists.txt` add `option(USE_KOKKOS …)`
-   beside the existing `USE_CUDA` block (CUDA detection at lines 99-110). Enforce
-   `USE_KOKKOS XOR USE_CUDA`. `add_subdirectory(external_packages/kokkos)` with
-   `Kokkos_ENABLE_CUDA/OPENMP/SERIAL` driven from the option; set
-   `CMAKE_CXX_STANDARD 17` for the `music4gpu` host TUs (parent JETSCAPE is
-   already C++17). Mirror the `USE_KOKKOS` option + `MUSIC_BACKEND_DIR` selection
-   in the parent `X-SCAPE/CMakeLists.txt` (lines 83-106) and link `Kokkos::kokkos`
-   into `libmusic`.
-3. **Lifecycle (resolved — see Risks).** Own Kokkos at the **`JetScape` driver
-   level**: place a `Kokkos::ScopeGuard` in the framework `main()`, declared
-   *before* the `JetScape` object, so one `initialize`/`finalize` brackets the
-   whole `Init→Exec→Clear→Finish` run (incl. all per-event / hydro-reuse View
-   churn). **Not** a `JetScape` member — the child modules live in the
-   `JetScapeTask` base (`tasks`, `JetScapeTask.h:314`) and are destroyed *after*
-   any derived member, so a member `ScopeGuard` would `finalize()` while MUSIC's
-   Views are still alive (use-after-finalize). MUSIC / `KokkosGrid` stay
-   lifecycle-agnostic (optionally `assert(Kokkos::is_initialized())`). Device
-   selection (`--kokkos-map-device-id-by=mpi_rank`) only matters if a given
-   executable initializes MPI — the core X-SCAPE framework does not.
-4. **Skeletons.** Create `src/gpu/KokkosPipelines.{h,cpp}` and
-   `src/gpu/KokkosGrid.{h,cpp}` mirroring `CUDAPipelines.h` / `GPUGrid.h`
-   (PIMPL-hidden Views, D7 — the rest of MUSIC stays a plain host TU). Extend the
-   `advance.h` alias block for `USE_KOKKOS`. Wire
-   the `.cpp` sources into `src/CMakeLists.txt` under a `USE_KOKKOS` branch
-   (parallel to the `USE_CUDA` block at lines 85-91 / 124-156).
+   beside the existing `USE_CUDA`/`USE_METAL` block, mutually exclusive with
+   both. Under `USE_KOKKOS`: re-assert `cmake_minimum_required(VERSION 3.16)`
+   (Kokkos floor; the CUDA/Metal/CPU builds keep the 3.10 floor), set
+   `CMAKE_CXX_STANDARD 17` **and** `string(REPLACE "-std=c++11" "-std=c++17" …)`
+   (the compiler blocks hard-set `-std=c++11`), then run the discovery chain
+   (override → `external/kokkos` → `../kokkos` → `find_package(Kokkos)`) with a
+   `if(NOT TARGET Kokkos::kokkos)` guard. `Kokkos_ENABLE_SERIAL/OPENMP` (+ CUDA
+   later) come from the configure line. In `src/CMakeLists.txt` add the
+   `USE_KOKKOS` source branch and link `Kokkos::kokkos` into `libmusic`. Mirror
+   the `USE_KOKKOS` option + `MUSIC_BACKEND_DIR` arm + mutual-exclusion in the
+   parent `X-SCAPE/CMakeLists.txt`; its existing `add_subdirectory` (line 557)
+   then builds music4gpu with Kokkos automatically.
+3. **Lifecycle (resolved — see Risks).** A host-safe `KokkosRuntimeGuard`
+   (RAII over `Kokkos::initialize/finalize`, declared in `gpu/kokkos_runtime.h`,
+   defined in `kokkos_runtime.cpp` — the only TU that includes Kokkos headers)
+   brackets the run. **PRIMARY (X-SCAPE):** construct it in the framework `main()`
+   *before* the `JetScape` object, so one init/finalize spans the whole
+   `Init→Exec→Clear→Finish` run. **Not** a `JetScape` member — the child modules
+   live in the `JetScapeTask` base (`tasks`, `JetScapeTask.h:314`) and are
+   destroyed *after* any derived member, so a member guard would `finalize()`
+   while MUSIC's Views are still alive (use-after-finalize). **SECONDARY
+   (stand-alone):** the guard sits at the top of `music4gpu/src/main.cpp`. The
+   guard is collision-safe (skips init/finalize if Kokkos is already up), and
+   MUSIC's `GPUGrid` stays lifecycle-agnostic. Device selection
+   (`--kokkos-map-device-id-by=mpi_rank`) only matters if a given executable
+   initializes MPI — the core X-SCAPE framework does not.
+4. **Skeletons.** Create `src/gpu/KokkosPipelines.{h,cpp}` (mirrors
+   `CUDAPipelines.h` 1:1, PIMPL — header stays Kokkos-free, D7) and
+   `src/gpu/GPUGrid_kokkos.cpp` (Kokkos impl of the *existing* `GPUGrid` class,
+   like `GPUGrid_cuda.cu`), plus the `kokkos_runtime.{h,cpp}` shim. Extend the
+   `advance.h` alias block + `MUSIC_USE_GPU` guard for `USE_KOKKOS`. Wire the
+   `.cpp` sources into `src/CMakeLists.txt` under a `USE_KOKKOS` branch (parallel
+   to the `USE_CUDA` block). **Stage-0 behaviour:** `KokkosPipelines::initialize()`
+   returns `false` (and `GPUGrid::allocate()` as a second net), so `advance.cpp`
+   keeps `gpu_ready_ == false` and runs the CPU path — every dispatch/grid method
+   exists only for linkage. Stage 1 fills them with real Views + kernels.
 5. **Bring-up on host backend first.** Build with `Kokkos::Serial`/`OpenMP`, route
    `dispatch_*` to correct (even if trivial) implementations, and confirm an
    end-to-end MUSIC run reproduces the CPU reference. This validates *all* the
@@ -386,19 +425,46 @@ only matters for diagnostic syncs.
 
 ## Verification
 
-- **Primary oracle:** `tests/eos_gpu_vs_cpu.sh` (EOS 91) — already compares
-  GPU-vs-CPU `eps_max(τ)` within tolerance (typ. ~1e-3 for hotQCD). Run it with
-  the Kokkos backend built; require the same tolerance.
-- **CPU reference:** `MUSIC_FORCE_CPU=1` to force the CPU path; diff against the
-  Kokkos GPU run.
-- **Native-CUDA cross-check:** run identical input on the native-CUDA build and
-  the Kokkos/CUDA build; `eps_max(τ)` traces must agree within float tolerance.
-- **New cross-backend test (Kokkos-enabled):** run the same input on Kokkos
-  `Serial`, `OpenMP`, and `Cuda` (later `HIP`/`SYCL`) and diff the traces — a
-  stronger single-source consistency check than exists today, wired as a **CI
-  gate** from Stage 1 (D9).
+**Standard test scripts (`tests/`)** — the same harness that validated the CUDA
+and Metal ports; reuse it for Kokkos. All run from the repo root with Gubser ICs
+(no external data; the EOS test needs the hotQCD table). Point at the Kokkos build
+via `GPU_BIN=` (the scripts auto-detect `build_metal/build_cuda/build_gpu`):
+
+- **Correctness — `tests/eos_gpu_vs_cpu.sh`** (EOS 91 hotQCD default): runs one
+  input on `build/src/MUSIChydro` (CPU) and the GPU binary; compares `eps_max(τ)`
+  within `TOL` (1e-3). The Stage-0 invocation:
+  ```
+  cmake -S . -B build        -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+  bash get_kokkos.sh                                     # latest Kokkos (or pin a tag)
+  cmake -S . -B build_kokkos -DUSE_KOKKOS=ON             && cmake --build build_kokkos -j
+  GPU_BIN=$PWD/build_kokkos/src/MUSIChydro bash tests/eos_gpu_vs_cpu.sh
+  ```
+- **Throughput — `tests/cuda_vs_cpu_bench.sh`**: total wall-time GPU vs CPU across
+  a grid sweep (needs `build/` + the GPU build).
+- **Per-step cost — `tests/cuda_perstep_bench.sh`**: isolates per-timestep compute
+  (`(T(long) − T(short))/100`, min of 3 runs) to factor out fixed init overhead.
+
+> **Stage-0 result (this branch):** `eos_gpu_vs_cpu.sh` (GPU_BIN = the Kokkos
+> build) reports **[3/3] PASS, max rel error `0.00e+00`** — the `USE_KOKKOS` build
+> reproduces the CPU reference bit-for-bit over 101 steps — and **[2/3] PASS**.
+> **[1/3] (GPU-dispatch) FAILs by design**: the skeleton's
+> `KokkosPipelines::initialize()` returns false, so MUSIC runs the CPU path; [1/3]
+> flips to PASS at Stage 1 when the kernels land.
+
+> **Future (Stage 1+):** add backend-explicit variants
+> (`kokkos_cuda_vs_cuda.sh`, `kokkos_vs_cpu_bench.sh`, `kokkos_perstep_bench.sh`, …)
+> that compare the Kokkos/Cuda build against the native-CUDA build, and the Kokkos
+> host backend against the CPU reference — keeping the CUDA/Metal scripts for the
+> legacy paths.
+
+- **CPU reference:** `MUSIC_FORCE_CPU=1` forces the CPU path for an explicit diff.
+- **Native-CUDA cross-check:** identical input on the native-CUDA and Kokkos/Cuda
+  builds; `eps_max(τ)` traces must agree within float tolerance.
+- **Cross-backend (Kokkos) consistency:** same input on Kokkos `Serial`, `OpenMP`,
+  `Cuda` (later `HIP`/`SYCL`); diff traces — a single-source consistency gate from
+  Stage 1 (D9).
 - **Conservation:** existing `check_conservation_law` in `grid_info.cpp`.
-- **Performance:** per-step `EvolveIt` wall-time of Kokkos/CUDA vs native CUDA on
+- **Performance:** per-step `EvolveIt` wall-time of Kokkos/Cuda vs native CUDA on
   the same NVIDIA GPU (this GB10/Grace box); track per-stage against the parity
   target.
 
@@ -406,7 +472,12 @@ only matters for diagnostic syncs.
 
 ## Open items to confirm during execution
 
-- Kokkos acquisition: `get_kokkos.sh` clone script (recommended — matches the
-  JETSCAPE `get_*.sh` convention) vs `find_package`/Spack/module on HPC sites.
-- Exact pinned Kokkos version (4.x) and the AMD/Intel toolchains available for the
-  Stage 2 bring-up (ROCm/HIP, oneAPI/SYCL).
+- ~~Kokkos acquisition method~~ — **resolved (D1):** in-repo `get_kokkos.sh`
+  (latest-default, pin via arg) + `find_package` fallback for HPC.
+- ~~Exact pinned Kokkos version~~ — **resolved:** latest release by default
+  (5.1.1 at time of writing); pin via `get_kokkos.sh <tag>` for reproducible builds.
+- The AMD/Intel toolchains available for the Stage 2 bring-up (ROCm/HIP,
+  oneAPI/SYCL) and the exact `Kokkos_ARCH_*` flags for the target machines.
+- Kokkos's exact `cmake_minimum_required` for the pinned tag (5.x ≳ 3.25) —
+  confirm the host CMake satisfies it; the build raises the floor to 3.16 under
+  `USE_KOKKOS` and Kokkos itself enforces the rest.

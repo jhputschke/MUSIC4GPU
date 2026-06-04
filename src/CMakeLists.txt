@@ -90,6 +90,18 @@ if (USE_CUDA)
         )
 endif()
 
+# ── Kokkos sources (NVIDIA/AMD/Intel GPU + multicore CPU) ─────────────────────
+# Stage 0: GPUGrid/KokkosPipelines skeletons behind the GPUPipelines alias +
+# the host-safe init/finalize shim. These are the only TUs compiled under the
+# Kokkos toolchain (PIMPL boundary); the rest of MUSIC stays plain host TUs.
+if (USE_KOKKOS)
+    set(SOURCES ${SOURCES}
+        gpu/GPUGrid_kokkos.cpp
+        gpu/KokkosPipelines.cpp
+        gpu/kokkos_runtime.cpp
+        )
+endif()
+
 add_library(${libname} SHARED ${SOURCES})
 # Bind pretty_ostream symbols locally so iSS/3dMCGlauber's copies don't override
 # -Bsymbolic-functions is Linux/GNU ld only; Apple ld64 doesn't support it
@@ -158,6 +170,15 @@ if (USE_CUDA)
     # 1e-3 correctness threshold while accelerating delta_qi / w_full.
     target_compile_options(${libname} PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+endif()
+
+if (USE_KOKKOS)
+    set(CompileFlags "${CompileFlags} -DUSE_KOKKOS")
+    target_compile_definitions(${libname} PRIVATE USE_KOKKOS)
+    target_link_libraries(${libname} Kokkos::kokkos)
+    target_include_directories(${libname} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+    )
 endif()
 
 
