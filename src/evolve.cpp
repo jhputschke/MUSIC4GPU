@@ -449,7 +449,9 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         FOinfo.close();
     }
     if (tau < tauMax) {
-        music_message.info("Finished.");
+        //music_message.info("Finished.");
+        music_message << "Finished at tau = " << tau << " fm/c.";
+        music_message.flush("info");
     } else {
         music_message.warning("Maximum allowed time reached.");
     }

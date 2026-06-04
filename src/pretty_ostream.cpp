@@ -7,7 +7,7 @@
 #include <algorithm>
 
 #include "pretty_ostream.h"
-
+/* 
 //Original MUSIC Code from get script in XSCAPE:
 
 using std::string;
@@ -35,7 +35,7 @@ void pretty_ostream::flush(string type) {
 
 //! This function output information message
 void pretty_ostream::info(string message) {
-    //*output_stream_ << "[Info] " << get_memory_usage() << " " << message << std::endl;
+   *output_stream_ << "[Info] " << " " << message << std::endl;
 }
 
 
@@ -73,8 +73,8 @@ string pretty_ostream::get_memory_usage() {
         return(0);
     }
 }
+ */
 
-/* 
 #include "emoji.h"
 
 using std::cout;
@@ -148,4 +148,3 @@ string pretty_ostream::get_memory_usage() {
         return(0);
     }
 }
- */

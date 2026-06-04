@@ -573,6 +573,9 @@ void HydroSourceStrings::prepare_list_for_current_tau_frame(
             QCD_strings_list_current_tau.push_back(it);
         }
     }
+
+    if (tau_local < get_source_tauStart_max() + dtau) {
+       
     music_message << "hydro_source: tau = " << tau_local << " fm."
                   << " number of strings for energy density: "
                   << QCD_strings_list_current_tau.size()
@@ -581,6 +584,9 @@ void HydroSourceStrings::prepare_list_for_current_tau_frame(
                   << " number of strings for net electric charge density: "
                   << QCD_strings_electric_list_current_tau.size();
     music_message.flush("info");
+    music_message << "Calculating remaining tau steps ...";
+    music_message.flush("info");
+    }
 }
 
 
