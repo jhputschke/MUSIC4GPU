@@ -17,7 +17,7 @@ void display_logo(int selector) {
     std::cout << "|  ██║ ╚═╝ ██║╚██████╔╝███████║██║╚██████╔╝  ├──┼──┼──┤        |"  << std::endl;
     std::cout << "|  ╚═╝     ╚═╝ ╚═════╝ ╚══════╝╚═╝ ╚═════╝   └──┴──┴──┘        |"  << std::endl;
     std::cout << "|                                                              |"  << std::endl;
-    std::cout << "|           GPU-Accelerated Heavy-Ion Hydrodynamics            |"  << std::endl;
+    std::cout << "|           GPU-Accelerated MUSIC Hydrodynamics                |"  << std::endl;
     std::cout << "================================================================"  << std::endl;
 
 }
