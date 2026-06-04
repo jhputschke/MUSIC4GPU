@@ -105,8 +105,9 @@ void pretty_ostream::flush(string type) {
 //! This function output information message
 void pretty_ostream::info(string message) {
     //cout << "[Info] " << get_memory_usage() << " " << message << endl;
-    cout << emoji::music_note() << " " << get_memory_usage() << " "
-         << message << endl;
+    //cout << emoji::music_note() << " " << get_memory_usage() << " "
+    //     << message << endl;
+    cout << "[MUSIC] " << " " << message << endl;
 }
 
 
