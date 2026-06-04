@@ -19,3 +19,6 @@ MUSIChydro
 *.metallib
 music_input*
 MUSIC4GPU.code-workspace
+
+# Kokkos source cloned by get_kokkos.sh (USE_KOKKOS backend)
+/external/kokkos/

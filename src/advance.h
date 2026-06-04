@@ -24,10 +24,16 @@ using GPUPipelines = MetalPipelines;
 #include "gpu/CUDAPipelines.h"
 #include "gpu/gpu_types.h"
 using GPUPipelines = CUDAPipelines;
+#elif defined(USE_KOKKOS)
+#include "gpu/GPUGrid.h"
+#include "gpu/KokkosPipelines.h"
+#include "gpu/gpu_types.h"
+// Same alias, third back-end: host dispatch in advance.cpp is unchanged.
+using GPUPipelines = KokkosPipelines;
 #endif
 
-// Single switch covering either GPU back-end.
-#if defined(USE_METAL) || defined(USE_CUDA)
+// Single switch covering any GPU back-end.
+#if defined(USE_METAL) || defined(USE_CUDA) || defined(USE_KOKKOS)
 #define MUSIC_USE_GPU 1
 #endif
 

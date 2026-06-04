@@ -87,6 +87,10 @@ option (unittest "Build Unit tests" OFF)
 option (link_with_lib "Link executable with the libarary" ON)
 option (USE_METAL "Enable Metal GPU acceleration (macOS/Apple Silicon)" OFF)
 option (USE_CUDA  "Enable CUDA GPU acceleration (NVIDIA)" OFF)
+option (USE_KOKKOS "Enable Kokkos backend (NVIDIA/AMD/Intel GPU + multicore CPU)" OFF)
+# Stage 3 (D11): fuse delta_qi+finalize_ideal into one kernel (skips the qi_out
+# global round-trip).  OFF keeps the unfused kernels as the golden reference.
+option (MUSIC_KOKKOS_FUSE "Kokkos: fuse the delta_qi + finalize_ideal kernels" OFF)
 
 if (USE_METAL AND NOT APPLE)
     message(FATAL_ERROR "USE_METAL is only supported on macOS (Apple Silicon).")
@@ -94,6 +98,10 @@ endif()
 
 if (USE_METAL AND USE_CUDA)
     message(FATAL_ERROR "USE_METAL and USE_CUDA are mutually exclusive.")
+endif()
+
+if (USE_KOKKOS AND (USE_CUDA OR USE_METAL))
+    message(FATAL_ERROR "USE_KOKKOS is mutually exclusive with USE_CUDA / USE_METAL.")
 endif()
 
 if (USE_CUDA)
@@ -136,6 +144,70 @@ endif()
 # $PREFIX/include as implicit only when CPATH is set at configure time).
 if (GSL_FOUND)
     string(APPEND CMAKE_CXX_FLAGS " -I${GSL_INCLUDE_DIR}")
+endif()
+
+# ── Kokkos backend (NVIDIA/AMD/Intel GPU + multicore CPU) ────────────────────
+# Single integration point: this runs in BOTH the stand-alone MUSIChydro build
+# and the X-SCAPE build (which add_subdirectory()'s this CMakeLists.txt).
+if (USE_KOKKOS)
+    # Kokkos needs CMake >= 3.16 (4.x; 5.x wants ~3.25). Raise the policy floor
+    # only in the Kokkos configuration, leaving the CUDA/Metal/CPU builds on the
+    # 3.10 floor untouched. Kokkos' own CMakeLists enforces its exact minimum.
+    cmake_minimum_required(VERSION 3.16)
+
+    # Kokkos 5.x requires C++20 (4.x needs C++17); use C++20 so the default
+    # latest-release build works. The compiler blocks above hard-set -std=c++11,
+    # so surgically bump that flag too (the last -std on the command line wins).
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    string(REPLACE "-std=c++11" "-std=c++20" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+
+    # libmusic is a SHARED library, so Kokkos' default static archive must be
+    # built position-independent or the link fails (notably on AArch64:
+    # "relocation R_AARCH64_* ... recompile with -fPIC").
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+    if (NOT TARGET Kokkos::kokkos)
+        # Discovery order: explicit override -> in-repo source (get_kokkos.sh)
+        # -> X-SCAPE sibling -> system install (Spack / module on HPC).
+        if (NOT KOKKOS_SOURCE_DIR)
+            foreach (_cand "${CMAKE_CURRENT_SOURCE_DIR}/external/kokkos"
+                           "${CMAKE_CURRENT_SOURCE_DIR}/../kokkos")
+                if (EXISTS "${_cand}/CMakeLists.txt")
+                    set(KOKKOS_SOURCE_DIR "${_cand}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if (KOKKOS_SOURCE_DIR AND EXISTS "${KOKKOS_SOURCE_DIR}/CMakeLists.txt")
+            message(STATUS "Kokkos: add_subdirectory(${KOKKOS_SOURCE_DIR})")
+            add_subdirectory(${KOKKOS_SOURCE_DIR} ${CMAKE_BINARY_DIR}/kokkos_build)
+        else()
+            message(STATUS "Kokkos source not found - find_package(Kokkos) "
+                           "(system / Spack / module install). Hint: run get_kokkos.sh "
+                           "or pass -DKokkos_ROOT=<path>.")
+            find_package(Kokkos REQUIRED)
+        endif()
+    endif()
+
+    # When Kokkos targets CUDA (NVIDIA), the MUSIC device TUs (the ported
+    # kernels + managed-View allocation in KokkosPipelines.cpp / GPUGrid_kokkos.cpp)
+    # must be compiled by nvcc.  Use the CMake CUDA language so ONLY those TUs go
+    # through nvcc while the rest of MUSIC stays plain host C++ (PIMPL boundary,
+    # D7) — this requires configuring Kokkos with
+    # -DKokkos_ENABLE_COMPILE_AS_CMAKE_LANGUAGE=ON.  src/CMakeLists.txt then marks
+    # the two device sources LANGUAGE CUDA.
+    if (Kokkos_ENABLE_CUDA)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 20)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+            set(CMAKE_CUDA_ARCHITECTURES native)
+        endif()
+        message(STATUS "Kokkos targets CUDA — device TUs via nvcc "
+                       "(CC ${CMAKE_CUDA_ARCHITECTURES}).")
+    endif()
+    message(STATUS "Kokkos backend enabled (USE_KOKKOS=ON).")
 endif()
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")

@@ -90,6 +90,18 @@ if (USE_CUDA)
         )
 endif()
 
+# ── Kokkos sources (NVIDIA/AMD/Intel GPU + multicore CPU) ─────────────────────
+# Stage 0: GPUGrid/KokkosPipelines skeletons behind the GPUPipelines alias +
+# the host-safe init/finalize shim. These are the only TUs compiled under the
+# Kokkos toolchain (PIMPL boundary); the rest of MUSIC stays plain host TUs.
+if (USE_KOKKOS)
+    set(SOURCES ${SOURCES}
+        gpu/GPUGrid_kokkos.cpp
+        gpu/KokkosPipelines.cpp
+        gpu/kokkos_runtime.cpp
+        )
+endif()
+
 add_library(${libname} SHARED ${SOURCES})
 # Bind pretty_ostream symbols locally so iSS/3dMCGlauber's copies don't override
 # -Bsymbolic-functions is Linux/GNU ld only; Apple ld64 doesn't support it
@@ -158,6 +170,47 @@ if (USE_CUDA)
     # 1e-3 correctness threshold while accelerating delta_qi / w_full.
     target_compile_options(${libname} PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+endif()
+
+if (USE_KOKKOS)
+    set(CompileFlags "${CompileFlags} -DUSE_KOKKOS")
+    target_compile_definitions(${libname} PRIVATE USE_KOKKOS)
+    if (MUSIC_KOKKOS_FUSE)
+        target_compile_definitions(${libname} PRIVATE MUSIC_KOKKOS_FUSE)
+        message(STATUS "Kokkos: delta_qi+finalize_ideal kernel fusion ENABLED.")
+    endif()
+    target_link_libraries(${libname} Kokkos::kokkos)
+    target_include_directories(${libname} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu
+    )
+    # CUDA backend: compile the Kokkos-touching TUs with nvcc (CMake CUDA
+    # language), leaving the rest of MUSIC as host C++ TUs (PIMPL boundary, D7).
+    # Any TU that includes <Kokkos_Core.hpp> must go through nvcc once Kokkos is
+    # built with CUDA (the header hard-errors under a non-__CUDACC__ compiler),
+    # so the init/finalize shim is compiled as CUDA too — it still contains no
+    # device code, just Kokkos::initialize/finalize host calls.
+    if (Kokkos_ENABLE_CUDA)
+        set_source_files_properties(
+            gpu/GPUGrid_kokkos.cpp
+            gpu/KokkosPipelines.cpp
+            gpu/kokkos_runtime.cpp
+            PROPERTIES LANGUAGE CUDA
+        )
+        # GSL include must also reach the nvcc compilations (the device TUs pull
+        # grid.h/fields.h, which are GSL-free today, but keep parity with the
+        # CUDA backend's include wiring to be safe).
+        if (GSL_FOUND)
+            target_include_directories(${libname} PRIVATE ${GSL_INCLUDE_DIR})
+        endif()
+        # Stage 2 perf parity: fast-math intrinsics for the compute-bound device
+        # kernels (Newton reconstruction sqrtf/divides, transport expf/powf) —
+        # exactly what the native CUDA backend already enables (CMakeLists.txt).
+        # The hydro state is FP32 (~6e-4 vs the double CPU); fast-math stays far
+        # inside the 1e-3 gate while ~halving the delta_qi/w_full cost.  Applied
+        # only to the CUDA-language TUs (our kernels), not Kokkos' own sources.
+        target_compile_options(${libname} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    endif()
 endif()
 
 
