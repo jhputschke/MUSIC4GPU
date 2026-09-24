@@ -115,6 +115,12 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         if (hydro_source_terms_ptr) {
             hydro_source_terms_ptr->prepare_list_for_current_tau_frame(tau);
         }
+        // The jet source prunes its droplets to those that can deposit in
+        // this step (X-SCAPE HydroSourceJETSCAPE); without this call it
+        // evaluates every droplet in every cell at every step.
+        if (hydro_source_terms_from_jets_ptr_) {
+            hydro_source_terms_from_jets_ptr_->prepare_list_for_current_tau_frame(tau);
+        }
         // store initial conditions
         if (it == iFreezeStart) {
 #ifdef MUSIC_USE_GPU
@@ -501,6 +507,12 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         double tau = DATA.tau0 + tauIdx*DATA.delta_tau;
         if (hydro_source_terms_ptr) {
             hydro_source_terms_ptr->prepare_list_for_current_tau_frame(tau);
+        }
+        // The jet source prunes its droplets to those that can deposit in
+        // this step (X-SCAPE HydroSourceJETSCAPE); without this call it
+        // evaluates every droplet in every cell at every step.
+        if (hydro_source_terms_from_jets_ptr_) {
+            hydro_source_terms_from_jets_ptr_->prepare_list_for_current_tau_frame(tau);
         }
 
         // store initial conditions
