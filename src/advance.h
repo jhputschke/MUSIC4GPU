@@ -36,6 +36,9 @@ class Advance {
     const InitData &DATA;
     const EOS &eos;
     std::shared_ptr<HydroSourceBase> hydro_source_terms_ptr;
+    //! jet energy deposition (X-SCAPE liquefier), on top of
+    //! hydro_source_terms_ptr (the initial-state source, e.g. strings)
+    std::shared_ptr<HydroSourceBase> hydro_source_terms_from_jets_ptr_;
 
     Diss diss_helper;
     Minmod minmod;
@@ -43,6 +46,10 @@ class Advance {
     pretty_ostream music_message;
 
     bool flag_add_hydro_source;
+    //! set at the start of every AdvanceIt: the jet source is attached AND
+    //! holds droplets.  Re-evaluated per substep because in the time-stepped
+    //! (X-SCAPE main clock) mode Advance is built before any droplet exists.
+    bool flag_add_hydro_source_from_jets_ = false;
 
 #ifdef MUSIC_USE_GPU
     GPUGrid    gpu_grid_;
@@ -117,7 +124,9 @@ class Advance {
 
  public:
     Advance(const EOS &eosIn, const InitData &DATA_in,
-            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in);
+            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in,
+            std::shared_ptr<HydroSourceBase> hydro_source_ptr_from_jets_in
+                = nullptr);
 
     void AdvanceIt(const double tau_init, Fields &arenaFieldsPrev,
                    Fields &arenaFieldsCurr, Fields &arenaFieldsNext,

@@ -42,6 +42,10 @@ class MUSIC {
     Fields freezeoutFieldCurr_;
 
     std::shared_ptr<HydroSourceBase> hydro_source_terms_ptr;
+    //! jet energy deposition (X-SCAPE liquefier), added on top of
+    //! hydro_source_terms_ptr, which keeps the initial-state source
+    //! (e.g. 3D-Glauber strings)
+    std::shared_ptr<HydroSourceBase> hydro_source_terms_from_jet_ptr_;
 
     std::shared_ptr<HydroinfoMUSIC> hydro_info_ptr;
 
@@ -76,6 +80,9 @@ class MUSIC {
 
     //! this function adds hydro source terms pointer
     void add_hydro_source_terms(
+            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in);
+    //! this function adds the jet energy deposition source terms pointer
+    void add_hydro_source_terms_from_jet(
             std::shared_ptr<HydroSourceBase> hydro_source_ptr_in);
 
     //! This function setup source terms from dynamical initialization

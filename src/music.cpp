@@ -40,6 +40,7 @@ MUSIC::MUSIC(std::string input_file) :
 
     // setup source terms
     hydro_source_terms_ptr = nullptr;
+    hydro_source_terms_from_jet_ptr_ = nullptr;
 
     currTauIdx = 0;
 }
@@ -53,6 +54,13 @@ MUSIC::~MUSIC() {
 void MUSIC::add_hydro_source_terms(
             std::shared_ptr<HydroSourceBase> hydro_source_ptr_in) {
     hydro_source_terms_ptr = hydro_source_ptr_in;
+}
+
+
+//! This function adds the jet energy deposition source terms pointer
+void MUSIC::add_hydro_source_terms_from_jet(
+            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in) {
+    hydro_source_terms_from_jet_ptr_ = hydro_source_ptr_in;
 }
 
 
@@ -141,7 +149,8 @@ void MUSIC::initialize_hydro_xscape(int nx, int ny, int nz,
 
 //! this is a shell function to run hydro
 int MUSIC::run_hydro() {
-    evolve_ptr_= std::make_shared<Evolve> (eos, DATA, hydro_source_terms_ptr);
+    evolve_ptr_= std::make_shared<Evolve> (eos, DATA, hydro_source_terms_ptr,
+                                           hydro_source_terms_from_jet_ptr_);
 
     if (hydro_info_ptr == nullptr && DATA.store_hydro_info_in_memory == 1) {
         hydro_info_ptr = std::make_shared<HydroinfoMUSIC> ();
@@ -160,7 +169,8 @@ void MUSIC::prepare_run_hydro_one_time_step() {
     freezeoutFieldPrev_.resizeFields(DATA.nx, DATA.ny, DATA.neta);
     freezeoutFieldCurr_.resizeFields(DATA.nx, DATA.ny, DATA.neta);
 
-    evolve_ptr_= std::make_shared<Evolve> (eos, DATA, hydro_source_terms_ptr);
+    evolve_ptr_= std::make_shared<Evolve> (eos, DATA, hydro_source_terms_ptr,
+                                           hydro_source_terms_from_jet_ptr_);
     currTauIdx = 0;
 
     if (hydro_info_ptr == nullptr && DATA.store_hydro_info_in_memory == 1) {

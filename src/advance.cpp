@@ -341,7 +341,8 @@ bool Advance::gpu_features_supported() const {
     // Hydro source terms: GPU snapshot only carries rhob, so QS (rhoq/rhos)
     // source contributions can't be applied — fall back to CPU in that case.
     // Pure energy + baryon sources are supported via prefill_hydro_source_on_cpu.
-    if (flag_add_hydro_source && DATA.turn_on_QS == 1) return false;
+    if ((flag_add_hydro_source || flag_add_hydro_source_from_jets_)
+        && DATA.turn_on_QS == 1) return false;
     return true;
 }
 
@@ -379,14 +380,32 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
             u_local[ii] = arenaFieldsCurr.u_[ii][c];
 
         EnergyFlowVec j_mu = {0};
-        hydro_source_terms_ptr->get_hydro_energy_source(
-                tau_rk, x_local, y_local, eta_s_local, u_local, j_mu);
+        double j_rhob = 0.;
+        if (flag_add_hydro_source) {
+            hydro_source_terms_ptr->get_hydro_energy_source(
+                    tau_rk, x_local, y_local, eta_s_local, u_local, j_mu);
+            if (rhob_src) {
+                j_rhob = hydro_source_terms_ptr->get_hydro_rhob_source(
+                        tau_rk, x_local, y_local, eta_s_local, u_local);
+            }
+        }
+        // Jet energy deposition, summed into the same buffer.  With no
+        // droplets this block is skipped, so the buffer is bit-identical to
+        // an initial-state-only run.
+        if (flag_add_hydro_source_from_jets_) {
+            EnergyFlowVec j_jet = {0};
+            hydro_source_terms_from_jets_ptr_->get_hydro_energy_source(
+                    tau_rk, x_local, y_local, eta_s_local, u_local, j_jet);
+            for (int ii = 0; ii < 4; ii++) j_mu[ii] += j_jet[ii];
+            if (rhob_src) {
+                j_rhob += hydro_source_terms_from_jets_ptr_->get_hydro_rhob_source(
+                        tau_rk, x_local, y_local, eta_s_local, u_local);
+            }
+        }
         for (int ii = 0; ii < 4; ii++) {
             qb[ii * N + c] = static_cast<float>(tauRkFactor * j_mu[ii]);
         }
         if (rhob_src) {
-            const double j_rhob = hydro_source_terms_ptr->get_hydro_rhob_source(
-                    tau_rk, x_local, y_local, eta_s_local, u_local);
             qb[4 * N + c] = static_cast<float>(tauRkFactor * j_rhob);
         }
     }
@@ -521,7 +540,7 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     // Hydro source pre-pass (energy + momentum, plus rhob if turn_on_rhob).
     // turn_on_QS == 1 is rejected upstream in gpu_features_supported(), so we
     // only need to evaluate energy + baryon channels here.
-    if (flag_add_hydro_source) {
+    if (flag_add_hydro_source || flag_add_hydro_source_from_jets_) {
         // prepare_list_for_current_tau_frame is already called once per
         // timestep by Evolve::AdvanceRK before AdvanceIt, matching the CPU
         // FirstRKStepT contract (no per-substep re-prep).
@@ -675,13 +694,15 @@ bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
 #endif  // MUSIC_USE_GPU
 
 Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
-                 std::shared_ptr<HydroSourceBase> hydro_source_ptr_in) :
+                 std::shared_ptr<HydroSourceBase> hydro_source_ptr_in,
+                 std::shared_ptr<HydroSourceBase> hydro_source_ptr_from_jets_in) :
     DATA(DATA_in), eos(eosIn),
     diss_helper(eosIn, DATA_in),
     minmod(DATA_in),
     reconst_helper(eos, DATA_in.echo_level, DATA_in.beastMode) {
 
     hydro_source_terms_ptr = hydro_source_ptr_in;
+    hydro_source_terms_from_jets_ptr_ = hydro_source_ptr_from_jets_in;
     flag_add_hydro_source = false;
     if (hydro_source_terms_ptr) {
         if (DATA.Initial_profile == 42) {
@@ -698,6 +719,12 @@ Advance::Advance(const EOS &eosIn, const InitData &DATA_in,
 void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
                         Fields &arenaFieldsCurr, Fields &arenaFieldsNext,
                         const int rk_flag) {
+    // Jet source: only when attached and holding droplets.  Without droplets
+    // (background leg, hydro-only runs) nothing below changes, bit for bit.
+    flag_add_hydro_source_from_jets_ = (
+        hydro_source_terms_from_jets_ptr_ != nullptr
+        && hydro_source_terms_from_jets_ptr_->get_number_of_sources() > 0);
+
 #ifdef MUSIC_USE_GPU
     // Try the full-GPU path first.  If it returns true the substep is done;
     // otherwise (unsupported config, GPU init failed, etc.) fall through to
@@ -835,6 +862,41 @@ void Advance::FirstRKStepT(
         }
     }
 
+    // jet energy deposition (X-SCAPE liquefier); as upstream MUSIC c8da6a3
+    TJbVec qi_source_from_jets = {0.0};
+    if (flag_add_hydro_source_from_jets_) {
+        EnergyFlowVec j_mu = {0};
+        FlowVec u_local;
+        for (int ii = 0; ii < 4; ii++)
+            u_local[ii] = arenaFieldsCurr.u_[ii][fieldIdx];
+
+        hydro_source_terms_from_jets_ptr_->get_hydro_energy_source(
+                    tau_rk, x_local, y_local, eta_s_local, u_local, j_mu);
+        for (int ii = 0; ii < 4; ii++) {
+            qi_source_from_jets[ii] = tauRkFactor*j_mu[ii];
+            if (isnan(qi_source_from_jets[ii])) {
+                music_message << "qi_source_from_jets is nan. i = " << ii;
+                music_message.flush("error");
+                exit(0);
+            }
+        }
+
+        if (DATA.turn_on_rhob == 1) {
+            qi_source_from_jets[4] = (
+                tauRkFactor*hydro_source_terms_from_jets_ptr_->get_hydro_rhob_source(
+                            tau_rk, x_local, y_local, eta_s_local, u_local));
+        }
+
+        if (DATA.turn_on_QS == 1) {
+            qi_source_from_jets[5] = (
+                tauRkFactor*hydro_source_terms_from_jets_ptr_->get_hydro_rhoq_source(
+                            tau_rk, x_local, y_local, eta_s_local, u_local));
+            qi_source_from_jets[6] = (
+                tauRkFactor*hydro_source_terms_from_jets_ptr_->get_hydro_rhos_source(
+                            tau_rk, x_local, y_local, eta_s_local, u_local));
+        }
+    }
+
     // now MakeWSource returns partial_a W^{a mu}
     // (including geometric terms)
 
@@ -852,6 +914,9 @@ void Advance::FirstRKStepT(
 
         // add energy momentum and net baryon density source terms
         qi[alpha] += qi_source[alpha]*DATA.delta_tau;
+
+        // add the jet energy deposition source terms
+        qi[alpha] += qi_source_from_jets[alpha]*DATA.delta_tau;
 
         // set baryon density back to zero if viscous correction made it
         // non-zero remove/modify if rho_b!=0
