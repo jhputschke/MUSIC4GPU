@@ -85,6 +85,12 @@ class Evolve {
 
     void store_previous_step_for_freezeout(Fields &arenaCurr,
                                            Fields &arenaFreeze);
+
+    // freeze_out_surface = 0: stop without building the surface
+    double emax_last_check_ = -1.;  //!< max e at the last check [1/fm^4]
+    double max_energy_density_raw(Fields &arena_current);
+    int frozen_without_surface(Fields &arena_current);
+    bool transverse_edge_is_hot(Fields &arena_current, double eps_fo);
     void regulate_qmu(const FlowVec u, const double q[],
                       double q_regulated[]) const;
     void regulate_Wmunu(const FlowVec u, const double Wmunu[4][4],

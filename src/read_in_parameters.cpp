@@ -371,6 +371,10 @@ InitData read_in_parameters(std::string input_file) {
         (getParameter(input_file, "Do_FreezeOut_Yes_1_No_0", 1));
     parameter_list.doFreezeOut_lowtemp =
         (getParameter(input_file, "Do_FreezeOut_lowtemp", 1));
+    // freeze_out_surface: 1 builds the freeze-out surface (default); 0 builds
+    // none and stops the evolution on max(e) < e_fo instead (see data.h)
+    parameter_list.freeze_out_surface =
+        (getParameter(input_file, "freeze_out_surface", 1));
     // freeze_out_method:
     // 2: Schenke's more complex method
     // 4: Cornelius
@@ -1076,6 +1080,10 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
 
     if (parameter_name == "Do_FreezeOut_lowtemp") {
         parameter_list.doFreezeOut_lowtemp = static_cast<int>(value);
+    }
+
+    if (parameter_name == "freeze_out_surface") {
+        parameter_list.freeze_out_surface = static_cast<int>(value);
     }
 
     if (parameter_name == "average_surface_over_this_many_time_steps") {

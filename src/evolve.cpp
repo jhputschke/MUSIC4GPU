@@ -122,7 +122,9 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             hydro_source_terms_from_jets_ptr_->prepare_list_for_current_tau_frame(tau);
         }
         // store initial conditions
-        if (it == iFreezeStart) {
+        if (it == iFreezeStart && DATA.freeze_out_surface == 0) {
+            emax_last_check_ = max_energy_density_raw(*fpCurr);
+        } else if (it == iFreezeStart) {
 #ifdef MUSIC_USE_GPU
             // store_previous_step_for_freezeout reads the full arenas, so
             // bring snap_curr/snap_prev back into the host Fields first if
@@ -359,7 +361,16 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 
         // determine freeze-out surface
         int frozen = 0;
-        if (freezeout_flag == 1) {
+        if (freezeout_flag == 1 && DATA.freeze_out_surface == 0) {
+            // No surface: the equal-tau surface of the first step only adds
+            // surface cells (it always returns 0), so it is skipped as well.
+            if ((it - iFreezeStart)%facTau == 0 && it > iFreezeStart) {
+                frozen = frozen_without_surface(*fpCurr);
+            }
+            if (DATA.reRunHydro) {
+                return(-1);
+            }
+        } else if (freezeout_flag == 1) {
             if (freezeout_lowtemp_flag == 1 && it == iFreezeStart) {
 #ifdef MUSIC_USE_GPU
                 // Equal-tau surface only reads the current arena.
@@ -516,7 +527,9 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         }
 
         // store initial conditions
-        if (tauIdx == iFreezeStart) {
+        if (tauIdx == iFreezeStart && DATA.freeze_out_surface == 0) {
+            emax_last_check_ = max_energy_density_raw(*fpCurr);
+        } else if (tauIdx == iFreezeStart) {
 #ifdef MUSIC_USE_GPU
             advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
 #endif
@@ -628,7 +641,12 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 
         //determine freeze-out surface
         int frozen = 0;
-        if (freezeout_flag == 1) {
+        if (freezeout_flag == 1 && DATA.freeze_out_surface == 0) {
+            if ((tauIdx - iFreezeStart) % DATA.facTau == 0
+                    && tauIdx > iFreezeStart) {
+                frozen = frozen_without_surface(*fpCurr);
+            }
+        } else if (freezeout_flag == 1) {
             if (freezeout_lowtemp_flag == 1 && tauIdx == iFreezeStart) {
 #ifdef MUSIC_USE_GPU
                 // Equal-tau surface only reads the current arena.
@@ -736,6 +754,82 @@ void Evolve::AdvanceRK(double tau, Fields* &fpPrev, Fields* &fpCurr,
 #endif
         }
     }  /* loop over rk_flag */
+}
+
+// ── freeze_out_surface = 0: stop without building the surface ─────────────
+//
+// FindFreezeOutSurface_Cornelius reports "all frozen" when no hyper-cube
+// between the previously checked step and the current one straddles e_fo.
+// With every cell a cube corner (freeze_Ncell_x_step = 1, eta step 1) that is
+// exactly: every cell of both steps is below e_fo (a corner equal to e_fo
+// counts as a crossing, hence the strict <). This test gives the same stop
+// step without building the surface. Both read the same values: the GPU's
+// float state (reduction on the GPU, or the host copy of it).
+
+//! max(e) of the current step [1/fm^4]
+double Evolve::max_energy_density_raw(Fields &arena_current) {
+#ifdef MUSIC_USE_GPU
+    if (advance.gpu_owns_state()) {
+        double eps_max = 0., rhob_max = 0.;
+        advance.reduce_max_gpu(eps_max, rhob_max);
+        return eps_max;
+    }
+#endif
+    double eps_max = 0.;
+    const std::vector<double> &e = arena_current.e_;
+    #pragma omp parallel for reduction(max:eps_max)
+    for (std::size_t i = 0; i < e.size(); i++) {
+        eps_max = std::max(eps_max, e[i]);
+    }
+    return eps_max;
+}
+
+//! "frozen" as FindFreezeOutSurface_Cornelius would report it, without a
+//! surface; also flags a hot transverse grid edge like Cornelius does
+int Evolve::frozen_without_surface(Fields &arena_current) {
+    bench::Timer _bt("evolve.freezeout_check_no_surface");
+    double eps_fo = epsFO_list[0];
+    for (const double eps : epsFO_list) eps_fo = std::min(eps_fo, eps);
+    eps_fo /= hbarc;                                         // 1/fm^4
+    const double eps_max = max_energy_density_raw(arena_current);
+    const bool frozen = (eps_max < eps_fo && emax_last_check_ < eps_fo);
+    emax_last_check_ = eps_max;
+    if (!frozen && transverse_edge_is_hot(arena_current, eps_fo)) {
+        music_message << "Freeze-out cell at the boundary! "
+                      << "The grid is too small!";
+        music_message.flush("error");
+        DATA.reRunHydro = true;
+        return 0;
+    }
+    return frozen ? 1 : 0;
+}
+
+//! Cornelius sets reRunHydro when a crossing cube starts at ix == 0 or
+//! ix >= nx - 2*fac_x (same in y): a cell at or above e_fo in those bands
+bool Evolve::transverse_edge_is_hot(Fields &arena_current, double eps_fo) {
+#ifdef MUSIC_USE_GPU
+    advance.sync_curr_from_gpu_readonly(arena_current);
+#endif
+    const int nx = arena_current.nX();
+    const int ny = arena_current.nY();
+    const int neta = arena_current.nEta();
+    const int fx = DATA.fac_x;
+    const int fy = DATA.fac_y;
+    for (int ieta = 0; ieta < neta; ieta++)
+    for (int ix = 0; ix < nx; ix++)
+    for (int iy = 0; iy < ny; iy++) {
+        const bool edge = (ix <= fx || ix >= nx - 2*fx
+                           || iy <= fy || iy >= ny - 2*fy);
+        if (!edge) {
+            iy = std::max(iy, ny - 2*fy - 1);          // jump to the far band
+            continue;
+        }
+        if (arena_current.e_[arena_current.getFieldIdx(ix, iy, ieta)]
+                >= eps_fo) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Cornelius freeze out  (C. Shen, 11/2014)
