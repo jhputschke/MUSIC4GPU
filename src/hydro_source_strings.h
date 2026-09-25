@@ -68,6 +68,17 @@ class HydroSourceStrings : public HydroSourceBase {
 
     //! this function returns the energy source term J^\mu at a given point
     //! (tau, x, y, eta_s)
+    //! The energy source reads the string and remnant lists, rhob the baryon
+    //! list, rhoq the baryon or electric list; with all four empty every one
+    //! of them returns exactly zero.  With evolve_QCD_string_mode 4 that is
+    //! every step after the strings are deposited at the start.
+    bool has_active_sources_current_tau() const override {
+        return(!(QCD_strings_list_current_tau.empty()
+                 && QCD_strings_remnant_list_current_tau.empty()
+                 && QCD_strings_baryon_list_current_tau.empty()
+                 && QCD_strings_electric_list_current_tau.empty()));
+    }
+
     void get_hydro_energy_source(const double tau, const double x,
                                  const double y, const double eta_s,
                                  const FlowVec &u_mu,

@@ -85,6 +85,13 @@ class HydroSourceBase {
                                             const double eta_s) const;
 
     virtual void prepare_list_for_current_tau_frame(const double tau_local) {}
+
+    //! Whether the source can be non-zero at the query times of the current
+    //! step (tau and tau + dtau of its Runge-Kutta substeps), i.e. after
+    //! prepare_list_for_current_tau_frame(tau).  false promises that every
+    //! get_hydro_*_source() returns exactly zero there, so the caller may skip
+    //! evaluating it.  The default is the conservative true.
+    virtual bool has_active_sources_current_tau() const {return(true);}
 };
 
 #endif  // SRC_HYDRO_SOURCE_BASE_H_
