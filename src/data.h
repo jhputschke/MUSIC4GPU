@@ -233,6 +233,12 @@ typedef struct init_data {
 
     //! flag to include low temperature cell at the initial time
     int doFreezeOut_lowtemp;
+    //! 1 (default): build the freeze-out surface (Cornelius) at every check
+    //! step; its "no crossing left" result also stops the evolution.
+    //! 0: build no surface and stop on the equivalent test, max(e) below the
+    //! freeze-out energy density in the current and the previously checked
+    //! step (same stop step), for runs that need only the evolution.
+    int freeze_out_surface;
 
     //! Maximum starting time for freeze-out surface
     double freezeOutTauStartMax;
