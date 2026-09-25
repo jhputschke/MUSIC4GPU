@@ -111,7 +111,19 @@ string StringFind4(string file_name, string str_in) {
     // pass checking, now read in the parameter file
     string temp_string;
     std::ifstream input(inputname.c_str());
-    getline(input, temp_string);  // read in the first entry
+    // The file must end with an EndOfData line.  Reaching the end of the file
+    // first means it is empty or truncated -- e.g. read while another process
+    // rewrites it -- and the loop below would otherwise spin forever: getline()
+    // then keeps returning an empty string, which is never "endofdata".
+    auto next_line = [&]() {
+        if (!std::getline(input, temp_string)) {
+            std::cerr << "StringFind4: " << file_name << " ended without an "
+                      << "EndOfData line while looking for " << str_in
+                      << " (empty or truncated file?)" << std::endl;
+            exit(1);
+        }
+    };
+    next_line();  // read in the first entry
 
     int ind = 0;
     string para_name;
@@ -133,7 +145,7 @@ string StringFind4(string file_name, string str_in) {
                 return(para_val);
             }  /* if right, return */
         }
-        getline(input, temp_string);  // read in the next entry
+        next_line();  // read in the next entry
     }
     input.close(); // finish read in and close the file
 
