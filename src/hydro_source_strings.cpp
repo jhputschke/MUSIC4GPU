@@ -573,6 +573,7 @@ void HydroSourceStrings::prepare_list_for_current_tau_frame(
             QCD_strings_list_current_tau.push_back(it);
         }
     }
+    build_transverse_bins();
 
     if (tau_local < get_source_tauStart_max() + dtau) {
        
@@ -598,9 +599,15 @@ void HydroSourceStrings::get_hydro_energy_source(
         && QCD_strings_remnant_list_current_tau.size() == 0) return;
 
     const double dtau = DATA.delta_tau;
-    const double n_sigma_skip = 8.;
+    const double n_sigma_skip = n_sigma_skip_;
     const double exp_tau = 1./tau;
-    for (auto const&it: QCD_strings_list_current_tau) {
+    // only the strings whose transverse box contains (x, y), in list order
+    const std::vector<int> *near_strings = string_bins_.lookup(x, y);
+    const std::size_t n_strings = (near_strings ? near_strings->size()
+                                   : QCD_strings_list_current_tau.size());
+    for (std::size_t k = 0; k < n_strings; k++) {
+        auto const &it = QCD_strings_list_current_tau[
+                            near_strings ? (*near_strings)[k] : k];
         const double sigma_x = it->sigma_x;
         const double sigma_x_sq = sigma_x*sigma_x;
         const double sigma_eta = it->sigma_eta;
@@ -725,7 +732,12 @@ void HydroSourceStrings::get_hydro_energy_source(
         j_mu[3] += local_eperp*sinh_long*cosh_perp;
     }
 
-    for (auto const&it: QCD_strings_remnant_list_current_tau) {
+    const std::vector<int> *near_remnants = remnant_bins_.lookup(x, y);
+    const std::size_t n_remnants = (near_remnants ? near_remnants->size()
+                                    : QCD_strings_remnant_list_current_tau.size());
+    for (std::size_t k = 0; k < n_remnants; k++) {
+        auto const &it = QCD_strings_remnant_list_current_tau[
+                            near_remnants ? (*near_remnants)[k] : k];
         const double sigma_x = it->sigma_x;
         const double sigma_x_sq = sigma_x*sigma_x;
         const double sigma_eta = it->sigma_eta;
@@ -829,8 +841,13 @@ double HydroSourceStrings::get_hydro_rhob_source(
     const double dtau            = DATA.delta_tau;
 
     const double exp_tau      = 1.0/tau;
-    const double n_sigma_skip = 8.;
-    for (auto &it: QCD_strings_baryon_list_current_tau) {
+    const double n_sigma_skip = n_sigma_skip_;
+    const std::vector<int> *near_baryons = baryon_bins_.lookup(x, y);
+    const std::size_t n_baryons = (near_baryons ? near_baryons->size()
+                                   : QCD_strings_baryon_list_current_tau.size());
+    for (std::size_t k = 0; k < n_baryons; k++) {
+        auto const &it = QCD_strings_baryon_list_current_tau[
+                            near_baryons ? (*near_baryons)[k] : k];
         const double sigma_x = it->sigma_x;
         const double sigma_eta = it->sigma_eta;
         const double prefactor_prep = 1./(2.*M_PI*sigma_x*sigma_x);
@@ -971,7 +988,7 @@ double HydroSourceStrings::get_hydro_rhoq_source(
     const double dtau            = DATA.delta_tau;
 
     const double exp_tau      = 1.0/tau;
-    const double n_sigma_skip = 8.;
+    const double n_sigma_skip = n_sigma_skip_;
     for (auto &it: QCD_strings_electric_list_current_tau) {
         const double sigma_x = it->sigma_x;
         const double sigma_eta = it->sigma_eta;
@@ -1079,6 +1096,91 @@ double HydroSourceStrings::get_hydro_rhoq_source(
     const double prefactor_tau  = 1./dtau;
     res *= prefactor_tau;
     return(res);
+}
+
+
+void StringTransverseBins::build(
+        const std::vector<std::array<double, 4>> &boxes,
+        double x_min, double x_max, double y_min, double y_max,
+        double bx_in, double by_in) {
+    bx = bx_in;
+    by = by_in;
+    x0 = x_min;
+    y0 = y_min;
+    nx = std::max(1, static_cast<int>(std::ceil((x_max - x_min)/bx)));
+    ny = std::max(1, static_cast<int>(std::ceil((y_max - y_min)/by)));
+    bins.assign(static_cast<std::size_t>(nx)*ny, std::vector<int>());
+    for (std::size_t i = 0; i < boxes.size(); i++) {
+        const auto &b = boxes[i];
+        // floor() is monotone, so every point inside the box falls into a bin
+        // in [ix_lo, ix_hi] x [iy_lo, iy_hi]; bins outside the area are never
+        // looked up (lookup() returns the whole list there)
+        const int ix_lo = std::max(0, static_cast<int>(std::floor((b[0] - x0)/bx)));
+        const int ix_hi = std::min(nx - 1, static_cast<int>(std::floor((b[1] - x0)/bx)));
+        const int iy_lo = std::max(0, static_cast<int>(std::floor((b[2] - y0)/by)));
+        const int iy_hi = std::min(ny - 1, static_cast<int>(std::floor((b[3] - y0)/by)));
+        for (int ix = ix_lo; ix <= ix_hi; ix++) {
+            for (int iy = iy_lo; iy <= iy_hi; iy++) {
+                bins[static_cast<std::size_t>(ix)*ny + iy].push_back(
+                                                    static_cast<int>(i));
+            }
+        }
+    }
+}
+
+
+void HydroSourceStrings::build_transverse_bins() {
+    // The binned area is the hydro grid plus one cell on each side; a query
+    // outside it walks the whole list.  One bin per grid cell.
+    const double bx = DATA.delta_x;
+    const double by = DATA.delta_y;
+    const double x_min = -DATA.x_size/2. - 1.5*bx;
+    const double x_max =  DATA.x_size/2. + 1.5*bx;
+    const double y_min = -DATA.y_size/2. - 1.5*by;
+    const double y_max =  DATA.y_size/2. + 1.5*by;
+    // Far above the rounding of the transverse coordinates (~1e-15 fm), far
+    // below a cell: only makes the boxes safely conservative.
+    const double pad = 1e-6;
+
+    // The string and baryon loops place a string at
+    // getStringTransverseCoord(end_l, end_r, eta_frac) with eta_frac clamped
+    // to [0, 1]; that is linear in eta_frac, so its range is spanned by
+    // eta_frac = 0 and 1.
+    auto along_string = [&](const QCD_string &st) {
+        const double xa = getStringTransverseCoord(st.x_pl, st.x_pr, 0.);
+        const double xb = getStringTransverseCoord(st.x_pl, st.x_pr, 1.);
+        const double ya = getStringTransverseCoord(st.y_pl, st.y_pr, 0.);
+        const double yb = getStringTransverseCoord(st.y_pl, st.y_pr, 1.);
+        const double reach = n_sigma_skip_*st.sigma_x + pad;
+        return std::array<double, 4>{std::min(xa, xb) - reach,
+                                     std::max(xa, xb) + reach,
+                                     std::min(ya, yb) - reach,
+                                     std::max(ya, yb) + reach};
+    };
+    // The remnant loop places it at its fixed (x_perp, y_perp).
+    auto at_remnant = [&](const QCD_string &st) {
+        const double reach = n_sigma_skip_*st.sigma_x + pad;
+        return std::array<double, 4>{st.x_perp - reach, st.x_perp + reach,
+                                     st.y_perp - reach, st.y_perp + reach};
+    };
+
+    auto rebuild = [&](StringTransverseBins &bins,
+                       const std::vector<std::shared_ptr<QCD_string>> &list,
+                       const bool remnant) {
+        if (list.empty()) {
+            bins.clear();
+            return;
+        }
+        std::vector<std::array<double, 4>> boxes;
+        boxes.reserve(list.size());
+        for (auto const &it: list) {
+            boxes.push_back(remnant ? at_remnant(*it) : along_string(*it));
+        }
+        bins.build(boxes, x_min, x_max, y_min, y_max, bx, by);
+    };
+    rebuild(string_bins_,  QCD_strings_list_current_tau,         false);
+    rebuild(remnant_bins_, QCD_strings_remnant_list_current_tau, true);
+    rebuild(baryon_bins_,  QCD_strings_baryon_list_current_tau,  false);
 }
 
 

@@ -3,6 +3,8 @@
 #ifndef SRC_HYDRO_SOURCE_STRINGS_H_
 #define SRC_HYDRO_SOURCE_STRINGS_H_
 
+#include <array>
+#include <cmath>
 #include <vector>
 #include <memory>
 #include "hydro_source_base.h"
@@ -36,6 +38,38 @@ struct QCD_string {
 };
 
 
+//! The strings of one current-tau list, binned by the transverse box each can
+//! reach.  The per-cell source loops skip a string that is more than
+//! n_sigma_skip * sigma_x away from it in x or in y before adding anything, so
+//! a cell needs only the strings whose box contains it.  Each bin lists them in
+//! list order, so a cell adds the same terms in the same order as a loop over
+//! the whole list: the result is bit-identical.
+struct StringTransverseBins {
+    double x0 = 0., y0 = 0.;     //!< lower edge of bin (0, 0) [fm]
+    double bx = 1., by = 1.;     //!< bin widths [fm]
+    int nx = 0, ny = 0;
+    std::vector<std::vector<int>> bins;   //!< [ix * ny + iy] -> list indices
+
+    void clear() { nx = ny = 0; bins.clear(); }
+
+    //! (Re)build for boxes[i] = {x_lo, x_hi, y_lo, y_hi} of list entry i, on
+    //! bins of width (bx_in, by_in) covering [x_min, x_max] x [y_min, y_max].
+    void build(const std::vector<std::array<double, 4>> &boxes,
+               double x_min, double x_max, double y_min, double y_max,
+               double bx_in, double by_in);
+
+    //! The list indices to visit at (x, y), or nullptr for "the whole list"
+    //! (not built, or a point outside the binned area).
+    const std::vector<int> *lookup(const double x, const double y) const {
+        if (nx == 0) return nullptr;
+        const double fx = std::floor((x - x0)/bx);
+        const double fy = std::floor((y - y0)/by);
+        if (!(fx >= 0. && fx < nx && fy >= 0. && fy < ny)) return nullptr;
+        return &bins[static_cast<int>(fx)*ny + static_cast<int>(fy)];
+    }
+};
+
+
 class HydroSourceStrings : public HydroSourceBase {
  private:
     InitData &DATA;
@@ -49,6 +83,13 @@ class HydroSourceStrings : public HydroSourceBase {
     std::vector<std::shared_ptr<QCD_string>> QCD_strings_remnant_list_current_tau;
     std::vector<std::shared_ptr<QCD_string>> QCD_strings_baryon_list_current_tau;
     std::vector<std::shared_ptr<QCD_string>> QCD_strings_electric_list_current_tau;
+
+    //! The per-cell loops skip a string beyond this many sigma_x / sigma_eta.
+    static constexpr double n_sigma_skip_ = 8.;
+    //! Transverse bins of the three current-tau lists the per-cell loops walk,
+    //! rebuilt by prepare_list_for_current_tau_frame().
+    StringTransverseBins string_bins_, remnant_bins_, baryon_bins_;
+    void build_transverse_bins();
 
  public:
     HydroSourceStrings() = delete;
