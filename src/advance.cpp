@@ -351,7 +351,8 @@ bool Advance::gpu_features_supported() const {
 // energy + momentum, alpha = 4 for baryon when turn_on_rhob).  The result is
 // consumed by gpu_finalize_ideal when params.has_hydro_source == 1.
 void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
-                                          Fields &arenaFieldsCurr) {
+                                          Fields &arenaFieldsCurr,
+                                          bool with_main, bool with_jets) {
     const int Nx    = arenaFieldsCurr.nX();
     const int Ny    = arenaFieldsCurr.nY();
     const int Neta  = arenaFieldsCurr.nEta();
@@ -366,7 +367,12 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
 
     const bool rhob_src = (DATA.turn_on_rhob == 1);
 
-    #pragma omp parallel for collapse(3) schedule(static)
+    // Dynamic, not static: the cost per cell varies by orders of magnitude
+    // (cells near a string or droplet evaluate it, the rest skip it at once)
+    // and the cores run at different speeds, so equal static shares left
+    // most threads waiting at the barrier.  Each cell writes only its own
+    // entries, so the result does not depend on the schedule.
+    #pragma omp parallel for collapse(3) schedule(dynamic, 1024)
     for (int ieta = 0; ieta < Neta; ++ieta)
     for (int ix   = 0; ix   < Nx;   ++ix  )
     for (int iy   = 0; iy   < Ny;   ++iy  ) {
@@ -381,7 +387,7 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
 
         EnergyFlowVec j_mu = {0};
         double j_rhob = 0.;
-        if (flag_add_hydro_source) {
+        if (with_main) {
             hydro_source_terms_ptr->get_hydro_energy_source(
                     tau_rk, x_local, y_local, eta_s_local, u_local, j_mu);
             if (rhob_src) {
@@ -392,7 +398,7 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
         // Jet energy deposition, summed into the same buffer.  With no
         // droplets this block is skipped, so the buffer is bit-identical to
         // an initial-state-only run.
-        if (flag_add_hydro_source_from_jets_) {
+        if (with_jets) {
             EnergyFlowVec j_jet = {0};
             hydro_source_terms_from_jets_ptr_->get_hydro_energy_source(
                     tau_rk, x_local, y_local, eta_s_local, u_local, j_jet);
@@ -540,11 +546,22 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     // Hydro source pre-pass (energy + momentum, plus rhob if turn_on_rhob).
     // turn_on_QS == 1 is rejected upstream in gpu_features_supported(), so we
     // only need to evaluate energy + baryon channels here.
-    if (flag_add_hydro_source || flag_add_hydro_source_from_jets_) {
-        // prepare_list_for_current_tau_frame is already called once per
-        // timestep by Evolve::AdvanceRK before AdvanceIt, matching the CPU
-        // FirstRKStepT contract (no per-substep re-prep).
-        prefill_hydro_source_on_cpu(tau, rk_flag, arenaFieldsCurr);
+    // prepare_list_for_current_tau_frame is already called once per timestep
+    // by Evolve before AdvanceRK, matching the CPU FirstRKStepT contract (no
+    // per-substep re-prep), so the sources know here whether they can deposit
+    // at this step's query times.  A source that cannot adds exactly zero:
+    // leave it out, and skip the whole pre-pass (and the source add in the
+    // kernel) when neither can.  With string initial conditions
+    // (evolve_QCD_string_mode 4) the strings are all deposited in the first
+    // two steps, so this removes the pre-pass from nearly every step of a
+    // background leg, and from every step of a jet leg without a droplet due.
+    const bool with_main = flag_add_hydro_source
+        && hydro_source_terms_ptr->has_active_sources_current_tau();
+    const bool with_jets = flag_add_hydro_source_from_jets_
+        && hydro_source_terms_from_jets_ptr_->has_active_sources_current_tau();
+    if (with_main || with_jets) {
+        prefill_hydro_source_on_cpu(tau, rk_flag, arenaFieldsCurr,
+                                    with_main, with_jets);
         p.has_hydro_source = 1;
         p.has_rhob_source  = (DATA.turn_on_rhob == 1) ? 1 : 0;
     } else {

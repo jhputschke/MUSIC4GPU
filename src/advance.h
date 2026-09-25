@@ -118,8 +118,11 @@ class Advance {
     // (qi_source_in[alpha * Ncells + cell] = tau_rk * j^alpha).  Mirrors the
     // per-cell formula in Advance::FirstRKStepT.  Caller must guard
     // turn_on_QS == 1 — rhoq/rhos sources are not GPU-supported.
+    // with_main / with_jets: evaluate the initial-state / jet source; a source
+    // left out must be exactly zero this step (has_active_sources_current_tau).
     void       prefill_hydro_source_on_cpu(double tau, int rk_flag,
-                                           Fields &arenaFieldsCurr);
+                                           Fields &arenaFieldsCurr,
+                                           bool with_main, bool with_jets);
 #endif
 
  public:
