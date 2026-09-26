@@ -79,7 +79,8 @@ class Evolve {
                                           Fields &arena_current,
                                           Fields &arena_freezeout_prev,
                                           Fields &arena_freezeout,
-                                          int thread_id, double epsFO);
+                                          int thread_id, double epsFO,
+                                          std::vector<SurfaceCell> &surface_out);
     int FindFreezeOutSurface_boostinvariant_Cornelius(
                 double tau, Fields &arena_current, Fields &arena_freezeout);
 

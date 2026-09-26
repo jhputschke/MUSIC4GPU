@@ -716,6 +716,9 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 
 void Evolve::store_previous_step_for_freezeout(Fields &arenaCurr,
                                                Fields &arenaFreeze) {
+    bench::Timer _bt("evolve.freezeout_store_prev");
+    // Plain copies: bandwidth-bound (~4 ms per call on the GB10); an OpenMP
+    // copy per field was slower (thread wake-ups, 21 fields x 2 per pass).
     arenaFreeze.e_ = arenaCurr.e_;
     arenaFreeze.rhob_ = arenaCurr.rhob_;
     arenaFreeze.rhoq_ = arenaCurr.rhoq_;
@@ -843,12 +846,34 @@ int Evolve::FindFreezeOutSurface_Cornelius(double tau,
             i_freezesurf++) {
         const double epsFO = epsFO_list[i_freezesurf]/hbarc;   // 1/fm^4
 
-        //#pragma omp parallel for reduction(+:intersections)
-        for (int ieta = 0; ieta < (neta-fac_eta); ieta += fac_eta) {
+        // One eta slice per iteration, each into its own vector, joined in eta
+        // order afterwards: the surface is the serial one, cell for cell and in
+        // the same order, whatever the thread count. Upstream disabled the
+        // parallel loop (5025f77) -- with surface_in_memory all threads
+        // pushed into the one surfaceCellVec_. The file output (one file per
+        // thread, concatenated in thread order) is not order-stable in
+        // parallel, so that mode stays serial.
+        const int nslices = (neta - fac_eta + fac_eta - 1)/fac_eta;
+        std::vector<std::vector<SurfaceCell>> slice_cells(nslices);
+        const bool parallel = DATA.surface_in_memory;
+        bench::Timer _bt_find("evolve.freezeout_find");
+        #pragma omp parallel for reduction(+:intersections) \
+                schedule(dynamic, 1) if (parallel)
+        for (int islice = 0; islice < nslices; islice++) {
+            const int ieta = islice*fac_eta;
             int thread_id = omp_get_thread_num();
             intersections += FindFreezeOutSurface_Cornelius_XY(
                 tau, ieta, arena_prev, arena_current,
-                arena_freezeout_prev, arena_freezeout, thread_id, epsFO);
+                arena_freezeout_prev, arena_freezeout, thread_id, epsFO,
+                slice_cells[islice]);
+        }
+        // No reserve(size + n_new) here: an exact reserve every pass defeats
+        // the vector's geometric growth and re-copies the whole accumulated
+        // surface each pass (quadratic; measured 70% of the finder's time).
+        // insert() grows geometrically on its own.
+        for (auto &cells : slice_cells) {
+            surfaceCellVec_.insert(surfaceCellVec_.end(), cells.begin(),
+                                   cells.end());
         }
         if (DATA.reRunHydro) {
             return(0);
@@ -866,7 +891,8 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                                               Fields &arena_current,
                                               Fields &arena_freezeout_prev,
                                               Fields &arena_freezeout,
-                                              int thread_id, double epsFO) {
+                                              int thread_id, double epsFO,
+                                              std::vector<SurfaceCell> &surface_out) {
     const bool surface_in_binary = DATA.freeze_surface_in_binary;
     const int nx = arena_current.nX();
     const int ny = arena_current.nY();
@@ -882,7 +908,11 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
         modes = modes | std::ios::binary;
     }
 
-    s_file.open(strs_name.str().c_str(), modes);
+    // Only the file mode writes it; in memory mode (possibly one call per
+    // thread) opening it would just leave empty per-thread files behind.
+    if (!DATA.surface_in_memory) {
+        s_file.open(strs_name.str().c_str(), modes);
+    }
 
     const int dim = 4;
     int intersections = 0;
@@ -964,6 +994,7 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                 || !std::isfinite(arena_freezeout.e_[Idx011])
                 || !std::isfinite(arena_freezeout.e_[Idx111])) {
                 static bool warned_nonfinite = false;
+                #pragma omp critical(music_freezeout_message)
                 if (!warned_nonfinite) {
                     music_message << "[freeze-out] skipping cell with non-finite "
                                      "energy density (likely fp32 GPU instability "
@@ -999,19 +1030,25 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
 
             if (ix == 0 || ix >= nx - 2*fac_x
                     || iy == 0 || iy >= ny - 2*fac_y) {
-                music_message << "Freeze-out cell at the boundary! "
-                              << "The grid is too small!";
-                music_message.flush("error");
-                DATA.reRunHydro = true;
+                #pragma omp critical(music_freezeout_message)
+                {
+                    music_message << "Freeze-out cell at the boundary! "
+                                  << "The grid is too small!";
+                    music_message.flush("error");
+                    DATA.reRunHydro = true;
+                }
                 return(0);
             }
 
             if (ix == 0 || ix >= nx - 2*fac_x
                     || iy == 0 || iy >= ny - 2*fac_y) {
-                music_message << "Freeze-out cell at the boundary! "
-                              << "The grid is too small!";
-                music_message.flush("error");
-                DATA.reRunHydro = true;
+                #pragma omp critical(music_freezeout_message)
+                {
+                    music_message << "Freeze-out cell at the boundary! "
+                                  << "The grid is too small!";
+                    music_message.flush("error");
+                    DATA.reRunHydro = true;
+                }
                 return(0);
             }
 
@@ -1196,6 +1233,10 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                     aFreezeCell.energy_density = (
                                             static_cast<float>(epsFO*hbarc));
                     aFreezeCell.temperature = static_cast<float>(TFO*hbarc);
+                    // was never set here, so the in-memory surface carried
+                    // uninitialised memory as its pressure (the file output
+                    // writes it). iSS re-derives P with regulateEOS = 1.
+                    aFreezeCell.pressure = static_cast<float>(pressure*hbarc);
                     aFreezeCell.mu_B = static_cast<float>(muB*hbarc);
                     aFreezeCell.mu_S = static_cast<float>(muS*hbarc);
                     aFreezeCell.mu_Q = static_cast<float>(muQ*hbarc);
@@ -1208,7 +1249,7 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                         aFreezeCell.shear_pi[ii] = static_cast<float>(
                                                 fluid_center.Wmunu[ii]*hbarc);
                     }
-                    surfaceCellVec_.push_back(aFreezeCell);
+                    surface_out.push_back(aFreezeCell);
                 } else if (surface_in_binary) {
                     const int FOsize = 36 + DATA.output_vorticity*(24 + 14);
                     float array[FOsize];
@@ -1514,6 +1555,7 @@ void Evolve::FreezeOut_equal_tau_Surface_XY(double tau, int ieta,
                 aFreezeCell.umu[3] = static_cast<float>(ueta_center);
                 aFreezeCell.energy_density = static_cast<float>(e_local*hbarc);
                 aFreezeCell.temperature = static_cast<float>(T_local*hbarc);
+                aFreezeCell.pressure = static_cast<float>(pressure*hbarc);
                 aFreezeCell.mu_B = static_cast<float>(muB_local*hbarc);
                 aFreezeCell.mu_S = static_cast<float>(muS_local*hbarc);
                 aFreezeCell.mu_Q = static_cast<float>(muQ_local*hbarc);
@@ -1895,6 +1937,7 @@ int Evolve::FindFreezeOutSurface_boostinvariant_Cornelius(
                                             static_cast<float>(epsFO*hbarc));
                         aFreezeCell.temperature = (
                                             static_cast<float>(TFO*hbarc));
+                        aFreezeCell.pressure = static_cast<float>(pressure*hbarc);
                         aFreezeCell.mu_B = static_cast<float>(muB*hbarc);
                         aFreezeCell.mu_S = static_cast<float>(muS*hbarc);
                         aFreezeCell.mu_Q = static_cast<float>(muQ*hbarc);
