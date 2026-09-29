@@ -76,6 +76,11 @@ public:
     // epsilon/rhob on the host after wait() has ensured the last kernel is done.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // The CUDA kernel counts the cell updates in which it set a non-finite
+    // W^{mu nu} or Pi to 0; the Metal kernels apply the same guard but do not
+    // count yet, so this always returns 0.
+    unsigned int read_and_reset_nonfinite() { return 0u; }
+
     // Phase 2b: launch gpu_pack_evolution_ideal over the down-sampled grid into
     // a pipeline-owned shared scratch buffer, synchronize, and copy the packed
     // records into host_out (8 floats per cell, fluidCell_ideal layout).

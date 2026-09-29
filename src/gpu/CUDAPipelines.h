@@ -56,6 +56,11 @@ public:
     // call).  Launches on the compute stream and synchronizes before returning.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // Cell updates in which gpu_first_rk_step_w_full set a non-finite
+    // W^{mu nu} or Pi to 0 since the last call (resets the count).
+    // Synchronizes the compute stream.
+    unsigned int read_and_reset_nonfinite();
+
     // Phase 2b: launch gpu_pack_evolution_ideal over the down-sampled grid into
     // a pipeline-owned managed scratch buffer, synchronize, and copy the packed
     // records into host_out (8 floats per cell, fluidCell_ideal layout).  The

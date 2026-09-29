@@ -129,3 +129,7 @@ __global__ void gpu_pack_evolution_ideal(
     float* __restrict__ out,
     GPUEosParams eos_p,
     GPUPackParams pp);
+
+// Cell updates in which gpu_first_rk_step_w_full set a non-finite W^{mu nu} or
+// Pi to 0 since the last call; resets the count.  Synchronizes `stream`.
+unsigned int gpu_nonfinite_count_read_and_reset(void* stream);

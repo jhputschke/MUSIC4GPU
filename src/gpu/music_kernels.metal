@@ -356,7 +356,8 @@ kernel void gpu_first_rk_step_w(
         // Source: -(pi_b + bulk_zeta*theta) / bulk_tau_Pi
         float bulk_src = -(pib_c + bulk_zeta * theta) / fmax(bulk_tau, 1e-6f);
         float tempf = pib_c * uc[0] + bulk_src * dt;
-        pi_b_future[c] = tempf / uf[0];
+        const float pib_new = tempf / uf[0];
+        pi_b_future[c] = isfinite(pib_new) ? pib_new : 0.f;  // non-finite guard
     } else {
         pi_b_future[c] = 0.f;
     }
@@ -383,6 +384,13 @@ kernel void gpu_first_rk_step_w(
 
     // Zero out diffusion components (handled on CPU)
     for (int m = 10; m < 14; ++m) Wf[m] = 0.f;
+
+    // Non-finite guard (see gpu_first_rk_step_w_full)
+    {
+        bool bad_w = false;
+        for (int m = 0; m < 14; ++m) bad_w |= !isfinite(Wf[m]);
+        if (bad_w) for (int m = 0; m < 14; ++m) Wf[m] = 0.f;
+    }
 
     // Write output
     for (int m = 0; m < 14; ++m)
@@ -609,7 +617,7 @@ inline float gpu_solve_u0(float u0_guess, float T00, float K00, float M, float J
 // tauq[5] = tau * {T^{00}, T^{10}, T^{20}, T^{30}, J^0} at a half-interface.
 // prev_u[4], prev_eps: full center-cell 4-velocity and energy used for Newton
 // initial guess and for the revert fallback (matches revert_grid on CPU).
-ReconstResult gpu_reconst(float tau, float tauq[5],
+ReconstResult gpu_reconst_raw(float tau, float tauq[5],
                            thread const float prev_u[4], float prev_eps,
                            device const float* P_tab,
                            device const float* dPde_tab,
@@ -717,6 +725,20 @@ ReconstResult gpu_reconst(float tau, float tauq[5],
         res.e    = prev_eps;
         res.u[0] = prev_u[0];  res.u[1] = prev_u[1];
         res.u[2] = prev_u[2];  res.u[3] = prev_u[3];
+    }
+    return res;
+}
+
+// Vacuum at rest: see gpu_reconst in music_kernels.cu.  A vacuum-level cell
+// (e < 1e-5 1/fm^4) moving faster than u^0 = 10 is put at rest.
+ReconstResult gpu_reconst(float tau, float tauq[5],
+                           thread const float prev_u[4], float prev_eps,
+                           device const float* P_tab,
+                           device const float* dPde_tab,
+                           constant GPUEosParams& ep) {
+    ReconstResult res = gpu_reconst_raw(tau, tauq, prev_u, prev_eps, P_tab, dPde_tab, ep);
+    if (res.e < 1.e-5f && res.u[0] > 10.f) {
+        res.u[0] = 1.f;  res.u[1] = 0.f;  res.u[2] = 0.f;  res.u[3] = 0.f;
     }
     return res;
 }
@@ -2182,6 +2204,16 @@ kernel void gpu_first_rk_step_w_full(
         }
 
         (void)rhob_future;  // EOS at rhob=0 for this v1 — future µB needs Tier 4
+    }
+
+    // Non-finite guard (as in music_kernels.cu, without the counter): an
+    // inf/NaN W^{mu nu} or Pi from an overflow in a very dilute cell would
+    // spread and freeze the grid; set it to 0.  Normal runs are unchanged.
+    {
+        bool bad_w = false;
+        for (int m = 0; m < 14; m++) bad_w |= !isfinite(Wf[m]);
+        if (bad_w) for (int m = 0; m < 14; m++) Wf[m] = 0.f;
+        if (!isfinite(pi_b_out)) pi_b_out = 0.f;
     }
 
     // ── Write outputs ─────────────────────────────────────────────────────

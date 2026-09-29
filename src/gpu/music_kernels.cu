@@ -619,7 +619,7 @@ __device__ float gpu_solve_u0(float u0_guess, float T00, float K00, float M, flo
 
 // ── Main reconstruction (matches Reconst::ReconstIt_shell on CPU) ─────────────
 
-__device__ ReconstResult gpu_reconst(float tau, float tauq[5],
+__device__ ReconstResult gpu_reconst_raw(float tau, float tauq[5],
                                      const float prev_u[4], float prev_eps,
                                      const float* __restrict__ P_tab,
                                      const float* __restrict__ dPde_tab,
@@ -723,6 +723,33 @@ __device__ ReconstResult gpu_reconst(float tau, float tauq[5],
         res.e    = prev_eps;
         res.u[0] = prev_u[0];  res.u[1] = prev_u[1];
         res.u[2] = prev_u[2];  res.u[3] = prev_u[3];
+    }
+    return res;
+}
+
+// Vacuum at rest.  In single precision the energy density of vacuum cells has a
+// floor of ~1e-7 1/fm^4 (on the CPU, in double, ~1e-14), and such a cell can
+// still come out of the reconstruction with a huge Lorentz factor (u^0 in the
+// thousands at the dilute edge of the medium).  T^{tau mu} grows as e u0^2, so
+// on the GPU that cell carries an energy-momentum comparable to the dilute
+// fluid next to it: when the fluid reaches it, it is dragged to u^0 ~ 100s in
+// one step, and the viscous terms then overflow (a whole-grid freeze before the
+// non-finite guard, a blow-up after it).  So a vacuum-level cell (e below
+// GPU_VACUUM_E, 1e-5 1/fm^4 ~ 2e-6 GeV/fm^3, 1e5 below freeze-out) moving
+// faster than u^0 = GPU_VACUUM_U0_MAX is put at rest.  Its e is kept; only the
+// spurious kinetic energy of a vacuum cell is dropped.  Real fluid is never
+// that dilute, so the evolution of the medium is unaffected.
+#define GPU_VACUUM_E       1.e-5f
+#define GPU_VACUUM_U0_MAX  10.f
+
+__device__ ReconstResult gpu_reconst(float tau, float tauq[5],
+                                     const float prev_u[4], float prev_eps,
+                                     const float* __restrict__ P_tab,
+                                     const float* __restrict__ dPde_tab,
+                                     const GPUEosParams& ep) {
+    ReconstResult res = gpu_reconst_raw(tau, tauq, prev_u, prev_eps, P_tab, dPde_tab, ep);
+    if (res.e < GPU_VACUUM_E && res.u[0] > GPU_VACUUM_U0_MAX) {
+        res.u[0] = 1.f;  res.u[1] = 0.f;  res.u[2] = 0.f;  res.u[3] = 0.f;
     }
     return res;
 }
@@ -1693,6 +1720,24 @@ DFI float gpu_uWRHS_geom(
               + theta * W_local[mu][nu]) * delta_tau;
 }
 
+// ── non-finite counter ───────────────────────────────────────────────────────
+// Cell updates in which gpu_first_rk_step_w_full found a non-finite W^{mu nu}
+// or Pi and set it to 0.  A device global (no kernel argument, no buffer), so
+// the host accessor has to live in this translation unit.
+__device__ unsigned int d_nonfinite_count = 0u;
+
+unsigned int gpu_nonfinite_count_read_and_reset(void* stream_v) {
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_v);
+    unsigned int count = 0u;
+    const unsigned int zero = 0u;
+    cudaMemcpyFromSymbolAsync(&count, d_nonfinite_count, sizeof(count), 0,
+                              cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyToSymbolAsync(d_nonfinite_count, &zero, sizeof(zero), 0,
+                            cudaMemcpyHostToDevice, stream);
+    cudaStreamSynchronize(stream);
+    return count;
+}
+
 // ── gpu_first_rk_step_w_full ─────────────────────────────────────────────────
 
 __global__ void gpu_first_rk_step_w_full(
@@ -1914,6 +1959,21 @@ __global__ void gpu_first_rk_step_w_full(
 
         (void)rhob_future;
     }
+
+    // Non-finite guard.  An overflow in a very dilute cell (e.g. a spurious u^0
+    // jump at the edge of the medium) can leave W^{mu nu} or Pi at inf/NaN, and
+    // the regulator above cannot remove it (inf * 0 = NaN, and NaN > x is
+    // false).  It would then spread through the flux stencil, and
+    // gpu_reconstruct reverts every cell it reaches, so the whole grid stops
+    // evolving while MUSIC runs on to its maximum time.  Set such a tensor to 0
+    // and count the cell update (gpu_nonfinite_count_read_and_reset).  Only
+    // non-finite values trigger it, so normal runs are unchanged.
+    bool bad_w = false;
+    for (int m = 0; m < 14; m++) bad_w |= !isfinite(Wf[m]);
+    const bool bad_pi = !isfinite(pi_b_out);
+    if (bad_w) for (int m = 0; m < 14; m++) Wf[m] = 0.f;
+    if (bad_pi) pi_b_out = 0.f;
+    if (bad_w || bad_pi) atomicAdd(&d_nonfinite_count, 1u);
 
     for (int m = 0; m < 14; m++)
         Wmunu_future[m * Ncells + c] = Wf[m];

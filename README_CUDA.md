@@ -113,6 +113,48 @@ empty or `0` enables it. Example:
 MUSIC_FORCE_CPU=1 ./MUSIChydro input_params
 ```
 
+### Dilute regions: vacuum at rest, non-finite guard, debug switches
+
+In single precision the energy density of vacuum cells has a floor of ~1e-7 1/fm^4
+(in double, on the CPU path, ~1e-14). Both paths produce vacuum cells with huge
+Lorentz factors at the dilute edge of the medium (u^0 up to thousands). On the CPU
+they are harmless, but on the GPU T^{tau mu} ~ e u0^2 makes such a cell carry
+energy-momentum comparable to the dilute fluid next to it. Seen in one 3D
+MC-Glauber event (0-10% Au+Au):
+
+1. A vacuum cell with u^0 = 2048 dragged the fluid at the edge (e ~ 0.005 GeV/fm^3)
+   to u^0 = 190 in one step.
+2. W^{mu nu} and Pi there overflowed.
+3. The NaN spread through the flux stencil. `gpu_reconst` reverts every cell it
+   reaches, so the whole grid stopped evolving.
+4. MUSIC ran on silently to its maximum time; the same event on the CPU path froze
+   out normally at tau = 10.86 fm/c.
+
+Two changes stop this:
+
+- **Vacuum at rest** (`gpu_reconst`, CUDA and Metal): a cell with
+  e < `GPU_VACUUM_E` = 1e-5 1/fm^4 (~2e-6 GeV/fm^3, 1e5 below freeze-out) and
+  u^0 > `GPU_VACUUM_U0_MAX` = 10 is put at rest, keeping its e. This removes the
+  source. With it, the event above freezes out at tau = 10.86 fm/c, like the CPU
+  path. For a normal event the medium changes by at most 1% (relative) in cells
+  above freeze-out and 0.03% in total energy, with identical freeze-out times.
+- **Non-finite guard** (`gpu_first_rk_step_w_full`; Metal: the same guard): a
+  non-finite W^{mu nu} or Pi is set to 0 before it is stored. The regulator cannot
+  do that itself (inf * 0 = NaN, and NaN > x is false). Only non-finite values
+  trigger the guard, so normal runs are bit-identical. On CUDA the kernel counts
+  such cell updates in a device global (no extra memory traffic). The host reads
+  the count every 10 steps and warns once, with a total at the end of the run.
+  `MUSIC_ABORT_ON_NONFINITE=1` stops the run instead. On Metal the count is not
+  implemented yet (always 0).
+
+Debug switches, off unless set. They cost one comparison per step when unset; when
+set, each check copies the whole state to the host.
+
+| variable | effect |
+|---|---|
+| `MUSIC_DEBUG_NONFINITE=N` | every N steps, report the cells with a non-finite field, the largest \|W^{mu nu}\|/e and the largest u^0 (with where) |
+| `MUSIC_DEBUG_CELL=ix,iy,ieta,from,to` | every step in [from, to], print that cell and its x neighbours: e [GeV/fm^3], u^mu, Pi, W^{mu nu}. Indices are MUSIC's grid (centre -size/2 + i d) |
+
 ---
 
 ## Phase 1 — Direct port (correctness first)
