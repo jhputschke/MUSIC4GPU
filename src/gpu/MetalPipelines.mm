@@ -4,6 +4,7 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,7 @@ MetalPipelines& MetalPipelines::instance() {
 }
 
 MetalPipelines::~MetalPipelines() {
+    if (nonfinite_buf_) { CFRelease(nonfinite_buf_); }
     if (evo_pack_buf_) { CFRelease(evo_pack_buf_); }
     if (pso_pack_evo_) { CFRelease(pso_pack_evo_); }
     if (pso_uprhs_)    { CFRelease(pso_uprhs_); }
@@ -243,6 +245,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     }
     pso_pack_evo_ = (__bridge_retained void*)pso_pk;
 
+    // Non-finite counter for gpu_first_rk_step_w_full (buffer 24): one uint32,
+    // shared, so the host reads and resets it directly.
+    id<MTLBuffer> nf = [dev newBufferWithLength:sizeof(uint32_t)
+                                        options:MTLResourceStorageModeShared];
+    if (!nf) { fprintf(stderr, "[MUSIC-GPU] Failed to allocate the non-finite counter.\n"); return false; }
+    *static_cast<uint32_t*>([nf contents]) = 0u;
+    nonfinite_buf_ = (__bridge_retained void*)nf;
+
     ready_ = true;
     return true;
 }
@@ -273,6 +283,23 @@ void MetalPipelines::wait() {
     [cb waitUntilCompleted];
     CFRelease(cmd_buf_);
     cmd_buf_ = nullptr;
+}
+
+// ── read_and_reset_nonfinite ─────────────────────────────────────────────────
+//
+// The count of cell updates in which gpu_first_rk_step_w_full set a non-finite
+// W^{mu nu} or Pi to 0.  wait() joins the last committed command buffer; the
+// counter is a shared buffer, so the host reads and zeroes it in place.  Counts
+// from a still-open batch land after the reset and are read next time.
+
+unsigned int MetalPipelines::read_and_reset_nonfinite() {
+    if (!ready_ || !nonfinite_buf_) return 0u;
+    wait();
+    auto buf = (__bridge id<MTLBuffer>)nonfinite_buf_;
+    uint32_t* p = static_cast<uint32_t*>([buf contents]);
+    const uint32_t n = *p;
+    *p = 0u;
+    return n;
 }
 
 // ── batch_cb_ open/close ─────────────────────────────────────────────────────
@@ -713,6 +740,7 @@ void MetalPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:21];
     [enc setBuffer:get_buf(gpu.snap_future.epsilon) offset:0 atIndex:22];
     [enc setBuffer:get_buf(gpu.snap_future.rhob)    offset:0 atIndex:23];
+    [enc setBuffer:(__bridge id<MTLBuffer>)nonfinite_buf_ offset:0 atIndex:24];
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(

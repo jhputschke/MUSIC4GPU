@@ -11,6 +11,9 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <iostream>
+#include <cstdlib>
+#include <cstring>
 
 #include "evolve.h"
 #include "cornelius.h"
@@ -47,6 +50,137 @@ Evolve::Evolve(const EOS &eosIn, InitData &DATA_in,
 
 
 // master control function for hydrodynamic evolution
+// ── Debug switches (off unless the environment variable is set) ─────────────
+//
+// MUSIC_DEBUG_NONFINITE=N    every N steps, copy the state to the host and report
+//                            the cells with a non-finite field and the largest
+//                            |W^{mu nu}|/e (expensive: a full-arena sync).
+// MUSIC_DEBUG_CELL=ix,iy,ieta,from,to
+//                            every step in [from, to], print that cell and its
+//                            x neighbours: e [GeV/fm^3], u^mu, Pi, W^{mu nu}.
+//                            Indices are MUSIC's grid (cell centre -size/2 + i d).
+// Both are read once per process; unset, they cost one comparison per step.
+static int debug_nonfinite_every() {
+    static const int n = []{
+        const char* e = getenv("MUSIC_DEBUG_NONFINITE");
+        return e ? atoi(e) : 0;
+    }();
+    return n;
+}
+
+static const int* debug_cell() {
+    static int dc[5] = {-1, -1, -1, 0, -1};
+    static const bool read = []{
+        const char* e = getenv("MUSIC_DEBUG_CELL");
+        if (e) sscanf(e, "%d,%d,%d,%d,%d", &dc[0], &dc[1], &dc[2], &dc[3], &dc[4]);
+        return true;
+    }();
+    (void)read;
+    return dc;
+}
+
+static void debug_report_nonfinite(Fields &f, int it, double tau, const InitData &D) {
+    const int N = f.nX() * f.nY() * f.nEta();
+    long n_e = 0, n_u = 0, n_w = 0, n_pi = 0, n_rb = 0, first = -1;
+    double wmax = 0., wmax_e = 0.; long wmax_idx = -1;
+    double u0max = 0., u0max_e = 0.; long u0max_idx = -1; long n_u0_big = 0;
+    for (int i = 0; i < N; i++) {
+        if (std::isfinite(f.u_[0][i]) && f.u_[0][i] > u0max) {
+            u0max = f.u_[0][i]; u0max_e = f.e_[i]; u0max_idx = i;
+        }
+        if (f.u_[0][i] > 100.) n_u0_big++;
+        bool bad = false;
+        if (!std::isfinite(f.e_[i])) { n_e++; bad = true; }
+        if (!std::isfinite(f.rhob_[i])) { n_rb++; bad = true; }
+        if (!std::isfinite(f.piBulk_[i])) { n_pi++; bad = true; }
+        for (int k = 0; k < 4; k++) if (!std::isfinite(f.u_[k][i])) { n_u++; bad = true; break; }
+        double wi = 0.;
+        for (int k = 0; k < (int)f.Wmunu_.size(); k++) {
+            const double w = f.Wmunu_[k][i];
+            if (!std::isfinite(w)) { n_w++; bad = true; break; }
+            wi = std::max(wi, std::abs(w));
+        }
+        if (bad && first < 0) first = i;
+        if (!bad && f.e_[i] > 1e-6 && wi / f.e_[i] > wmax) {
+            wmax = wi / f.e_[i]; wmax_e = f.e_[i]; wmax_idx = i;
+        }
+    }
+    auto where = [&](long i) {
+        const int ix = i % f.nX(), iy = (i / f.nX()) % f.nY(), ie = i / (f.nX() * f.nY());
+        std::ostringstream o;
+        o << "(ix " << ix << ", iy " << iy << ", ieta " << ie << ": x "
+          << (-D.x_size / 2. + ix * D.delta_x) << ", y " << (-D.y_size / 2. + iy * D.delta_y)
+          << ", eta " << (-D.eta_size / 2. + ie * D.delta_eta) << ")";
+        return o.str();
+    };
+    std::cerr << "[MUSIC-DEBUG] step " << it << " tau " << tau << ": non-finite e " << n_e
+              << " u " << n_u << " Wmunu " << n_w << " piBulk " << n_pi << " rhob " << n_rb;
+    if (first >= 0) std::cerr << "; first at " << where(first);
+    std::cerr << "; max |W|/e " << wmax << " (e " << wmax_e * Util::hbarc << " GeV/fm^3 at "
+              << (wmax_idx >= 0 ? where(wmax_idx) : std::string("-")) << ")"
+              << "; cells with u^0 > 100: " << n_u0_big << ", max u^0 " << u0max << " (e "
+              << u0max_e * Util::hbarc << " GeV/fm^3 at "
+              << (u0max_idx >= 0 ? where(u0max_idx) : std::string("-")) << ")" << std::endl;
+}
+
+static void debug_print_cell(Fields &f, int it, const int* dc) {
+    for (int dx = -1; dx <= 1; dx++) {
+        const int ix = dc[0] + dx;
+        if (ix < 0 || ix >= f.nX() || dc[1] < 0 || dc[1] >= f.nY()
+            || dc[2] < 0 || dc[2] >= f.nEta()) continue;
+        const int i = f.getFieldIdx(ix, dc[1], dc[2]);
+        std::cerr << "[MUSIC-CELL] step " << it << " ix " << ix
+                  << " e " << f.e_[i] * Util::hbarc
+                  << " u " << f.u_[0][i] << " " << f.u_[1][i]
+                  << " " << f.u_[2][i] << " " << f.u_[3][i]
+                  << " Pi " << f.piBulk_[i] << " W";
+        for (int k = 0; k < 14; k++) std::cerr << " " << f.Wmunu_[k][i];
+        std::cerr << std::endl;
+    }
+}
+
+void Evolve::debug_hooks(Fields &prev, Fields &curr, int it, double tau) {
+    const int every = debug_nonfinite_every();
+    const int* dc = debug_cell();
+    const bool do_scan = every > 0 && it % every == 0;
+    const bool do_cell = dc[0] >= 0 && it >= dc[3] && it <= dc[4];
+    if (!do_scan && !do_cell) return;
+#ifdef MUSIC_USE_GPU
+    advance.sync_arena_from_gpu_readonly(prev, curr);
+#endif
+    if (do_cell) debug_print_cell(curr, it, dc);
+    if (do_scan) debug_report_nonfinite(curr, it, tau, DATA);
+}
+
+// ── Non-finite guard report (GPU) ─────────────────────────────────────────────
+// gpu_first_rk_step_w_full sets a non-finite W^{mu nu} or Pi to 0 and counts the
+// cell update.  Read the count every 10 steps: warn on the first, keep a total,
+// and with MUSIC_ABORT_ON_NONFINITE=1 stop the run instead.
+void Evolve::check_nonfinite_gpu(int it, double tau) {
+#ifdef MUSIC_USE_GPU
+    if (it % 10 != 0) return;
+    const unsigned int n = advance.nonfinite_count_gpu();
+    if (n == 0u) return;
+    if (nonfinite_total_ == 0) {
+        nonfinite_first_it_ = it;
+        music_message << "GPU: " << n << " cell update(s) with a non-finite W^{mu nu} "
+                      << "or Pi, set to 0 (up to step " << it << ", tau = " << tau
+                      << " fm/c). Usually an overflow in a very dilute cell; "
+                      << "MUSIC_DEBUG_NONFINITE=10 shows where.";
+        music_message.flush("warning");
+        const char* e = getenv("MUSIC_ABORT_ON_NONFINITE");
+        if (e && e[0] != '\0' && strcmp(e, "0") != 0) {
+            music_message << "MUSIC_ABORT_ON_NONFINITE is set: stopping.";
+            music_message.flush("error");
+            exit(1);
+        }
+    }
+    nonfinite_total_ += n;
+#else
+    (void)it; (void)tau;
+#endif
+}
+
 int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                      Fields &arenaFieldsNext, HydroinfoMUSIC &hydro_info_ptr) {
     // first pass some control parameters
@@ -94,6 +228,11 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                               arenaFieldsCurr.nEta());
 
     int it = 0;
+    nonfinite_total_ = 0;
+    nonfinite_first_it_ = -1;
+#ifdef MUSIC_USE_GPU
+    advance.nonfinite_count_gpu();   // discard a count left by an earlier run
+#endif
     double eps_max_cur = -1.;
     const double max_allowed_e_increase_factor = 5.;
     double tau = tau0;
@@ -402,12 +541,15 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             }
         }
 
+        debug_hooks(*fpPrev, *fpCurr, it, tau);
+
         /* execute rk steps */
         // all the evolution are at here !!!
         {
         bench::Timer _bt_rk("evolve.AdvanceRK");
         AdvanceRK(tau, fpPrev, fpCurr, fpNext);
         }
+        check_nonfinite_gpu(it, tau);
 
         if (DATA.JSecho > 0) {
             music_message << emoji::clock()
@@ -450,6 +592,13 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         it++;
     }
 #ifdef MUSIC_USE_GPU
+    // the steps since the last non-finite check, so no count carries over into
+    // the next run of this process
+    {
+        const unsigned int n_last = advance.nonfinite_count_gpu();
+        if (n_last > 0u && nonfinite_first_it_ < 0) nonfinite_first_it_ = it;
+        nonfinite_total_ += n_last;
+    }
     // End-of-run sync: bring the GPU state back to host for any final
     // outputs / Cooper-Frye / etc.  Also cleanly clears gpu_owns_state_
     // so a subsequent EvolveIt call on the same Advance instance starts
@@ -468,6 +617,12 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                    << std::endl;
         }
         FOinfo.close();
+    }
+    if (nonfinite_total_ > 0) {
+        music_message << "GPU: " << nonfinite_total_ << " cell update(s) in this run had a "
+                      << "non-finite W^{mu nu} or Pi set to 0 (first reported at step "
+                      << nonfinite_first_it_ << ").";
+        music_message.flush("warning");
     }
     if (tau < tauMax) {
         //music_message.info("Finished.");
@@ -494,6 +649,13 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
     double eps_max_cur = -1.;
     const double max_allowed_e_increase_factor = 2.;
 
+    if (itau == 0) {
+        nonfinite_total_ = 0;
+        nonfinite_first_it_ = -1;
+#ifdef MUSIC_USE_GPU
+        advance.nonfinite_count_gpu();   // discard a count left by an earlier run
+#endif
+    }
     if (DATA.store_hydro_info_in_memory == 1 && itau == 0) {
         hydro_info_ptr.set_grid_infomatioin(DATA);
     }
@@ -676,9 +838,12 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         }
         frozenStatus = frozen;
 
+        debug_hooks(*fpPrev, *fpCurr, tauIdx, tau);
+
         /* execute rk steps */
         // all the evolution are at here !!!
         AdvanceRK(tau, fpPrev, fpCurr, fpNext);
+        check_nonfinite_gpu(tauIdx, tau);
 
         music_message << emoji::clock()
                       << " Done time step " << tauIdx

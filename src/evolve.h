@@ -40,6 +40,14 @@ class Evolve {
     std::vector<double> FO_nQvsEta_;
     std::vector<double> FO_nSvsEta_;
 
+    // non-finite W^{mu nu} / Pi set to 0 by the GPU in this run (see
+    // check_nonfinite_gpu)
+    unsigned long nonfinite_total_ = 0;
+    int nonfinite_first_it_ = -1;
+    void check_nonfinite_gpu(int it, double tau);
+    // MUSIC_DEBUG_NONFINITE / MUSIC_DEBUG_CELL (evolve.cpp); no-ops unless set
+    void debug_hooks(Fields &prev, Fields &curr, int it, double tau);
+
  public:
     Evolve(const EOS &eos, InitData &DATA_in,
            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in,

@@ -381,6 +381,13 @@ void CUDAPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params) 
     check_launch("gpu_make_uprhs");
 }
 
+// ── read_and_reset_nonfinite ─────────────────────────────────────────────────
+
+unsigned int CUDAPipelines::read_and_reset_nonfinite() {
+    if (!ready_) return 0u;
+    return gpu_nonfinite_count_read_and_reset(compute_stream_);
+}
+
 // ── dispatch_first_rk_step_w_full ────────────────────────────────────────────
 
 void CUDAPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,

@@ -315,6 +315,13 @@ void Advance::rotate_snapshots_gpu() {
     if (gpu_state_authoritative_) gpu_grid_.rotate_snapshots();
 }
 
+unsigned int Advance::nonfinite_count_gpu() {
+    // the counter is a device global: readable whenever the pipelines are up,
+    // independent of who owns the fluid state
+    if (!gpu_ready_) return 0u;
+    return GPUPipelines::instance().read_and_reset_nonfinite();
+}
+
 void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
     if (!gpu_owns_state_ || !gpu_ready_) { eps_max = rhob_max = 0.0; return; }
     GPUPipelines::instance().reduce_max(gpu_grid_, eps_max, rhob_max);
@@ -605,6 +612,9 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
         gpu_state_authoritative_ = false;   // snap_curr lives in snap_future
                                             // until swap_curr_future_gpu()
                                             // runs in AdvanceRK
+        // the GPU takes over the state at a run's first step: discard any
+        // non-finite count an earlier run left behind
+        if (!gpu_owns_state_) GPUPipelines::instance().read_and_reset_nonfinite();
         gpu_owns_state_          = true;
     } else {
         gpu_state_authoritative_ = true;    // intra-substep residency
