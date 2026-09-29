@@ -76,10 +76,11 @@ public:
     // epsilon/rhob on the host after wait() has ensured the last kernel is done.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
-    // The CUDA kernel counts the cell updates in which it set a non-finite
-    // W^{mu nu} or Pi to 0; the Metal kernels apply the same guard but do not
-    // count yet, so this always returns 0.
-    unsigned int read_and_reset_nonfinite() { return 0u; }
+    // Cell updates in which gpu_first_rk_step_w_full set a non-finite
+    // W^{mu nu} or Pi to 0 since the last call (resets the count).  Waits for
+    // the last committed command buffer; counts from an open batch arrive at
+    // the next call.  Same contract as CUDAPipelines::read_and_reset_nonfinite.
+    unsigned int read_and_reset_nonfinite();
 
     // Phase 2b: launch gpu_pack_evolution_ideal over the down-sampled grid into
     // a pipeline-owned shared scratch buffer, synchronize, and copy the packed
@@ -129,5 +130,7 @@ private:
     // singleton; freed in the destructor.  evo_pack_floats_ tracks its capacity
     // in floats so it is only reallocated when a larger frame is needed.
     void*  evo_pack_buf_    = nullptr;  // id<MTLBuffer>
+    // one uint32 (atomic_uint in the kernel): see read_and_reset_nonfinite
+    void*  nonfinite_buf_   = nullptr;  // id<MTLBuffer>
     size_t evo_pack_floats_ = 0;
 };

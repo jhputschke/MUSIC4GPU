@@ -1976,6 +1976,8 @@ kernel void gpu_first_rk_step_w_full(
     // For QuestRevert: needs the future-state primitives (post-Newton).
     device const float*       epsilon_future [[buffer(22)]],
     device const float*       rhob_future    [[buffer(23)]],
+    // cell updates with a non-finite W^{mu nu} or Pi set to 0 (see below)
+    device atomic_uint*       nonfinite_count [[buffer(24)]],
     uint3 gid [[thread_position_in_grid]])
 {
     int ix   = (int)gid.x;
@@ -2206,14 +2208,18 @@ kernel void gpu_first_rk_step_w_full(
         (void)rhob_future;  // EOS at rhob=0 for this v1 — future µB needs Tier 4
     }
 
-    // Non-finite guard (as in music_kernels.cu, without the counter): an
-    // inf/NaN W^{mu nu} or Pi from an overflow in a very dilute cell would
-    // spread and freeze the grid; set it to 0.  Normal runs are unchanged.
+    // Non-finite guard (as in music_kernels.cu): an inf/NaN W^{mu nu} or Pi
+    // from an overflow in a very dilute cell would spread and freeze the grid;
+    // set it to 0 and count the cell update (MetalPipelines::
+    // read_and_reset_nonfinite).  Normal runs never get here.
     {
         bool bad_w = false;
         for (int m = 0; m < 14; m++) bad_w |= !isfinite(Wf[m]);
+        const bool bad_pi = !isfinite(pi_b_out);
         if (bad_w) for (int m = 0; m < 14; m++) Wf[m] = 0.f;
-        if (!isfinite(pi_b_out)) pi_b_out = 0.f;
+        if (bad_pi) pi_b_out = 0.f;
+        if (bad_w || bad_pi)
+            atomic_fetch_add_explicit(nonfinite_count, 1u, memory_order_relaxed);
     }
 
     // ── Write outputs ─────────────────────────────────────────────────────

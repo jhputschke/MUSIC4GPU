@@ -144,8 +144,9 @@ Two changes stop this:
   trigger the guard, so normal runs are bit-identical. On CUDA the kernel counts
   such cell updates in a device global (no extra memory traffic). The host reads
   the count every 10 steps and warns once, with a total at the end of the run.
-  `MUSIC_ABORT_ON_NONFINITE=1` stops the run instead. On Metal the count is not
-  implemented yet (always 0).
+  `MUSIC_ABORT_ON_NONFINITE=1` stops the run instead. Metal counts the same way,
+  with an `atomic_uint` in a 4-byte shared buffer (buffer 24 of the kernel)
+  instead of a device global.
 
 Debug switches, off unless set. They cost one comparison per step when unset; when
 set, each check copies the whole state to the host.
