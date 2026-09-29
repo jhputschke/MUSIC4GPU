@@ -2,8 +2,8 @@
 
 **Status:** fixed on branch `nonfinite_guard` (commit `f73ffab`).
 
-**Affects:** the MUSIC4GPU CUDA path; the Metal path has the same code, but it has not been
-compiled or tested.
+**Affects:** the MUSIC4GPU CUDA path. The Metal path has the same code; it is validated on an
+M3 Max (see [Metal (M3 Max)](#metal-m3-max)), where the failing event does not fail.
 
 **Found in:** an X-SCAPE production, 0–10% Au+Au 200 GeV, 3D MC-Glauber strings
 (`InitialProfile 131`), viscous, hotQCD EoS.
@@ -231,6 +231,60 @@ build without these changes):
 **Cost:** the vacuum reset is one comparison per reconstruction, and the counter only adds work
 when the guard acts. Neither is measurable next to a ~30 ms step.
 
+### Metal (M3 Max)
+
+Tested 2026-09-28 on an Apple M3 Max: X-SCAPE `contrib` 4a7a158f, this branch at 6d171df,
+js-contrib `main` 53ab4ef, built with `USE_METAL=ON`. The reproduction above was run with the
+build's kernels, with variant kernels selected by `MUSIC_METALLIB` (the pre-fix
+`music_kernels.metal` of 6b238c4, and this one without the vacuum reset: all three pieces of the
+fix are in the shader, so the libraries stay the same), and on the CPU path.
+
+**The failing event does not fail on Metal.** Metal's rounding differs from CUDA's, and its
+vacuum cells are much slower, so the chain in [Root cause](#root-cause) does not start:
+
+| | before | guard only | guard + vacuum reset | CPU path |
+|---|---|---|---|---|
+| background ends at | 10.56 fm/c | 10.56 fm/c | 10.56 fm/c | 10.56 fm/c |
+| jet legs end at | 12.46, 10.86, 10.56 | same | same | 12.46, 10.86, 11.26 |
+| non-finite W^{μν}/Π | 0 | 0 | 0 | 0 |
+| cells with u⁰ > 100 (most at once) | 98 | 98 | 1 | ~3300 (harmless) |
+| largest u⁰ | 337 | 337 | 132 | ~6300 |
+
+The background ends at the same τ on Metal and on the CPU; the 10.86 fm/c above is the GB10
+value. The one remaining cell with u⁰ > 100 (step 40) has e = 2.1×10⁻⁶ GeV/fm³, just above the
+reset threshold, and is gone ten steps later.
+
+**The fix changes Metal results at the same level as on CUDA** (the reproduction, 1 background
+and 3 jets, guard + vacuum reset against before):
+
+| quantity | Metal | CUDA (above) |
+|---|---|---|
+| guard only | bit-identical hydro output | bit-identical |
+| freeze-out times (background, 3 jet legs) | identical | identical |
+| largest \|Δe\| anywhere | 0.006 GeV/fm³ | 0.007 GeV/fm³ |
+| largest \|Δe\|/e in cells above freeze-out | 0.6% | 1% |
+| background energy at τ = 7.5 fm/c | −0.035% (30,643 → 30,633 GeV) | −0.03% |
+| wake energy per event at τ = 7.5 fm/c | +0.1 to +0.8 GeV of 15–26 GeV | ±0.6 GeV of ~40 GeV |
+
+Against the CPU path, the fix moves the background energy at τ = 7.5 fm/c from +0.030% to
+−0.004%, which is the spurious energy of the vacuum cells removed. The field-level agreement
+with the CPU is unchanged (energy-weighted \|Δe\|/e = 1.8×10⁻³ with and without).
+
+**The guard and the counter work on Metal.** Metal compiles with fast math by default, but
+`isfinite` is kept (Apple metal 32023.864): a test kernel with the regulator's ∞ × 0 and a
+division by 0 zeroes both and counts 2 of 2. A test shader that puts a NaN into W^{μν} and an
+∞ into Π in two central cells for τ < 0.47 fm/c gives:
+
+- the warning at the first check (step 10) and the total at the end of each run;
+- 10 counted cell updates in each of three MUSIC runs in one process, so the count is reset
+  between runs;
+- freeze-out times identical to the run without the injection;
+- with `MUSIC_ABORT_ON_NONFINITE=1`, a stop at step 10 (exit status 1).
+
+**Cost and reproducibility:** 55.8 s with the fix and 55.6 s without (3 events, 2 runs each).
+Reruns are bit-identical in the hydro output, also with a different `OMP_NUM_THREADS` and with
+the debug switches on.
+
 ## Impact on existing data
 
 - **GPU runs made before this fix** can contain such events:
@@ -249,10 +303,11 @@ when the guard acts. Neither is measurable next to a ~30 ms step.
 
 ## Open points
 
-- **Metal:** the vacuum reset, the guard and the counter are implemented but have not been
-  compiled or tested (no Mac available).
-- **Counter reset between runs:** implemented but not exercised. With the vacuum reset, no test
-  case produces non-finite values any more.
+- **Metal:** validated on an M3 Max (see [Metal (M3 Max)](#metal-m3-max)). Since the failing
+  event does not fail there, Metal has no case in which the fix is needed yet; the guard and
+  the counter were exercised by injecting non-finite values.
+- **Counter reset between runs:** exercised on Metal with injected non-finite values (see
+  above). On CUDA, with the vacuum reset, no test case produces non-finite values any more.
 - **Thresholds:** `GPU_VACUUM_E` and `GPU_VACUUM_U0_MAX` are compile-time constants, chosen so
   real fluid is never touched. They could become input parameters if other setups need
   different values.

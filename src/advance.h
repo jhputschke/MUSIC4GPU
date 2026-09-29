@@ -157,7 +157,7 @@ class Advance {
     // No-op if GPU residency is not active.
     void reduce_max_gpu(double& eps_max, double& rhob_max);
     // Cell updates since the last call in which the GPU set a non-finite
-    // W^{mu nu} or Pi to 0 (0 on the CPU path and on Metal).
+    // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();
 
     // Bring snap_curr/snap_prev back into the host arenas if the GPU has
