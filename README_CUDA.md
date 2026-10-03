@@ -113,6 +113,22 @@ empty or `0` enables it. Example:
 MUSIC_FORCE_CPU=1 ./MUSIChydro input_params
 ```
 
+**CUDA errors stop the run.** A GPU build without code for the GPU it runs on (e.g. a
+V100, compute capability 7.0, with `CMAKE_CUDA_ARCHITECTURES` from 7.5 up) stops when the
+GPU is initialized:
+
+```
+[MUSIC-GPU] This build has no code that runs on Tesla V100-SXM2-16GB (compute capability 7.0):
+no kernel image is available for execution on the device. Rebuild with 70-real in
+CMAKE_CUDA_ARCHITECTURES, or set MUSIC_FORCE_CPU=1 to run on the CPU. Stopping.
+```
+
+A failed kernel launch or a failed stream synchronization (an error inside a kernel, e.g.
+an illegal address) stops the run too. Before, these were only printed, and MUSIC went
+on to its maximum time with fields the GPU never updated, and wrote them out.
+Embedded PTX (an architecture without `-real`) only runs on GPUs of that architecture or
+newer, never older ones.
+
 ### Dilute regions: vacuum at rest, non-finite guard, debug switches
 
 In single precision the energy density of vacuum cells has a floor of ~1e-7 1/fm^4
