@@ -37,7 +37,11 @@ HydroinfoMUSIC::~HydroinfoMUSIC() {
 }
 
 void HydroinfoMUSIC::clean_hydro_event() {
-    lattice_ideal.clear();
+    // Release the memory, not just the elements: clear() keeps the capacity, so
+    // every instance would hold its largest event's store (~2 GB at 0-10%
+    // Au+Au) for the rest of the run.  set_grid_infomatioin() reserves again
+    // at the start of each run.
+    std::vector<fluidCell_ideal>().swap(lattice_ideal);
     hydroTauMax = 0.;
     itaumax = 0;
 }
