@@ -156,6 +156,26 @@ logic in `src/advance.cpp` (the CUDA back-end is a direct port of the Metal
 one). The plain CPU build (no flag) is unchanged and is the reference the GPU
 paths are validated against.
 
+**Kokkos port (separate branch, behind).** A performance-portable
+[Kokkos](https://github.com/kokkos/kokkos) back-end (one kernel source for NVIDIA, AMD and
+Intel GPUs and multicore CPUs) exists on branch
+[`XSCAPE-KoKKos`](https://github.com/jhputschke/MUSIC4GPU/tree/XSCAPE-KoKKos) (PR #8; see
+[`README_KoKKos.md`](https://github.com/jhputschke/MUSIC4GPU/blob/XSCAPE-KoKKos/README_KoKKos.md)
+there). On the GB10 it reproduces the CPU `eps_max` evolution as closely as native CUDA
+(6.4e-4), at ~0.8× native CUDA's speed. HIP and SYCL are wired up but untested. It is **not
+merged into `XSCAPE`** and branched off before the X-SCAPE production work, so it lacks the
+bug fixes and features the CUDA and Metal back-ends have since received:
+- the GPU fix for stalled evolutions in dilute regions (vacuum cells at rest, non-finite
+  W/Π guard; PR #13, [`docs/VacReset_BUG.md`](docs/VacReset_BUG.md));
+- the parallel, deterministic freeze-out surface with the surface pressure initialised (#12);
+- the X-SCAPE jet source slot (liquefier droplets), the `freeze_out_surface` switch (#9),
+  the source-fill speed-ups (#10), the `StringFind4` EOF guard (#11), and releasing the
+  evolution store's memory (#15);
+- the CPU-vs-GPU validation above (#16).
+
+Use CUDA or Metal for productions; the Kokkos branch needs these changes merged in, and its
+own validation repeated, before it can be used for one.
+
 ### What is ported to the GPU
 
 When the configuration falls inside the supported matrix, the **entire per-cell
