@@ -349,7 +349,7 @@ build the same two dirs there, run the same scripts.
 - **`rhoq`/`rhos`, finite-µB EOS, baryon diffusion, vorticity** — same
   CPU-fallback guards as the Metal path (PORT_GPU.md §4); the guards live
   in the backend-agnostic `Advance::gpu_features_supported`
-  ([src/advance.cpp](src/advance.cpp)), so CUDA inherits them unchanged.
+  ([src/advance.cpp](../src/advance.cpp)), so CUDA inherits them unchanged.
   Note (2026-05-27): the finite-µB EOS guard now carves out `whichEOS ==
   91` (a zero-µB hotQCD variant) so it runs on GPU — see PORT_GPU.md §4.2,
   including the deferred `get_flag_muB()` cleanup (Option B) and the
@@ -362,10 +362,10 @@ build the same two dirs there, run the same scripts.
   s95p — see PORT_GPU.md §4.4. The fix samples all four tables on the
   shared log-e grid and routes `gpu_P`/`gpu_dPde` through `gpu_log_interp`
   (linear `gpu_eos_interp` removed). The CUDA kernel
-  ([src/gpu/music_kernels.cu](src/gpu/music_kernels.cu)) got the
+  ([src/gpu/music_kernels.cu](../src/gpu/music_kernels.cu)) got the
   structural mirror of the Metal change, but **was not built or run on
   CUDA hardware in-session** — verify on a discrete GPU before relying on
-  it. The host sampling change ([src/advance.cpp](src/advance.cpp)) is
+  it. The host sampling change ([src/advance.cpp](../src/advance.cpp)) is
   shared, so an un-mirrored CUDA kernel would mis-index the table.
 
 ## 8. Post-port CPU-side optimizations & final decomposition

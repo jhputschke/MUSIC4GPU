@@ -75,7 +75,7 @@ static bool gpu_no_pack() {
 // the process (3DGlauber, iSS, ...), not only MUSIC.  passive only changes
 // idle-thread behavior, so the cost to other modules is a small per-region
 // thread wake-up — negligible for their coarse-grained loops.  See the X-SCAPE
-// README.md ("OpenMP defaults for GPU builds") and PORT_GPU.md.
+// README.md ("OpenMP defaults for GPU builds") and docs/PORT_GPU.md.
 extern "C" void kmp_set_blocktime(int) __attribute__((weak));
 
 namespace {
@@ -287,7 +287,7 @@ void Advance::swap_curr_future_gpu() {
     // from the rk0 predictor, degrading RK2 to forward-Euler (~1e-3 drift
     // instead of the kernels' ~1e-5 float32 floor).  This matches main_gpu's
     // original gate; the gpu_state_authoritative_ gate was a regression
-    // introduced in commit 0cecdf5.  See PORT_GPU_CUDA.md.
+    // introduced in commit 0cecdf5.  See docs/PORT_GPU_CUDA.md.
     if (gpu_owns_state_) gpu_grid_.swap_curr_future();
 
     // Step boundary (called once per completed RK step, at rk1).  After the
@@ -332,7 +332,7 @@ void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
 // Gate the GPU dispatch on the configuration falling inside the support matrix
 // that the kernels actually implement.  Anything outside this set falls back
 // to the CPU loop.  Each guard mirrors a kernel-side assumption documented in
-// the .metal / .cu sources and PORT_GPU.md §4.
+// the .metal / .cu sources and docs/PORT_GPU.md §4.
 //
 // The check is configuration-only (DATA flags); per-cell state checks (rhoq /
 // rhos non-zero, finite-muB EOS effects) are done in gpu_charges_ok().
@@ -342,7 +342,7 @@ bool Advance::gpu_features_supported() const {
     if (DATA.muB_dependent_shear_to_s != 0) return false;
     // Reject finite-muB EOS tables (GPU EOS is sampled at rhob=0).  EOS 91 is
     // a zero-muB hotQCD variant (same EOS_hotQCD class as EOS 9, flag_muB=false)
-    // so it is GPU-safe and carved out of the threshold.  See PORT_GPU.md §4.2
+    // so it is GPU-safe and carved out of the threshold.  See docs/PORT_GPU.md §4.2
     // for why this stays a magic-number check rather than eos.get_flag_muB().
     if (DATA.whichEOS > 9 && DATA.whichEOS != 91) return false;
     // Hydro source terms: GPU snapshot only carries rhob, so QS (rhoq/rhos)
@@ -460,7 +460,7 @@ bool Advance::gpu_charges_ok(const Fields &arena) {
 //
 // Residency optimisation (gpu_owns_state_ / gpu_state_authoritative_) is NOT
 // enabled on the Fields path in this first cut — every substep does a fresh
-// upload at rk_flag==0.  See PORT_GPU.md §7 (open questions) — JETSCAPE may
+// upload at rk_flag==0.  See docs/PORT_GPU.md §7 (open questions) — JETSCAPE may
 // mutate the Fields between AdvanceIt calls, which would invalidate any
 // residency assumption.
 bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
@@ -499,7 +499,7 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
         if (!charge_warning_logged) {
             music_message << "[MUSIC-GPU] Fields path: non-zero rhoq/rhos "
                              "detected, falling back to CPU "
-                             "(see PORT_GPU.md §4.1).";
+                             "(see docs/PORT_GPU.md §4.1).";
             music_message.flush("warning");
             charge_warning_logged = true;
         }
@@ -542,7 +542,7 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
         // memory, where copy_to_gpu wrote the device-visible managed buffers
         // directly.  Mirrors main_gpu's SCGrid dispatch — this H2D call was
         // lost when the SCGrid AdvanceIt was dropped in the XSCAPE merge.
-        // See PORT_GPU_CUDA.md.
+        // See docs/PORT_GPU_CUDA.md.
         GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
 #endif
     }
@@ -755,7 +755,7 @@ void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
 #ifdef MUSIC_USE_GPU
     // Try the full-GPU path first.  If it returns true the substep is done;
     // otherwise (unsupported config, GPU init failed, etc.) fall through to
-    // the CPU triple loop below.  See PORT_GPU.md §5 Phase 2.
+    // the CPU triple loop below.  See docs/PORT_GPU.md §5 Phase 2.
     if (try_gpu_advance(tau, arenaFieldsPrev,
                         arenaFieldsCurr, arenaFieldsNext, rk_flag)) {
         return;

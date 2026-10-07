@@ -89,7 +89,7 @@ class Advance {
     // Predicate: is the current DATA configuration entirely supported by the
     // GPU kernels?  Currently requires viscosity_flag==1, no baryon diffusion,
     // no hydro source terms, no multi-charge (rhoq/rhos kept zero), and a
-    // CPU EOS that the GPU table samples adequately.  See PORT_GPU.md §4 for
+    // CPU EOS that the GPU table samples adequately.  See docs/PORT_GPU.md §4 for
     // the full list.
     bool       gpu_features_supported() const;
 

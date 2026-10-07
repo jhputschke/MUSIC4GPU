@@ -87,7 +87,7 @@ public:
     // records into host_out (8 floats per cell, fluidCell_ideal layout).
     // Mirrors CUDAPipelines::pack_evolution_ideal, but the scratch buffer lives
     // here on the singleton (NOT on GPUGrid) so the GPUGrid object embedded in
-    // Advance/Evolve keeps its byte-identical layout — see OOB_Bug.md.  On
+    // Advance/Evolve keeps its byte-identical layout — see docs/OOB_Bug.md.  On
     // Apple unified memory the buffer is host-readable, so the copy is a plain
     // memcpy with no D2H transfer.  Returns false (no-op) if the pipeline isn't
     // ready, so the caller falls back to the host output path.

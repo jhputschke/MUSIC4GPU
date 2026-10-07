@@ -368,7 +368,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 
             // Gated by output_diagnostics_every_N_timesteps (default 1)
             // so we can amortize the full-arena read over many GPU steps.
-            // Inherited from main_gpu — see PORT_GPU.md §8.3.
+            // Inherited from main_gpu — see docs/PORT_GPU.md §8.3.
             if (it % Nskip_diag == 0) {
 #ifdef MUSIC_USE_GPU
                 advance.sync_curr_from_gpu_readonly(*fpCurr);

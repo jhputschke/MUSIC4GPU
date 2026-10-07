@@ -7,7 +7,7 @@
 > (CUDA).
 
 **Question.** MUSIC4GPU evolves in single precision and puts vacuum cells moving with
-u⁰ > 10 at rest (PR #13, [`VacReset_BUG.md`](../VacReset_BUG.md)). The CPU path of the same build
+u⁰ > 10 at rest (PR #13, [`VacReset_BUG.md`](VacReset_BUG.md)). The CPU path of the same build
 (`MUSIC_FORCE_CPU=1`) evolves in double precision and has no such reset. How large are the
 differences, and do they matter for the physics a production delivers?
 
@@ -92,7 +92,7 @@ little hot matter is left.
 - **The vacuum reset works.** The CPU keeps thousands of vacuum cells moving with
   u^τ > 10; on the GPU at most 13 remain (with e just above the reset threshold). On the CPU
   these cells carry no measurable energy (vacuum floor ~10⁻¹⁴ GeV/fm³); on the GPU, before
-  the fix, they did ([`VacReset_BUG.md`](../VacReset_BUG.md)).
+  the fix, they did ([`VacReset_BUG.md`](VacReset_BUG.md)).
 
 ### Freeze-out surfaces
 
@@ -175,7 +175,7 @@ error from the two halves of the oversamples is rough (a few ×10⁻⁴).
 **Cause.** This test cannot separate single precision from the vacuum reset or from the GPU
 path's EoS table. MUSIC4GPU's own validation measured the reset alone at ~0.03% of the
 background energy, with the field-level agreement with the CPU unchanged with and without it
-(energy-weighted |Δe|/e = 1.8×10⁻³ on Metal, [`VacReset_BUG.md`](../VacReset_BUG.md)). Most of the 0.2–0.3% is
+(energy-weighted |Δe|/e = 1.8×10⁻³ on Metal, [`VacReset_BUG.md`](VacReset_BUG.md)). Most of the 0.2–0.3% is
 therefore probably single precision, presumably extra numerical diffusion from the core
 into the dilute edge. That is an inference, not a measurement; a GPU build without the reset,
 run on these events, would settle it.

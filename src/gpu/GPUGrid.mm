@@ -318,6 +318,6 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const 
         dst_rhob[c] = static_cast<double>(src.rhob   [c]);
         for (int m = 0; m < GPU_U_COMPS; ++m)
             dst_u[m][c] = static_cast<double>(src.u[m * Ncells + c]);
-        // rhoq_ / rhos_ intentionally untouched — see PORT_GPU.md §4.1.
+        // rhoq_ / rhos_ intentionally untouched — see docs/PORT_GPU.md §4.1.
     }
 }
