@@ -1,9 +1,11 @@
 # MUSIC — Metal GPU Backend (macOS / Apple Silicon)
 
-> Part of the **experimental** GPU acceleration of MUSIC 3.1 (ports only — no new
-> physics; produced with Claude Opus 4.7). See the main [README.md](README.md) for
-> overall scope, the experimental-use disclaimer, and the CUDA backend
-> ([README_CUDA.md](README_CUDA.md)).
+> Part of the GPU acceleration of MUSIC 3.1 (ports only — no new physics; produced with
+> Claude Opus 4.7). Metal agrees with the CPU build at the field level (Au+Au:
+> |Δe|/e = 1.8×10⁻³, background energy within 0.03%; [`VacReset_BUG.md`](VacReset_BUG.md));
+> final-state hadrons have been compared with the CPU on CUDA only
+> ([`docs/MUSIC_CPU_vs_GPU.md`](docs/MUSIC_CPU_vs_GPU.md)). See the main [README.md](README.md)
+> for the overall scope and validation status, and the CUDA backend ([README_CUDA.md](README_CUDA.md)).
 
 ## Metal GPU Acceleration (macOS / Apple Silicon)
 
