@@ -17,17 +17,35 @@ MUSIC is a 3+1D relativistic second-order viscous hydrodynamics for heavy ion co
 > - **Authorship.** The GPU ports, benchmarks, and GPU documentation were
 >   produced with **Claude Opus 4.7**.
 >
-> > ### ⚠️ (EXPERIMENTAL) — PASSED SIMPLE PHYSICS VALIDATION 
+> > ### ✅ VALIDATED AGAINST THE CPU BUILD — A LARGE-SCALE CAMPAIGN COMPARISON IS STILL MISSING
 > >
-> > The GPU paths reproduce the CPU build's `eps_max` evolution to better than
-> > **1e-3** on the tested cases — but that is a numerical smoke test, **not** a
-> > physics validation. The physics has been validated by comparing the hydro evolution output for a single O+O events (3d Glauber + MUSIC4GPU), energy-density, vx, yy, yz agree to better than **1e-3**. **BUT: No full, production-style MUSIC run has yet been
-> > compared against the CPU build at the level of final-state observables**
-> > (particle spectra, anisotropic-flow harmonics, freeze-out surfaces).
+> > The GPU paths have been compared with the CPU build (`MUSIC_FORCE_CPU=1`, the same binary,
+> > double precision) at every level from the evolution to final-state hadrons:
 > >
-> > **Until such an end-to-end comparison is performed and documented, the GPU
-> > back-ends must be treated as EXPERIMENTAL and if used to produce
-> > physics results w/o this production test document, it is on your own risk!**
+> > - **Numerics:** `eps_max` within 1e-4 (EOS 0, Gubser) and 6.4e-4 (hotQCD, EOS 91); one O+O
+> >   event (3D Glauber) with e, vx, vy, vz within 1e-3.
+> > - **A 0–10% Au+Au jet production** (X-SCAPE: 3D MC-Glauber strings, a viscous background
+> >   and a jet leg with liquefier droplets, iSS on the freeze-out surfaces; 6 jet events on
+> >   3 backgrounds, CUDA on a GB10), see [`docs/MUSIC_CPU_vs_GPU.md`](docs/MUSIC_CPU_vs_GPU.md):
+> >   identical freeze-out times in all 9 hydro runs; energy-weighted |Δe|/e = 2×10⁻³ and
+> >   |ΔT|/T = 3×10⁻⁴ above freeze-out; momentum anisotropy, ⟨pT⟩, v₂, v₃ and the jet wake
+> >   unchanged within errors. **Systematic:** on the GPU 0.3% less energy above freeze-out,
+> >   a 0.19% smaller freeze-out volume and **0.20 ± 0.02% fewer charged hadrons**.
+> > - **Metal** (M3 Max) agrees with the CPU at the field level (|Δe|/e = 1.8×10⁻³,
+> >   background energy within 0.03%; [`VacReset_BUG.md`](VacReset_BUG.md)); its final-state
+> >   hadrons have not been compared.
+> >
+> > **What this means:** the GPU back-ends can be used for physics production. Keep a campaign
+> > on one path: the 0.2% offset in multiplicity is negligible within a campaign but does not
+> > average out when GPU and CPU samples are mixed, and name the path when comparing with CPU
+> > MUSIC results.
+> >
+> > **Still missing:** a **real large-scale campaign** compared with the CPU build at the level
+> > of final-state observables (thousands of events, several centralities and systems; the
+> > test above is 6 events, 0–10% Au+Au, one jet pT̂ window). GPU campaigns of ~1000 events have
+> > run, but not against a CPU counterpart. Also open: a GPU without code for its architecture
+> > (e.g. a V100 with a build lacking sm_70) still runs on with meaningless fields until the
+> > CUDA fail-fast (PR #14) is merged; check the logs for "no kernel image".
 
 
 
@@ -121,7 +139,7 @@ The result will be an executable named **`MUSIChydro`**.
 
 ---
 
-## GPU Acceleration (experimental)
+## GPU Acceleration
 
 MUSIC 3.1's hydrodynamic evolution has been ported to run on the GPU, with two
 interchangeable back-ends selected at build time. **No new physics is
