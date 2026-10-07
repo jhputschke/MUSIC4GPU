@@ -2603,12 +2603,12 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
     // eos.getThermalVariables() inside the parallel reduction loop below.
     // Originally a single shared std::vector outside the loop, which races
     // on resize and causes the SIGTRAP / Method-cache-corruption seen at
-    // OMP_NUM_THREADS >= 2.  See PORT_GPU.md §9.6.
+    // OMP_NUM_THREADS >= 2.  See docs/PORT_GPU.md §9.6.
     // ── Anisotropy / eccentricity, restructured for OpenMP thread scaling ────
     // The original ran two parallel-for reductions *inside* a serial eta loop,
     // i.e. 2*Neta OpenMP fork/joins per call; on small eta-slices at high
     // thread counts that overhead dominated and the diagnostic scaled
-    // *negatively* (PORT_GPU_CUDA.md §9).  Restructured into two full-grid
+    // *negatively* (docs/PORT_GPU_CUDA.md §9).  Restructured into two full-grid
     // passes: a centroid pass and a single collapse(3) anisotropy reduction
     // (1 fork/join for the heavy pass).  At OMP_NUM_THREADS=1 the cell-visit
     // and accumulation order (ieta-outer, then iy, ix) is unchanged, so the
@@ -2662,7 +2662,7 @@ void Cell_info::output_momentum_anisotropy_vs_tau(
 
     // Pass 2 — anisotropy / eccentricity / mean-pT sums over the whole grid.
     // thermalVec is firstprivate: one reusable buffer per thread (a shared one
-    // races on resize — PORT_GPU.md §9.6).
+    // races on resize — docs/PORT_GPU.md §9.6).
     std::vector<double> thermalVec;
     #pragma omp parallel for collapse(3) firstprivate(thermalVec) \
         reduction(+:ideal_num1, ideal_num2, ideal_den, \

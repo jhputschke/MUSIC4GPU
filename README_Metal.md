@@ -2,7 +2,7 @@
 
 > Part of the GPU acceleration of MUSIC 3.1 (ports only — no new physics; produced with
 > Claude Opus 4.7). Metal agrees with the CPU build at the field level (Au+Au:
-> |Δe|/e = 1.8×10⁻³, background energy within 0.03%; [`VacReset_BUG.md`](VacReset_BUG.md));
+> |Δe|/e = 1.8×10⁻³, background energy within 0.03%; [`docs/VacReset_BUG.md`](docs/VacReset_BUG.md));
 > final-state hadrons have been compared with the CPU on CUDA only
 > ([`docs/MUSIC_CPU_vs_GPU.md`](docs/MUSIC_CPU_vs_GPU.md)). See the main [README.md](README.md)
 > for the overall scope and validation status, and the CUDA backend ([README_CUDA.md](README_CUDA.md)).
@@ -284,7 +284,7 @@ Additional limiting factors:
 
 | File | Purpose |
 |---|---|
-| [`test_metal_input`](test_metal_input) | Gubser viscous smoke-test input (32×32×1, `boost_invariant 1`, shear viscosity on) |
+| [`tests/Gubser_flow/`](tests/Gubser_flow/) | Gubser flow inputs (`music_input_Gubser*`) with semi-analytic references; run in CI (`RunAutoTest.sh`). The bench scripts below write their own Gubser inputs for every grid they test |
 | [`tests/metal_vs_cpu_bench.sh`](tests/metal_vs_cpu_bench.sh) | 2D (boost-invariant) timing and correctness comparison between CPU and Metal GPU builds |
 | [`tests/metal_vs_cpu_bench_3d.sh`](tests/metal_vs_cpu_bench_3d.sh) | 3+1D timing and correctness comparison; exercises every η-direction code path |
 

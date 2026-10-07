@@ -437,7 +437,7 @@ bool Polygon::add_line(Line *l, int donotcheck)
 {
   // Bounds guard: lines[] is a fixed MAX_LINES heap array; without this an
   // edge-case cube yielding > MAX_LINES lines writes a pointer/double out of
-  // bounds (latent heap corruption). See OOB_Bug.md.
+  // bounds (latent heap corruption). See docs/OOB_Bug.md.
   if ( Nlines >= MAX_LINES ) {
     static bool warned = false;
     if ( !warned ) {
@@ -756,7 +756,7 @@ bool Polyhedron::add_polygon(Polygon *p, int donocheck)
 {
   // Bounds guard: polygons[] is a fixed MAX_POLYGONS heap array; without this an
   // edge-case yielding > MAX_POLYGONS polygons writes out of bounds (latent heap
-  // corruption). See OOB_Bug.md.
+  // corruption). See docs/OOB_Bug.md.
   if ( Npolygons >= MAX_POLYGONS ) {
     static bool warned = false;
     if ( !warned ) {

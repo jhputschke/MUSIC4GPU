@@ -105,12 +105,12 @@ behavior. The CPU fallback already exists in the SCGrid path; the same
 guard needs to fire on the Fields path.
 
 **Carve-out for EOS 91 (2026-05-27).** The guard in
-`Advance::gpu_features_supported` ([src/advance.cpp](src/advance.cpp))
+`Advance::gpu_features_supported` ([src/advance.cpp](../src/advance.cpp))
 was `if (DATA.whichEOS > 9) return false;`, which wrongly rejected
 `whichEOS == 91`. EOS 91 is a *zero-muB* hotQCD variant — built by the
-same `EOS_hotQCD` class as EOS 9 ([src/eos.cpp](src/eos.cpp), the
+same `EOS_hotQCD` class as EOS 9 ([src/eos.cpp](../src/eos.cpp), the
 `eos_id == 9 || eos_id == 91` branch), with `set_flag_muB(false)` and
-`dpdrhob = 0` ([src/eos_hotQCD.cpp](src/eos_hotQCD.cpp)). It samples the
+`dpdrhob = 0` ([src/eos_hotQCD.cpp](../src/eos_hotQCD.cpp)). It samples the
 GPU EOS table identically to EOS 9 and is GPU-safe. The guard is now:
 
 ```cpp
@@ -133,11 +133,11 @@ if (eos.get_flag_muB()) return false;   // instead of the >9 && !=91 check
 This is **not safe today** because of two issues found in the
 2026-05-27 audit:
 
-1. `EOS_base::flag_muB` ([src/eos_base.h](src/eos_base.h)) is declared
+1. `EOS_base::flag_muB` ([src/eos_base.h](../src/eos_base.h)) is declared
    with no initializer and `EOS_base() = default;`, so any subclass that
    skips `set_flag_muB()` leaves it indeterminate.
-2. `EOS_BEST` (`whichEOS == 17`, [src/eos_best.cpp](src/eos_best.cpp))
-   and `EOS_UH` (`whichEOS == 19`, [src/eos_UH.cpp](src/eos_UH.cpp))
+2. `EOS_BEST` (`whichEOS == 17`, [src/eos_best.cpp](../src/eos_best.cpp))
+   and `EOS_UH` (`whichEOS == 19`, [src/eos_UH.cpp](../src/eos_UH.cpp))
    **never call `set_flag_muB`**, yet both are genuinely muB-dependent
    (2D `interpolate2D(e, rhob, …)` tables, nonzero `get_dpOverdrhob2`).
    With the flag uninitialized, `get_flag_muB()` could read falsy and
@@ -145,7 +145,7 @@ This is **not safe today** because of two issues found in the
    physics, no warning. The current `> 9` threshold rejects 17/19
    correctly, which is why the magic number is kept for now.
 
-   The `EOS` wrapper ([src/eos.h](src/eos.h)) also does not yet forward
+   The `EOS` wrapper ([src/eos.h](../src/eos.h)) also does not yet forward
    `get_flag_muB()` from the inner `eos_ptr`, so Option B additionally
    needs a one-line forwarder there.
 
@@ -197,9 +197,9 @@ non-conformal and was affected. The CPU code shows it directly:
 |-------|----------|------------------------------------------|------------------|
 | 0     | idealgas | `P = e/3`, exactly linear                | ✓ exact          |
 | 1     | EOSQ     | bag model + 1st-order transition         | ✗ (also finite-µB, see §4.2) |
-| 2–7   | s95p     | **7 piecewise tables**, per-table spacing ([eos_s95p.cpp](src/eos_s95p.cpp)) | ✗ |
-| 8     | WB       | **degree-12 rational poly** ([eos_WB.cpp](src/eos_WB.cpp)) | ✗ (worst: `de ≈ 12`) |
-| 9, 91 | hotQCD   | 100k-pt table, fine spacing ([eos_hotQCD.cpp](src/eos_hotQCD.cpp)) | ✗ (`de ≈ 1.18`) |
+| 2–7   | s95p     | **7 piecewise tables**, per-table spacing ([eos_s95p.cpp](../src/eos_s95p.cpp)) | ✗ |
+| 8     | WB       | **degree-12 rational poly** ([eos_WB.cpp](../src/eos_WB.cpp)) | ✗ (worst: `de ≈ 12`) |
+| 9, 91 | hotQCD   | 100k-pt table, fine spacing ([eos_hotQCD.cpp](../src/eos_hotQCD.cpp)) | ✗ (`de ≈ 1.18`) |
 
 The non-linearity is visible in the CPU representation itself: s95p
 *splits into 7 sub-tables* specifically to refine the dilute end, WB is
@@ -214,11 +214,11 @@ covers hotQCD, WB and s95p at once; the ideal gas stays effectively
 exact (linear-in-log interp of a straight line over 0.14 %-wide
 intervals → ~1e-7 error, far under the fp32 floor). Changes:
 
-- [src/advance.cpp](src/advance.cpp) — host samples all four tables on
+- [src/advance.cpp](../src/advance.cpp) — host samples all four tables on
   one log grid (`log_e_floor = 1e-6`, matching `GPUGrid::upload_eos`'s
   `log_*` params). Shared by both backends.
-- [src/gpu/music_kernels.metal](src/gpu/music_kernels.metal) and
-  [src/gpu/music_kernels.cu](src/gpu/music_kernels.cu) — `gpu_P` /
+- [src/gpu/music_kernels.metal](../src/gpu/music_kernels.metal) and
+  [src/gpu/music_kernels.cu](../src/gpu/music_kernels.cu) — `gpu_P` /
   `gpu_dPde` use `gpu_log_interp`; the linear `gpu_eos_interp` is
   deleted. (The struct's linear `e_min`/`e_max`/`delta_e` fields are now
   set-but-unused; left in place to avoid touching the shared
@@ -709,7 +709,7 @@ fp64 `gpu_reconst` (or mixed-precision residency) as the remedy.
    supported in Metal`).  So the proposed fp64 Newton path was never
    available on this backend.
 2. The actual cause was a host-side bug in `swap_curr_future_gpu()`
-   ([src/advance.cpp:158](src/advance.cpp#L158)), not float
+   ([src/advance.cpp:158](../src/advance.cpp#L158)), not float
    arithmetic.
 
 **The bug.**  `swap_curr_future_gpu()` mirrors the host's rk1

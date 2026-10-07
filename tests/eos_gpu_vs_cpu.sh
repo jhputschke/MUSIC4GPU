@@ -2,7 +2,7 @@
 # eos_gpu_vs_cpu.sh — Verify a given EOS runs correctly on the GPU EOS path.
 #
 # Primary purpose: confirm that the GPU's pre-sampled EOS tables (P, dP/de,
-# s, T — log-spaced; see PORT_GPU.md §4.4) reproduce the CPU EOS for a
+# s, T — log-spaced; see docs/PORT_GPU.md §4.4) reproduce the CPU EOS for a
 # NON-conformal equation of state.  Defaults to EOS 91 (zero-muB hotQCD,
 # SMASH variant), the case that exposed the linear-vs-log table-sampling bug.
 #

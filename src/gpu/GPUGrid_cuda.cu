@@ -358,7 +358,7 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, SCGrid& dst) const 
 // ── Fields (SoA double) overloads ───────────────────────────────────────────
 //
 // Mirror the SCGrid versions above for both the coherent and discrete-GPU
-// memory paths.  See GPUGrid.h and PORT_GPU.md §4.1 for the rhoq/rhos
+// memory paths.  See GPUGrid.h and docs/PORT_GPU.md §4.1 for the rhoq/rhos
 // limitation — those arrays are not uploaded to the device.
 
 // Pointer-hoist optimisation (mirror of GPUGrid.mm): Fields stores u_ and
@@ -456,7 +456,7 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const 
         dst_rhob[c] = static_cast<double>(s_rhob[c]);
         for (int m = 0; m < GPU_U_COMPS; ++m)
             dst_u[m][c] = static_cast<double>(s_u[m * Ncells + c]);
-        // rhoq_ / rhos_ intentionally left alone — see PORT_GPU.md §4.1.
+        // rhoq_ / rhos_ intentionally left alone — see docs/PORT_GPU.md §4.1.
     }
 }
 

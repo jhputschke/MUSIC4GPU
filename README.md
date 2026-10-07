@@ -32,7 +32,7 @@ MUSIC is a 3+1D relativistic second-order viscous hydrodynamics for heavy ion co
 > >   unchanged within errors. **Systematic:** on the GPU 0.3% less energy above freeze-out,
 > >   a 0.19% smaller freeze-out volume and **0.20 ± 0.02% fewer charged hadrons**.
 > > - **Metal** (M3 Max) agrees with the CPU at the field level (|Δe|/e = 1.8×10⁻³,
-> >   background energy within 0.03%; [`VacReset_BUG.md`](VacReset_BUG.md)); its final-state
+> >   background energy within 0.03%; [`docs/VacReset_BUG.md`](docs/VacReset_BUG.md)); its final-state
 > >   hadrons have not been compared.
 > >
 > > **What this means:** the GPU back-ends can be used for physics production. Keep a campaign

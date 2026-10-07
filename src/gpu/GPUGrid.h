@@ -86,7 +86,7 @@ public:
     //
     // Limitation: GPUSnapshot only carries rhob.  Fields' rhoq_ / rhos_ are
     // NOT uploaded; the caller is responsible for falling back to the CPU
-    // path when either is non-zero.  See PORT_GPU.md §4.1.
+    // path when either is non-zero.  See docs/PORT_GPU.md §4.1.
     void copy_to_gpu(const Fields& src, GPUSnapshot& dst) const;
     void copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const;
     void copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const;
