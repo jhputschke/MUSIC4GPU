@@ -4,7 +4,7 @@
 > (js-contrib PR #47, 2026-10-07). The production it uses (X-SCAPE + PyJetscape,
 > `prod_AuAu_0_10_jet`) and the analysis scripts are in js-contrib; the links below point
 > there. The test ran MUSIC4GPU `49439c0` (this repository's `XSCAPE` branch) on the GB10
-> (CUDA).
+> (CUDA), and `df4f30d` (the same code) on an M3 Max (Metal), 2026-10-08.
 
 **Question.** MUSIC4GPU evolves in single precision and puts vacuum cells moving with
 u⁰ > 10 at rest (PR #13, [`VacReset_BUG.md`](VacReset_BUG.md)). The CPU path of the same build
@@ -19,7 +19,9 @@ their errors. Within one campaign that is negligible. Mixing GPU and CPU samples
 comparing a GPU campaign with CPU results, brings in a 0.2% normalization offset that does
 not average out.
 
-*October 2026, GB10. 6 jet events on 3 backgrounds: see [Limits](#limits).*
+*October 2026, GB10 (CUDA); repeated on an M3 Max (Metal) with the same result, see
+[Second platform](#second-platform-m3-max-metal). 6 jet events on 3 backgrounds per
+platform: see [Limits](#limits).*
 
 ## Method
 
@@ -180,9 +182,54 @@ therefore probably single precision, presumably extra numerical diffusion from t
 into the dilute edge. That is an inference, not a measurement; a GPU build without the reset,
 run on these events, would settle it.
 
+## Second platform: M3 Max (Metal)
+
+The same test on an Apple M3 Max (16 cores, Metal), 2026-10-08: the options of
+[Reproduce](#reproduce), X-SCAPE `57e32ce3`, MUSIC4GPU `df4f30d` (the code of `49439c0`),
+js-contrib `22c865f`. GPU job 2.8 min, CPU job 30.2 min.
+
+**The same seed gives other events here** (background 0 carries 31,500 GeV of fluid energy at
+τ = 1 fm/c, against 35,200 on the GB10), so the two platforms are compared through the
+GPU − CPU differences, not event by event. Those reproduce the GB10 numbers: the offsets
+are a property of the GPU path, the same with CUDA and Metal.
+
+| quantity (backgrounds; GPU vs. CPU) | M3 Max | GB10 |
+|---|---|---|
+| frames until freeze-out, the 3 backgrounds | identical (101, 107, 107) | identical |
+| \|Δe\|/e above freeze-out, energy-weighted | 2.0–2.2×10⁻³ (cells up to 3.9×10⁻²) | 2.1×10⁻³ (3.6×10⁻²) |
+| \|ΔT\|/T, \|Δv\| above freeze-out | 2.9–3.0×10⁻⁴, 1.4–1.6×10⁻⁴ | 2.9×10⁻⁴, 1.6×10⁻⁴ |
+| fluid energy | +0.05% to +0.07% | +0.02% to +0.08% |
+| energy above freeze-out | **−0.30% to −0.40%** | −0.30% to −0.34% |
+| energy of the dilute fluid | **+0.42% to +0.45%** | +0.39% to +0.45% |
+| momentum anisotropy ε_p | equal to ≤ 3×10⁻⁵ | ≤ 6×10⁻⁵ |
+| vacuum cells with u^τ > 10 (most in one frame) | GPU 16–27, CPU 15,700–17,300 | GPU 12–13, CPU 17,000–19,000 |
+| surface cells | −1.15 to −1.37×10⁻³ | −1.3 to −1.4×10⁻³ |
+| surface volume V | **−1.9×10⁻³** | −1.9 to −2.0×10⁻³ |
+| ⟨u_T⟩, ⟨√π:π⟩, ⟨Π⟩ at \|η_s\| < 1 | −1.1, −1.6 to −2.4, −0.4 (×10⁻³) | −1.1, −1.8 to −2.2, −0.3 to −0.4 (×10⁻³) |
+| shape of dV/dτ | 3.1–3.3×10⁻³ | 3.0–3.2×10⁻³ |
+
+Hadrons, the backgrounds, (G − C)/C ± the paired error (200 oversamples, `--correlated`):
+
+| observable | bg 0 | bg 2 | bg 4 | independent sampling error |
+|---|---|---|---|---|
+| charged hadrons, \|η\| < 5 | **−2.0 ± 0.2** ×10⁻³ | **−2.2 ± 0.2** ×10⁻³ | **−1.8 ± 0.2** ×10⁻³ | 1×10⁻³ |
+| dN_ch/dη, \|η\| < 0.5 | −2.5 ± 1.0 ×10⁻³ | −5.4 ± 1.0 ×10⁻³ | −3.2 ± 0.9 ×10⁻³ | 3×10⁻³ |
+| dN/dy π⁺, \|y\| < 0.5 | −2.0 ± 1 ×10⁻³ | −5.9 ± 1 ×10⁻³ | −2.4 ± 1 ×10⁻³ | 4×10⁻³ |
+| dN/dy K⁺, p | within ±8×10⁻³ (± 3–5×10⁻³) | | | 9×10⁻³, 1×10⁻² |
+| ⟨pT⟩ π⁺, K⁺, p | within ±5×10⁻³ (± 1–3×10⁻³) | | | 3–8×10⁻³ |
+| total hadron energy | +0.7 ± 0.3 ×10⁻³ | +0.8 ± 0.3 ×10⁻³ | +1.1 ± 0.3 ×10⁻³ | 2×10⁻³ |
+| v₂ (CPU value), G − C | 0.035: −6×10⁻⁵ | 0.019: −9.5×10⁻⁴ | 0.030: +8.9×10⁻⁴ | 6×10⁻⁴ |
+| v₃ (CPU value), G − C | 0.009: −7×10⁻⁵ | 0.013: −4.5×10⁻⁴ | 0.021: +7×10⁻⁵ | 7×10⁻⁴ |
+
+- **Multiplicity:** 0.2% fewer hadrons over the full acceptance, as on the GB10. At
+  midrapidity the deficit is somewhat larger here (0.25–0.54%, against 0.14–0.26%).
+- **Jets:** no event had the same showers on both paths (droplets within 10⁻²; GB10: 3 of 6),
+  so there is no cell-by-cell wake comparison. Wake per deposited energy: GPU
+  1.013 ± 0.006, CPU 1.020 ± 0.007 (GB10: 1.033 ± 0.012 and 1.017 ± 0.022).
+
 ## Limits
 
-- 6 jet events on 3 backgrounds, one centrality (0–10%), one pT̂ window.
+- 6 jet events on 3 backgrounds per platform, one centrality (0–10%), one pT̂ window.
 - The energies are those of the ideal T^μν: the store has no viscous fields.
 - Hadrons from iSS only (no afterburner, no jet fragmentation); v_n from single events with
   200 oversamples each.
@@ -197,8 +244,8 @@ In an X-SCAPE checkout with js-contrib (`external_packages/js-contrib`, its
 conda activate js_fno
 cd external_packages/js-contrib/contribs/PyJetscape/example/prod_AuAu_0_10_jet
 OPTS="--native --events 6 --reuse 2 --seed 11 --write-particlize both --seed-registry none"
-python run_prod_jet.py $OPTS --outdir OUT/gpu                      # 3.2 min on the GB10
-MUSIC_FORCE_CPU=1 python run_prod_jet.py $OPTS --outdir OUT/cpu    # 23 min
+python run_prod_jet.py $OPTS --outdir OUT/gpu                      # 3.2 min on the GB10, 2.8 on the M3 Max
+MUSIC_FORCE_CPU=1 python run_prod_jet.py $OPTS --outdir OUT/cpu    # 23 min, 30 min
 python music_cpu_gpu_hydro.py OUT/gpu/AuAu_0_10_jet_seed0011.h5 OUT/cpu/AuAu_0_10_jet_seed0011.h5
 
 python music_cpu_gpu_hadrons.py --match-seeds OUT/gpu OUT/cpu      # same iSS seeds
@@ -210,4 +257,5 @@ python music_cpu_gpu_hadrons.py OUT/gpu OUT/cpu
 ```
 
 The two jobs write ~10 GB (both legs on MUSIC's grid plus the surfaces); `hadronize.py`
-takes ~40 s per path, each comparison script a few minutes.
+takes ~40 s per path, each comparison script a few minutes. In zsh (the macOS default),
+`$OPTS` is not split into words: run the block in bash, or write `${=OPTS}`.

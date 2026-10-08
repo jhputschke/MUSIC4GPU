@@ -31,9 +31,11 @@ MUSIC is a 3+1D relativistic second-order viscous hydrodynamics for heavy ion co
 > >   |ΔT|/T = 3×10⁻⁴ above freeze-out; momentum anisotropy, ⟨pT⟩, v₂, v₃ and the jet wake
 > >   unchanged within errors. **Systematic:** on the GPU 0.3% less energy above freeze-out,
 > >   a 0.19% smaller freeze-out volume and **0.20 ± 0.02% fewer charged hadrons**.
-> > - **Metal** (M3 Max) agrees with the CPU at the field level (|Δe|/e = 1.8×10⁻³,
-> >   background energy within 0.03%; [`docs/VacReset_BUG.md`](docs/VacReset_BUG.md)); its final-state
-> >   hadrons have not been compared.
+> > - **Metal** (M3 Max): the same production test gives the same differences (|Δe|/e =
+> >   2.0–2.2×10⁻³, 0.30–0.40% less energy above freeze-out, a 0.19% smaller freeze-out
+> >   volume, 0.18–0.22% fewer charged hadrons; flow and ⟨pT⟩ unchanged), so the offset is a
+> >   property of the GPU path, not of one backend; see the M3 Max section of
+> >   [`docs/MUSIC_CPU_vs_GPU.md`](docs/MUSIC_CPU_vs_GPU.md).
 > >
 > > **What this means:** the GPU back-ends can be used for physics production. Keep a campaign
 > > on one path: the 0.2% offset in multiplicity is negligible within a campaign but does not
