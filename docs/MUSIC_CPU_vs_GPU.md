@@ -227,13 +227,99 @@ Hadrons, the backgrounds, (G − C)/C ± the paired error (200 oversamples, `--c
   so there is no cell-by-cell wake comparison. Wake per deposited energy: GPU
   1.013 ± 0.006, CPU 1.020 ± 0.007 (GB10: 1.033 ± 0.012 and 1.017 ± 0.022).
 
+## Single or double precision on the GPU?
+
+**Question.** Would FP64 kernels remove the offset, and what would they cost?
+
+**Answer.** They are worth having as a compile-time option for validation runs, not as the
+production default. The CUDA path needs about a week of work. A cheaper experiment comes
+first: find out whether single precision causes the offset at all.
+
+*An assessment of 2026-10-08 from the code (MUSIC4GPU `14940e0`) and the existing benchmarks.
+Nothing in this section has been built or measured; the speed figures are estimates.*
+
+### What FP64 would gain
+
+At most the 0.2–0.3% offset above, and only if single precision is its cause
+([Cause](#physics-implications)). Within one campaign, and for FNO training data, the offset
+is already negligible. What FP64 would gain is agreement with CPU MUSIC and published MUSIC
+results without a normalization offset.
+
+### What it would cost in speed
+
+The kernels compute in FP32 and build with `--use_fast_math`. The heaviest,
+`gpu_make_delta_qi` (the per-cell solve for e and u from T^τμ), is compute-bound
+([README_CUDA.md](../README_CUDA.md), Phase 5). So the GPU's FP64 rate relative to its FP32 rate
+decides:
+
+| GPU | FP64 : FP32 | expected effect of FP64 kernels |
+|---|---|---|
+| V100, A100, H100 | 1 : 2 | GPU part ~1.5–2× slower. At 4 jobs per GPU the GPU is not the bottleneck (2 × RTX 3090: ≤ 70% busy even at 8 jobs per GPU, [BENCHMARK_2x3090.md](https://github.com/jhputschke/js-contrib/blob/main/docs/BENCHMARK_2x3090.md)), so a campaign loses little. |
+| A40, L40S, RTX 30xx/40xx, GB10 | 1 : 64 | The compute-bound kernels several to ~10× slower. The GPU becomes the bottleneck, and some events approach the CPU path's ~4 min per event on 20 cores ([Method](#method)). |
+| Apple (Metal) | no FP64 | stays FP32 |
+
+- **GPU memory doubles:** from ~0.8 GB to ~1.6 GB per job (2 × RTX 3090 benchmark). That fits
+  on all of these GPUs.
+- **The host side gets cheaper:** the FP64 ↔ FP32 conversion of the whole grid on every copy
+  (`src/gpu/GPUGrid_cuda.cu`) becomes a plain copy.
+
+### What it would take in MUSIC4GPU
+
+The CUDA path is self-contained:
+
+| file | `float` | `…f` literals | `sqrtf`, `expf`, … calls |
+|---|---|---|---|
+| `src/gpu/music_kernels.cu` (2,025 lines) | 712 | 367 | 89 |
+| `src/gpu/music_kernels.cuh` | 77 | – | – |
+| `src/gpu/gpu_types.h` (shared with Metal) | 43 | 12 | – |
+| `src/gpu/GPUGrid_cuda.cu` (buffers, EoS upload, conversions) | 83 | 4 | – |
+| `src/gpu/CUDAPipelines.*`, `src/gpu/GPUGrid.h` | ~50 | – | – |
+
+With one compile-time switch (CMake `MUSIC_GPU_FP64` → `typedef float/double gpu_real`):
+
+1. **Kernels, ~1–2 days, mostly mechanical:**
+   - `float` → `gpu_real`;
+   - literals through a macro, `R(0.5)`: a bare `0.5` would silently promote the FP32 build to
+     double and slow it down;
+   - the unsuffixed CUDA math overloads (`sqrt`, `exp`, …);
+   - the `float2`/`float4` vector loads, and any atomics (double `atomicAdd` needs sm_60+);
+   - the thresholds tuned for FP32: the vacuum floor, `GPU_VACUUM_E`, the solver tolerances.
+   `--use_fast_math` does not affect double precision and can stay.
+2. **Host side, ~1 day:** buffers, the EoS tables (`upload_eos` takes `float*`), the
+   conversions, the argument structs.
+3. **Metal stays FP32.** Apple GPUs have no FP64. `gpu_types.h` gets an
+   `#ifdef __METAL_VERSION__` guard; `music_kernels.metal` is not touched.
+4. **Validation, ~2 days:**
+   - `tests/cuda_vs_cpu_bench.sh`: the ~10⁻⁵ agreement with the CPU should approach machine
+     precision;
+   - this document's 6-event test;
+   - timing on the GB10 (the worst case, 1 : 64) and on a V100 or A100.
+5. **Builds, ~½ day:** a second build flavour or image tag.
+
+A runtime switch instead would mean templating every kernel on the precision: about 2–3 more
+days, twice the compile time and binary size. It pays off only if one image has to run both.
+
+### Recommended order
+
+1. **A build without the vacuum reset** on these events (a few hours). It separates the reset
+   from single precision, as noted under [Cause](#physics-implications). An EoS table in double
+   on the GPU would separate the third candidate.
+2. **If single precision is the cause, mixed precision first:** FP64 only where cancellation
+   happens (the Runge–Kutta accumulation of T^τμ and the reconstruction solve), the stencils
+   in FP32. It targets the likely source of the offset and keeps most of the speed on the
+   1 : 64 GPUs. About the same effort as the full switch, but it needs more care about where
+   precision is lost.
+3. **Full FP64 as an opt-in build** for validation, and possibly for production on V100 /
+   A100. FP32 stays the default; keep each campaign and FNO training set on one path.
+
 ## Limits
 
 - 6 jet events on 3 backgrounds per platform, one centrality (0–10%), one pT̂ window.
 - The energies are those of the ideal T^μν: the store has no viscous fields.
 - Hadrons from iSS only (no afterburner, no jet fragmentation); v_n from single events with
   200 oversamples each.
-- The cause of the systematic offset is not isolated (above).
+- The cause of the systematic offset is not isolated (above); how to isolate it, and what
+  FP64 kernels would cost: [Single or double precision on the GPU?](#single-or-double-precision-on-the-gpu)
 
 ## Reproduce
 
