@@ -43,11 +43,15 @@ static void compute_launch(const GPUGrid& gpu, int max_threads,
                  (gpu.Neta() + bz - 1) / bz);
 }
 
+// A failed launch or stream means the hydro step did not run: stop instead of
+// evolving on (the run would go on and write meaningless fields).
 static inline void check_launch(const char* name) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[MUSIC-GPU] kernel launch '%s' failed: %s\n",
+        fprintf(stderr, "[MUSIC-GPU] kernel launch '%s' failed: %s. Stopping: the "
+                        "hydro step did not run.\n",
                 name, cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -100,6 +104,25 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
         fprintf(stderr, "[MUSIC-GPU] CUDA device: %s (cc %d.%d, %.1f GB)\n",
                 prop.name, prop.major, prop.minor,
                 prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        std::memset(&prop, 0, sizeof(prop));
+    }
+
+    // Is there code for this GPU in the build?  A missing architecture (e.g. a
+    // V100, sm_70, with a build for sm_75 and newer) fails every kernel launch
+    // with "no kernel image is available".  Say so once, here, and stop: a GPU
+    // build is meant to run on the GPU.  (With MUSIC_FORCE_CPU set, advance.cpp
+    // never gets here.)
+    cudaFuncAttributes fattr;
+    err = cudaFuncGetAttributes(&fattr, gpu_make_delta_qi);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[MUSIC-GPU] This build has no code that runs on %s "
+                        "(compute capability %d.%d): %s. Rebuild with %d%d-real "
+                        "in CMAKE_CUDA_ARCHITECTURES, or set MUSIC_FORCE_CPU=1 to "
+                        "run on the CPU. Stopping.\n",
+                prop.name, prop.major, prop.minor, cudaGetErrorString(err),
+                prop.major, prop.minor);
+        exit(EXIT_FAILURE);
     }
 
     // Detect coherent host-memory access (integrated GPU or NVLink-C2C parts).
@@ -182,8 +205,11 @@ void CUDAPipelines::wait() {
     cudaError_t err =
         cudaStreamSynchronize(static_cast<cudaStream_t>(compute_stream_));
     if (err != cudaSuccess) {
-        fprintf(stderr, "[MUSIC-GPU] cudaStreamSynchronize failed: %s\n",
+        // An error from a kernel that ran (e.g. an illegal address) shows up here.
+        fprintf(stderr, "[MUSIC-GPU] cudaStreamSynchronize failed: %s. Stopping: a "
+                        "hydro kernel did not complete.\n",
                 cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
     }
 }
 
