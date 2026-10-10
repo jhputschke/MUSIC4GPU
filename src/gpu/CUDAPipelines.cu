@@ -95,6 +95,37 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
         return false;
     }
 
+    // How the host thread waits in cudaStreamSynchronize.  CUDA's default
+    // (auto) spins whenever there are fewer contexts than cores, so the main
+    // thread burns a full core for as long as the GPU works -- ~24% of a
+    // job's CPU in a 4-job campaign on the GB10.  MUSIC_CUDA_SYNC=block
+    // sleeps on an interrupt instead, =yield spins with sched_yield, =spin
+    // forces spinning, =auto (or unset) leaves CUDA's default.
+    if (const char* e = getenv("MUSIC_CUDA_SYNC")) {
+        unsigned int flag = cudaDeviceScheduleAuto;
+        if      (!strcmp(e, "block")) flag = cudaDeviceScheduleBlockingSync;
+        else if (!strcmp(e, "yield")) flag = cudaDeviceScheduleYield;
+        else if (!strcmp(e, "spin"))  flag = cudaDeviceScheduleSpin;
+        else if (strcmp(e, "auto"))
+            fprintf(stderr, "[MUSIC-GPU] MUSIC_CUDA_SYNC=%s not one of "
+                            "auto|spin|yield|block; using auto\n", e);
+        err = cudaSetDeviceFlags(flag);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[MUSIC-GPU] cudaSetDeviceFlags(MUSIC_CUDA_SYNC=%s) "
+                            "failed: %s\n", e, cudaGetErrorString(err));
+            cudaGetLastError();   // not fatal: keep CUDA's default
+        }
+    }
+    {
+        unsigned int flags = 0;
+        cudaGetDeviceFlags(&flags);
+        const unsigned int s = flags & cudaDeviceScheduleMask;
+        fprintf(stderr, "[MUSIC-GPU] host sync: %s\n",
+                s == cudaDeviceScheduleBlockingSync ? "block"
+                : s == cudaDeviceScheduleYield      ? "yield"
+                : s == cudaDeviceScheduleSpin       ? "spin" : "auto");
+    }
+
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, device_id_) == cudaSuccess) {
         fprintf(stderr, "[MUSIC-GPU] CUDA device: %s (cc %d.%d, %.1f GB)\n",
