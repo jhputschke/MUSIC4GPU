@@ -682,6 +682,8 @@ void HydroSourceStrings::get_hydro_energy_source(
     const double exp_tau = 1./tau;
     // segments precomputed for this query time (prepare_for_query_tau)?
     const bool have_segments = (tau == segments_tau_);
+    // transverse preflow on? (production runs without it)
+    const bool preflow = (preEqFlowFactor_ != 0.);
     // only the strings whose transverse box contains (x, y), in list order
     const std::vector<int> *near_strings = string_bins_.lookup(x, y);
     const std::size_t n_strings = (near_strings ? near_strings->size()
@@ -747,11 +749,20 @@ void HydroSourceStrings::get_hydro_energy_source(
 
         double exp_xperp = exp(-(x_dis*x_dis + y_dis*y_dis)
                                 /(2.*sigma_x*sigma_x));
-        double cosh_perp = (
-            cosh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
-        double sinh_perp = (
-            sinh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
-        double phi_perp = atan2(y_dis, x_dis);
+        // With the preflow off (stringPreEqFlowFactor 0) cosh_perp =
+        // cosh(+0) = 1 and sinh_perp = sinh(+0) = +0 exactly: the transverse
+        // terms add +-0 to j_mu[1], j_mu[2], which leaves them unchanged, so
+        // their cosh, sinh, atan2, cos and sin are skipped.
+        double cosh_perp = 1.;
+        double sinh_perp = 0.;
+        double phi_perp = 0.;
+        if (preflow) {
+            cosh_perp = (
+                cosh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
+            sinh_perp = (
+                sinh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
+            phi_perp = atan2(y_dis, x_dis);
+        }
 
         double e_local = exp_tau*exp_xperp*exp_eta_s*it->norm;
         double Delta_eta = it->eta_s_right - it->eta_s_left;
@@ -776,8 +787,10 @@ void HydroSourceStrings::get_hydro_energy_source(
                       << "  " << it->eta_s_right << "  "
                       << it->eta_s_left << std::endl;
         }
-        j_mu[1] += local_eperp*sinh_perp*cos(phi_perp);
-        j_mu[2] += local_eperp*sinh_perp*sin(phi_perp);
+        if (preflow) {
+            j_mu[1] += local_eperp*sinh_perp*cos(phi_perp);
+            j_mu[2] += local_eperp*sinh_perp*sin(phi_perp);
+        }
         j_mu[3] += local_eperp*sinh_long*cosh_perp;
     }
 
@@ -846,15 +859,19 @@ void HydroSourceStrings::get_hydro_energy_source(
         if (cosh_long > 0) {
             exp_xperp = (prefactors*exp(-(x_dis*x_dis + y_dis*y_dis)
                                         /(2.*sigma_x*sigma_x)));
-            cosh_perp = (
-                cosh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
-            sinh_perp = (
-                sinh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
-            phi_perp = atan2(y_dis, x_dis);
+            if (preflow) {   // otherwise exactly 1, +0 and unused (above)
+                cosh_perp = (
+                    cosh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
+                sinh_perp = (
+                    sinh(preEqFlowFactor_*sqrt(x_dis*x_dis + y_dis*y_dis)));
+                phi_perp = atan2(y_dis, x_dis);
+            }
         }
         j_mu[0] += exp_xperp*cosh_long*cosh_perp;
-        j_mu[1] += exp_xperp*sinh_perp*cos(phi_perp);
-        j_mu[2] += exp_xperp*sinh_perp*sin(phi_perp);
+        if (preflow) {
+            j_mu[1] += exp_xperp*sinh_perp*cos(phi_perp);
+            j_mu[2] += exp_xperp*sinh_perp*sin(phi_perp);
+        }
         j_mu[3] += exp_xperp*sinh_long*cosh_perp;
     }
     const double prefactor_tau = 1./dtau;
