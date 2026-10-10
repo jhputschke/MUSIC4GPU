@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <vector>
 #include <memory>
 #include "hydro_source_base.h"
@@ -91,6 +92,31 @@ class HydroSourceStrings : public HydroSourceBase {
     StringTransverseBins string_bins_, remnant_bins_, baryon_bins_;
     void build_transverse_bins();
 
+    //! What the energy-source loops need of a string that does not depend on
+    //! the cell; one entry per string of the current-tau string and remnant
+    //! lists (same index), filled by prepare_list_for_current_tau_frame().
+    struct StringConsts {
+        double prefactor_prep;   // transverse normalisation, with preflow
+        double prefactor_etas;   // 1/(sqrt(2 pi) sigma_eta)
+        double skip_dis_x;
+        double skip_dis_eta;
+    };
+    std::vector<StringConsts> string_consts_, remnant_consts_;
+    StringConsts string_consts(const QCD_string &st) const;
+
+    //! The string segments crossed between tau - dtau/2 and tau + dtau/2:
+    //! they depend on the string and tau only.  string_segments_ holds them
+    //! for every string of the current-tau string list at segments_tau_
+    //! (prepare_for_query_tau); other query times compute them in place.
+    struct StringSegments {
+        double eta_s_L, eta_s_R, eta_s_L_next, eta_s_R_next;
+        bool flag_left, flag_right;
+    };
+    std::vector<StringSegments> string_segments_;
+    double segments_tau_ = std::numeric_limits<double>::quiet_NaN();
+    StringSegments string_segments(const QCD_string &st,
+                                   const double tau) const;
+
  public:
     HydroSourceStrings() = delete;
     HydroSourceStrings(InitData &DATA_in);
@@ -135,6 +161,7 @@ class HydroSourceStrings : public HydroSourceBase {
                                  const FlowVec &u_mu) const;
 
     void prepare_list_for_current_tau_frame(const double tau_local);
+    void prepare_for_query_tau(const double tau) override;
     void compute_norm_for_strings();
     double getStringTransverseCoord(const double xl, const double xr,
                                     const double etaFrac) const;

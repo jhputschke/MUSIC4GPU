@@ -360,6 +360,7 @@ bool Advance::gpu_features_supported() const {
 void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
                                           Fields &arenaFieldsCurr,
                                           bool with_main, bool with_jets) {
+    bench::Timer _bt("advance.prefill_hydro_source");
     const int Nx    = arenaFieldsCurr.nX();
     const int Ny    = arenaFieldsCurr.nY();
     const int Neta  = arenaFieldsCurr.nEta();
@@ -373,6 +374,11 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
     std::memset(qb, 0, static_cast<size_t>(5) * N * sizeof(float));
 
     const bool rhob_src = (DATA.turn_on_rhob == 1);
+
+    // Every cell queries tau_rk: let the sources precompute what depends on
+    // it alone once, not per cell (results unchanged).
+    if (with_main) hydro_source_terms_ptr->prepare_for_query_tau(tau_rk);
+    if (with_jets) hydro_source_terms_from_jets_ptr_->prepare_for_query_tau(tau_rk);
 
     // Dynamic, not static: the cost per cell varies by orders of magnitude
     // (cells near a string or droplet evaluate it, the rest skip it at once)
@@ -765,6 +771,15 @@ void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
     const int grid_neta = arenaFieldsCurr.nEta();
     const int grid_nx   = arenaFieldsCurr.nX();
     const int grid_ny   = arenaFieldsCurr.nY();
+
+    // Every cell queries the sources at the same tau_rk (FirstRKStepT).
+    {
+        const double tau_rk = tau + rk_flag*(DATA.delta_tau);
+        if (flag_add_hydro_source)
+            hydro_source_terms_ptr->prepare_for_query_tau(tau_rk);
+        if (flag_add_hydro_source_from_jets_)
+            hydro_source_terms_from_jets_ptr_->prepare_for_query_tau(tau_rk);
+    }
 
     // ── CPU triple loop: ideal evolution + Newton solve ───────────────────────
     #pragma omp parallel for collapse(3) schedule(guided)

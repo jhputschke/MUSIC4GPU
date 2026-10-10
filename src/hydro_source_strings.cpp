@@ -575,6 +575,16 @@ void HydroSourceStrings::prepare_list_for_current_tau_frame(
     }
     build_transverse_bins();
 
+    string_consts_.clear();
+    for (auto const &it: QCD_strings_list_current_tau)
+        string_consts_.push_back(string_consts(*it));
+    remnant_consts_.clear();
+    for (auto const &it: QCD_strings_remnant_list_current_tau)
+        remnant_consts_.push_back(string_consts(*it));
+    // the list changed: segments for the old one no longer apply
+    string_segments_.clear();
+    segments_tau_ = std::numeric_limits<double>::quiet_NaN();
+
     if (tau_local < get_source_tauStart_max() + dtau) {
        
     music_message << "hydro_source: tau = " << tau_local << " fm."
@@ -591,6 +601,76 @@ void HydroSourceStrings::prepare_list_for_current_tau_frame(
 }
 
 
+HydroSourceStrings::StringConsts HydroSourceStrings::string_consts(
+                                        const QCD_string &st) const {
+    StringConsts c;
+    const double sigma_x = st.sigma_x;
+    const double sigma_x_sq = sigma_x*sigma_x;
+    const double sigma_eta = st.sigma_eta;
+    const double alpsig = preEqFlowFactor_*sigma_x;
+    c.prefactor_prep = (
+        1./(2.*M_PI*(sigma_x_sq
+                     + exp(alpsig*alpsig/2.)*sqrt(M_PI/2)
+                       *alpsig*sigma_x_sq*erf(alpsig/sqrt(2.)))
+           )
+    );
+    c.prefactor_etas = 1./(sqrt(2.*M_PI)*sigma_eta);
+    c.skip_dis_x = n_sigma_skip_*sigma_x;
+    c.skip_dis_eta = n_sigma_skip_*sigma_eta;
+    return(c);
+}
+
+
+HydroSourceStrings::StringSegments HydroSourceStrings::string_segments(
+                        const QCD_string &st, const double tau) const {
+    // calculate the crossed string segments in the eta direction
+    // normally, there will be two segments
+    // [eta_L_next, eta_L] and [eta_R, eta_R_next]
+    // the envelop profile for a segment [eta_L, eta_R] is
+    // f(eta) = 0.5*(- Erf((eta_L - eta)/sigma)
+    //               + Erf((eta_R - eta)/sigma))
+    const double dtau      = DATA.delta_tau;
+    const double tau_0     = st.tau_0;
+    const double delta_tau = st.tau_form;
+    StringSegments s;
+    double eta_s_shift = 0.0;
+    double tau_L = tau - dtau/2.;
+    if (tau_L > tau_0 + delta_tau) {
+        eta_s_shift = acosh((tau_L*tau_L + tau_0*tau_0
+                                - delta_tau*delta_tau)
+                               /std::max(Util::small_eps, 2.*tau_L*tau_0));
+    }
+    s.eta_s_L = std::min(st.eta_s_right, st.eta_s_0 - eta_s_shift);
+    s.eta_s_R = std::max(st.eta_s_left, st.eta_s_0 + eta_s_shift);
+
+    double eta_s_next_shift = 0.0;
+    double tau_next = tau + dtau/2.;
+    if (tau_next > tau_0 + delta_tau) {
+        eta_s_next_shift = acosh(
+            (tau_next*tau_next + tau_0*tau_0 - delta_tau*delta_tau)
+            /std::max(Util::small_eps, 2.*tau_next*tau_0));
+    }
+    s.eta_s_L_next = std::max(st.eta_s_left, st.eta_s_0 - eta_s_next_shift);
+    s.eta_s_R_next = std::min(st.eta_s_right, st.eta_s_0 + eta_s_next_shift);
+
+    s.flag_left = true;   // the left string segment is valid
+    if (s.eta_s_L_next > s.eta_s_L) s.flag_left = false;
+
+    s.flag_right = true;  // the right string segment is valid
+    if (s.eta_s_R_next < s.eta_s_R) s.flag_right = false;
+    return(s);
+}
+
+
+void HydroSourceStrings::prepare_for_query_tau(const double tau) {
+    if (tau == segments_tau_) return;
+    string_segments_.clear();
+    for (auto const &it: QCD_strings_list_current_tau)
+        string_segments_.push_back(string_segments(*it, tau));
+    segments_tau_ = tau;
+}
+
+
 void HydroSourceStrings::get_hydro_energy_source(
     const double tau, const double x, const double y, const double eta_s,
     const FlowVec &u_mu, EnergyFlowVec &j_mu) const {
@@ -599,32 +679,24 @@ void HydroSourceStrings::get_hydro_energy_source(
         && QCD_strings_remnant_list_current_tau.size() == 0) return;
 
     const double dtau = DATA.delta_tau;
-    const double n_sigma_skip = n_sigma_skip_;
     const double exp_tau = 1./tau;
+    // segments precomputed for this query time (prepare_for_query_tau)?
+    const bool have_segments = (tau == segments_tau_);
     // only the strings whose transverse box contains (x, y), in list order
     const std::vector<int> *near_strings = string_bins_.lookup(x, y);
     const std::size_t n_strings = (near_strings ? near_strings->size()
                                    : QCD_strings_list_current_tau.size());
     for (std::size_t k = 0; k < n_strings; k++) {
-        auto const &it = QCD_strings_list_current_tau[
-                            near_strings ? (*near_strings)[k] : k];
+        const std::size_t idx = near_strings ? (*near_strings)[k] : k;
+        auto const &it = QCD_strings_list_current_tau[idx];
+        const StringConsts &sc = string_consts_[idx];
         const double sigma_x = it->sigma_x;
-        const double sigma_x_sq = sigma_x*sigma_x;
         const double sigma_eta = it->sigma_eta;
-        const double alpsig = preEqFlowFactor_*sigma_x;
-        const double prefactor_prep = (
-            1./(2.*M_PI*(sigma_x_sq
-                         + exp(alpsig*alpsig/2.)*sqrt(M_PI/2)
-                           *alpsig*sigma_x_sq*erf(alpsig/sqrt(2.)))
-               )
-        );
-        const double prefactor_etas = 1./(sqrt(2.*M_PI)*sigma_eta);
-        const double skip_dis_x = n_sigma_skip*sigma_x;
-        const double skip_dis_eta = n_sigma_skip*sigma_eta;
+        const double prefactor_prep = sc.prefactor_prep;
+        const double prefactor_etas = sc.prefactor_etas;
+        const double skip_dis_x = sc.skip_dis_x;
+        const double skip_dis_eta = sc.skip_dis_eta;
         // energy source from strings
-        const double tau_0     = it->tau_0;
-        const double delta_tau = it->tau_form;
-
         if (eta_s < it->eta_s_left - skip_dis_eta
                 || eta_s > it->eta_s_right + skip_dis_eta) continue;
         double eta_frac = ((eta_s - it->eta_s_left)
@@ -642,41 +714,14 @@ void HydroSourceStrings::get_hydro_energy_source(
         double y_dis = y - y_perp;
         if (std::abs(y_dis) > skip_dis_x) continue;
 
-        // calculate the crossed string segments in the eta direction
-        // normally, there will be two segments
-        // [eta_L_next, eta_L] and [eta_R, eta_R_next]
-        // the envelop profile for a segment [eta_L, eta_R] is
-        // f(eta) = 0.5*(- Erf((eta_L - eta)/sigma)
-        //               + Erf((eta_R - eta)/sigma))
-        double eta_s_shift = 0.0;
-        double tau_L = tau - dtau/2.;
-        if (tau_L > tau_0 + delta_tau) {
-            eta_s_shift = acosh((tau_L*tau_L + tau_0*tau_0
-                                    - delta_tau*delta_tau)
-                                   /std::max(Util::small_eps, 2.*tau_L*tau_0));
-        }
-        double eta_s_L = std::min(it->eta_s_right,
-                                  it->eta_s_0 - eta_s_shift);
-        double eta_s_R = std::max(it->eta_s_left,
-                                  it->eta_s_0 + eta_s_shift);
-
-        double eta_s_next_shift = 0.0;
-        double tau_next = tau + dtau/2.;
-        if (tau_next > tau_0 + delta_tau) {
-            eta_s_next_shift = acosh(
-                (tau_next*tau_next + tau_0*tau_0 - delta_tau*delta_tau)
-                /std::max(Util::small_eps, 2.*tau_next*tau_0));
-        }
-        double eta_s_L_next = std::max(it->eta_s_left,
-                                       it->eta_s_0 - eta_s_next_shift);
-        double eta_s_R_next = std::min(it->eta_s_right,
-                                       it->eta_s_0 + eta_s_next_shift);
-
-        bool flag_left = true;  // the left string segment is valid
-        if (eta_s_L_next > eta_s_L) flag_left = false;
-
-        bool flag_right = true;  // the right string segment is valid
-        if (eta_s_R_next < eta_s_R) flag_right = false;
+        const StringSegments seg = (have_segments ? string_segments_[idx]
+                                    : string_segments(*it, tau));
+        const double eta_s_L      = seg.eta_s_L;
+        const double eta_s_R      = seg.eta_s_R;
+        const double eta_s_L_next = seg.eta_s_L_next;
+        const double eta_s_R_next = seg.eta_s_R_next;
+        const bool flag_left      = seg.flag_left;
+        const bool flag_right     = seg.flag_right;
 
         double exp_eta_s = 0.;
         if (flag_left) {
@@ -695,6 +740,10 @@ void HydroSourceStrings::get_hydro_energy_source(
                         + erf((eta_s_R_next - eta_s)/(sqrt(2.)*sigma_eta)));
             }
         }
+        // No envelope here (no segment within reach, or erf saturated):
+        // every term below would add +-0 to j_mu, which leaves it unchanged
+        // (it starts at +0 and all factors are finite), so skip the rest.
+        if (exp_eta_s == 0.) continue;
 
         double exp_xperp = exp(-(x_dis*x_dis + y_dis*y_dis)
                                 /(2.*sigma_x*sigma_x));
@@ -736,22 +785,14 @@ void HydroSourceStrings::get_hydro_energy_source(
     const std::size_t n_remnants = (near_remnants ? near_remnants->size()
                                     : QCD_strings_remnant_list_current_tau.size());
     for (std::size_t k = 0; k < n_remnants; k++) {
-        auto const &it = QCD_strings_remnant_list_current_tau[
-                            near_remnants ? (*near_remnants)[k] : k];
+        const std::size_t idx = near_remnants ? (*near_remnants)[k] : k;
+        auto const &it = QCD_strings_remnant_list_current_tau[idx];
+        const StringConsts &sc = remnant_consts_[idx];
         const double sigma_x = it->sigma_x;
-        const double sigma_x_sq = sigma_x*sigma_x;
         const double sigma_eta = it->sigma_eta;
-        const double alpsig = preEqFlowFactor_*sigma_x;
-        const double prefactor_prep = (
-            1./(2.*M_PI*(sigma_x_sq
-                         + exp(alpsig*alpsig/2.)*sqrt(M_PI/2)
-                           *alpsig*sigma_x_sq*erf(alpsig/sqrt(2.)))
-               )
-        );
-        const double prefactor_etas = 1./(sqrt(2.*M_PI)*sigma_eta);
-        const double prefactors = prefactor_prep*prefactor_etas;
-        const double skip_dis_x = n_sigma_skip*sigma_x;
-        const double skip_dis_eta = n_sigma_skip*sigma_eta;
+        const double prefactors = sc.prefactor_prep*sc.prefactor_etas;
+        const double skip_dis_x = sc.skip_dis_x;
+        const double skip_dis_eta = sc.skip_dis_eta;
         // add remnant energy at the string ends
         bool flag_left = false;
         if (   it->tau_end_left >= tau - dtau/2.

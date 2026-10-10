@@ -86,6 +86,12 @@ class HydroSourceBase {
 
     virtual void prepare_list_for_current_tau_frame(const double tau_local) {}
 
+    //! Optional: precompute what depends only on the query time tau (e.g.
+    //! per-string geometry) before a loop over cells that all query the same
+    //! tau.  Called single-threaded; get_hydro_*_source() must give the same
+    //! results with or without it.
+    virtual void prepare_for_query_tau(const double tau) {}
+
     //! Whether the source can be non-zero at the query times of the current
     //! step (tau and tau + dtau of its Runge-Kutta substeps), i.e. after
     //! prepare_list_for_current_tau_frame(tau).  false promises that every
