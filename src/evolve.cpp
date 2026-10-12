@@ -979,6 +979,12 @@ int Evolve::frozen_without_surface(Fields &arena_current) {
 //! ix >= nx - 2*fac_x (same in y): a cell at or above e_fo in those bands
 bool Evolve::transverse_edge_is_hot(Fields &arena_current, double eps_fo) {
 #ifdef MUSIC_USE_GPU
+    // On the GPU's float state, without copying the grid to the host: the
+    // host copy holds the same floats as doubles, so max >= e_fo there is the
+    // same test (and eps_fo > 0, so the reduction's floor of 0 never counts).
+    if (advance.gpu_owns_state()) {
+        return advance.reduce_max_edge_gpu(DATA.fac_x, DATA.fac_y) >= eps_fo;
+    }
     advance.sync_curr_from_gpu_readonly(arena_current);
 #endif
     const int nx = arena_current.nX();

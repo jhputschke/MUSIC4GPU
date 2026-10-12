@@ -156,6 +156,10 @@ class Advance {
     // 1/fm^4 units (same as Cell_small::epsilon).  Synchronizes before return.
     // No-op if GPU residency is not active.
     void reduce_max_gpu(double& eps_max, double& rhob_max);
+    // max(epsilon) [1/fm^4] over the transverse edge bands of the GPU state:
+    // ix <= fac_x, ix >= Nx - 2*fac_x, iy <= fac_y, iy >= Ny - 2*fac_y, any
+    // eta; 0 if those cells all have e <= 0.  Only while gpu_owns_state().
+    double reduce_max_edge_gpu(int fac_x, int fac_y);
     // Cell updates since the last call in which the GPU set a non-finite
     // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();

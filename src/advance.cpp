@@ -328,6 +328,11 @@ void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
     GPUPipelines::instance().reduce_max(gpu_grid_, eps_max, rhob_max);
 }
 
+double Advance::reduce_max_edge_gpu(int fac_x, int fac_y) {
+    if (!gpu_owns_state_ || !gpu_ready_) return 0.0;
+    return GPUPipelines::instance().reduce_max_edge(gpu_grid_, fac_x, fac_y);
+}
+
 // ── Feature support predicate ────────────────────────────────────────────────
 //
 // Gate the GPU dispatch on the configuration falling inside the support matrix

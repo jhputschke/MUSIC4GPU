@@ -116,6 +116,16 @@ __global__ void gpu_reduce_max_eps_rhob(
     float* out_eps,
     float* out_rhob);
 
+// max(epsilon) over the transverse edge bands of snap_curr only: the cells
+// with ix <= fx, ix >= Nx - 2*fx, iy <= fy or iy >= Ny - 2*fy (the bands in
+// which Cornelius flags a crossing as a boundary hit), every eta.  Same
+// shared-memory + atomicMax scheme as gpu_reduce_max_eps_rhob; out_eps must
+// be 0 before the launch, so a band with only e <= 0 reads 0.
+__global__ void gpu_reduce_max_eps_edge(
+    const float* __restrict__ epsilon,
+    int Nx, int Ny, int Ncells, int fx, int fy,
+    float* out_eps);
+
 // Pack ideal-hydro output for the down-sampled evolution grid (Phase 2b).
 // One thread per output cell; reads snap_curr (epsilon, u) and the device EOS
 // tables, writes 8 floats per cell into `out` in fluidCell_ideal field order

@@ -280,6 +280,22 @@ void CUDAPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max) 
     rhob_max = static_cast<double>(*gpu.reduce_rhob_out);
 }
 
+double CUDAPipelines::reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y) {
+    if (!ready_ || !gpu.reduce_eps_out) return 0.0;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+
+    cudaMemsetAsync(gpu.reduce_eps_out, 0, sizeof(float), stream);
+    const int block = 256;
+    const int grid  = std::min((gpu.Ncells() + block - 1) / block, 1024);
+    gpu_reduce_max_eps_edge<<<grid, block, block * sizeof(float), stream>>>(
+        gpu.snap_curr.epsilon, gpu.Nx(), gpu.Ny(), gpu.Ncells(), fac_x, fac_y,
+        gpu.reduce_eps_out);
+    check_launch("gpu_reduce_max_eps_edge");
+
+    cudaStreamSynchronize(stream);
+    return static_cast<double>(*gpu.reduce_eps_out);
+}
+
 // ── pack_evolution_ideal ──────────────────────────────────────────────────────
 
 bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,

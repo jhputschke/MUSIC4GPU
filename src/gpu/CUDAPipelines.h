@@ -56,6 +56,11 @@ public:
     // call).  Launches on the compute stream and synchronizes before returning.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // max(epsilon) over the transverse edge bands of snap_curr (see
+    // gpu_reduce_max_eps_edge) [1/fm^4]; 0 if every edge cell has e <= 0.
+    // Synchronizes before returning.
+    double reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y);
+
     // Cell updates in which gpu_first_rk_step_w_full set a non-finite
     // W^{mu nu} or Pi to 0 since the last call (resets the count).
     // Synchronizes the compute stream.
