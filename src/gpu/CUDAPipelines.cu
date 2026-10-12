@@ -291,16 +291,29 @@ bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
     if (n_out <= 0) return false;
     const size_t need = static_cast<size_t>(n_out) * 8;   // 8 floats per cell
 
-    // Lazily (re)allocate the managed scratch buffer to fit.  The buffer lives
-    // on GPUGrid (Phase 2b) so its lifetime is tied to the grid; it is freed in
-    // GPUGrid::release().
+    // Lazily (re)allocate the scratch buffers to fit.  They live on GPUGrid
+    // (Phase 2b) so their lifetime is tied to the grid; they are freed in
+    // GPUGrid::release().  Coherent host memory: one managed buffer the host
+    // reads directly.  Discrete GPU: the kernel packs into device memory and
+    // one DMA copies the frame to pinned host memory (~1-2 ms for 19 MB,
+    // against ~15 ms of page faults reading a managed buffer from the host).
+    const bool staged = !coherent_memory_;
     if (gpu.evo_pack_floats < need) {
         if (gpu.evo_pack_out) cudaFree(gpu.evo_pack_out);
+        if (gpu.evo_pack_host) cudaFreeHost(gpu.evo_pack_host);
         gpu.evo_pack_out    = nullptr;
+        gpu.evo_pack_host   = nullptr;
         gpu.evo_pack_floats = 0;
-        if (cudaMallocManaged(&gpu.evo_pack_out, need * sizeof(float))
-                != cudaSuccess || !gpu.evo_pack_out) {
-            gpu.evo_pack_out = nullptr;
+        const size_t bytes = need * sizeof(float);
+        const bool ok = staged
+            ? (cudaMalloc(&gpu.evo_pack_out, bytes) == cudaSuccess
+               && cudaMallocHost(&gpu.evo_pack_host, bytes) == cudaSuccess)
+            : cudaMallocManaged(&gpu.evo_pack_out, bytes) == cudaSuccess;
+        if (!ok) {
+            if (gpu.evo_pack_out) cudaFree(gpu.evo_pack_out);
+            if (gpu.evo_pack_host) cudaFreeHost(gpu.evo_pack_host);
+            gpu.evo_pack_out  = nullptr;
+            gpu.evo_pack_host = nullptr;
             return false;
         }
         gpu.evo_pack_floats = need;
@@ -314,8 +327,15 @@ bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
         gpu.evo_pack_out, gpu.eos_params, pp);
     check_launch("gpu_pack_evolution_ideal");
 
+    const float* src = gpu.evo_pack_out;
+    if (staged) {
+        if (cudaMemcpyAsync(gpu.evo_pack_host, gpu.evo_pack_out,
+                            need * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream) != cudaSuccess) return false;
+        src = gpu.evo_pack_host;
+    }
     if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
-    std::memcpy(host_out, gpu.evo_pack_out, need * sizeof(float));
+    std::memcpy(host_out, src, need * sizeof(float));
     return true;
 }
 

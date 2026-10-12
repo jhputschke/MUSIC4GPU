@@ -4,6 +4,7 @@
     #include <omp.h>
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -688,8 +689,19 @@ void Advance::sync_curr_from_gpu_readonly(Fields &arenaFieldsCurr) {
     host_curr_fresh_ = true;
 }
 
-bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
-    if (!gpu_owns_state_ || !gpu_ready_ || gpu_no_pack()) return false;
+// The down-sampled output grid of the evolution store, as MUSIC's own
+// OutputEvolutionDataXYEta_memory walks it.
+static int pack_extent(int n, int skip) { return (n - 1) / std::max(skip, 1) + 1; }
+
+size_t Advance::evolution_pack_cells() const {
+    return static_cast<size_t>(
+          pack_extent(gpu_grid_.Nx(),   DATA.output_evolution_every_N_x))
+        * pack_extent(gpu_grid_.Ny(),   DATA.output_evolution_every_N_y)
+        * pack_extent(gpu_grid_.Neta(), DATA.output_evolution_every_N_eta);
+}
+
+bool Advance::pack_evolution_ideal(fluidCell_ideal *out) {
+    if (!gpu_owns_state_ || !gpu_ready_ || gpu_no_pack() || !out) return false;
     bench::Timer _bt("advance.output_pack_gpu");
 
     GPUPackParams pp;
@@ -703,9 +715,9 @@ bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
     pp.skip_x   = sx;
     pp.skip_y   = sy;
     pp.skip_eta = se;
-    pp.nx_out   = (pp.Nx   - 1) / sx + 1;
-    pp.ny_out   = (pp.Ny   - 1) / sy + 1;
-    pp.neta_out = (pp.Neta - 1) / se + 1;
+    pp.nx_out   = pack_extent(pp.Nx,   sx);
+    pp.ny_out   = pack_extent(pp.Ny,   sy);
+    pp.neta_out = pack_extent(pp.Neta, se);
     pp.boost_invariant = DATA.boost_invariant ? 1 : 0;
     pp.delta_eta = static_cast<float>(DATA.delta_eta);
     pp.eta_size  = static_cast<float>(DATA.eta_size);
@@ -716,13 +728,8 @@ bool Advance::pack_evolution_ideal(std::vector<fluidCell_ideal> &out) {
     // per-cell host EOS work.
     static_assert(sizeof(fluidCell_ideal) == 8 * sizeof(float),
                   "fluidCell_ideal must be 8 contiguous floats for the pack copy");
-    const size_t n_out =
-        static_cast<size_t>(pp.nx_out) * pp.ny_out * pp.neta_out;
-    out.resize(n_out);
-    if (!GPUPipelines::instance().pack_evolution_ideal(
-            gpu_grid_, pp, reinterpret_cast<float*>(out.data())))
-        return false;
-    return true;
+    return GPUPipelines::instance().pack_evolution_ideal(
+            gpu_grid_, pp, reinterpret_cast<float*>(out));
 }
 #endif  // MUSIC_USE_GPU
 

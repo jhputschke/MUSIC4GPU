@@ -192,11 +192,14 @@ class Advance {
 
     // Phase 2b: pack the ideal-hydro evolution output for the current step
     // directly on the GPU (EOS lookups + down-sampling on device) into `out`,
-    // laid out exactly as host fluidCell_ideal.  Avoids the full-arena D2H and
-    // the serial host EOS loop for the memory-output path.  Returns false when
-    // the GPU is not holding current state or the back-end has no packing
-    // kernel (Metal); the caller must then use the host output path.
-    bool pack_evolution_ideal(std::vector<fluidCell_ideal> &out);
+    // evolution_pack_cells() cells laid out exactly as host fluidCell_ideal
+    // (normally a frame of the store, HydroinfoMUSIC::begin_frame).  Avoids
+    // the full-arena D2H and the serial host EOS loop for the memory-output
+    // path.  Returns false when the GPU is not holding current state or the
+    // back-end has no packing kernel; the caller must then use the host
+    // output path.
+    size_t evolution_pack_cells() const;
+    bool pack_evolution_ideal(fluidCell_ideal *out);
 
    private:
     // Set when host arena matches the corresponding GPU snapshot — i.e. a

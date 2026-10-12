@@ -4,6 +4,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include "util.h"
 #include "HydroinfoMUSIC.h"
 
@@ -41,7 +44,7 @@ void HydroinfoMUSIC::clean_hydro_event() {
     // every instance would hold its largest event's store (~2 GB at 0-10%
     // Au+Au) for the rest of the run.  set_grid_infomatioin() reserves again
     // at the start of each run.
-    std::vector<fluidCell_ideal>().swap(lattice_ideal);
+    decltype(lattice_ideal)().swap(lattice_ideal);
     hydroTauMax = 0.;
     itaumax = 0;
 }
@@ -393,6 +396,24 @@ void HydroinfoMUSIC::set_grid_infomatioin(const InitData &DATA) {
     const size_t est_frames =
         static_cast<size_t>(DATA.nt/n_skip_tau) + 2;
     lattice_ideal.reserve(cells_per_frame*est_frames);
+#ifdef __linux__
+    // The store is written once, frame by frame, into pages it touches for the
+    // first time: with 4 kB pages ~5,000 page faults per 19 MB frame of 0-10%
+    // Au+Au.  Ask for transparent huge pages (granted where the system's THP
+    // mode is "madvise" or "always"): ~10 faults per frame.  Untouched pages
+    // of the reservation still cost nothing.
+    if (lattice_ideal.capacity() > 0) {
+        const uintptr_t huge = uintptr_t(2) << 20;
+        uintptr_t begin = reinterpret_cast<uintptr_t>(lattice_ideal.data());
+        const uintptr_t end =
+            begin + lattice_ideal.capacity()*sizeof(fluidCell_ideal);
+        begin = (begin + huge - 1) & ~(huge - 1);
+        if (end > begin + huge) {
+            madvise(reinterpret_cast<void *>(begin), (end - begin) & ~(huge - 1),
+                    MADV_HUGEPAGE);
+        }
+    }
+#endif
 }
 
 void HydroinfoMUSIC::print_grid_information() {
@@ -430,15 +451,21 @@ void HydroinfoMUSIC::dump_ideal_info_to_memory(double tau, float eta,
     lattice_ideal.push_back(new_cell);
 }
 
-void HydroinfoMUSIC::dump_ideal_info_frame_to_memory(
-        double tau, const std::vector<fluidCell_ideal> &frame) {
+fluidCell_ideal *HydroinfoMUSIC::begin_frame(size_t n) {
+    pending_frame_start_ = lattice_ideal.size();
+    lattice_ideal.resize(pending_frame_start_ + n);     // not zeroed
+    return lattice_ideal.data() + pending_frame_start_;
+}
+
+void HydroinfoMUSIC::commit_frame(double tau) {
     // All cells in a frame share tau, so the tau bookkeeping that
-    // dump_ideal_info_to_memory did per-cell is done once here.  The frame is
-    // pre-ordered (ix outer, iy middle, ieta inner) to match the former
-    // push_back sequence, so the appended lattice is byte-identical.
+    // dump_ideal_info_to_memory does per cell is done once here.
     if (tau > hydroTauMax) {
         hydroTauMax = tau;
         itaumax++;
     }
-    lattice_ideal.insert(lattice_ideal.end(), frame.begin(), frame.end());
+}
+
+void HydroinfoMUSIC::drop_frame() {
+    lattice_ideal.resize(pending_frame_start_);
 }

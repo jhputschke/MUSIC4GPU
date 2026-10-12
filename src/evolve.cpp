@@ -311,12 +311,13 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
 #ifdef MUSIC_USE_GPU
                 bool mem_done = false;
                 if (gpu_pack_mem) {
-                    std::vector<fluidCell_ideal> packed_frame;
-                    if (advance.pack_evolution_ideal(packed_frame)) {
-                        hydro_info_ptr.dump_ideal_info_frame_to_memory(
-                                tau, packed_frame);
+                    // packed straight into a new frame of the store
+                    if (advance.pack_evolution_ideal(hydro_info_ptr.begin_frame(
+                                advance.evolution_pack_cells()))) {
+                        hydro_info_ptr.commit_frame(tau);
                         mem_done = true;
                     } else {
+                        hydro_info_ptr.drop_frame();
                         // gpu_owns_state implies the pack succeeds; sync
                         // defensively so the CPU fallback reads fresh state.
                         advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
@@ -726,12 +727,13 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 #ifdef MUSIC_USE_GPU
                 bool mem_done = false;
                 if (gpu_pack_mem) {
-                    std::vector<fluidCell_ideal> packed_frame;
-                    if (advance.pack_evolution_ideal(packed_frame)) {
-                        hydro_info_ptr.dump_ideal_info_frame_to_memory(
-                                tau, packed_frame);
+                    // packed straight into a new frame of the store
+                    if (advance.pack_evolution_ideal(hydro_info_ptr.begin_frame(
+                                advance.evolution_pack_cells()))) {
+                        hydro_info_ptr.commit_frame(tau);
                         mem_done = true;
                     } else {
+                        hydro_info_ptr.drop_frame();
                         // gpu_owns_state implies the pack succeeds; sync
                         // defensively so the CPU fallback reads fresh state.
                         advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
