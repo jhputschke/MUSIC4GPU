@@ -333,6 +333,53 @@ double Advance::reduce_max_edge_gpu(int fac_x, int fac_y) {
     return GPUPipelines::instance().reduce_max_edge(gpu_grid_, fac_x, fac_y);
 }
 
+size_t Advance::gpu_state_floats() const {
+    return GPUPipelines::state_floats(gpu_grid_);
+}
+
+void* Advance::save_gpu_state() {
+    if (!gpu_owns_state_ || !gpu_ready_) return nullptr;
+    auto& mp = GPUPipelines::instance();
+    void* state = mp.alloc_state(gpu_state_floats());
+    if (state && !mp.save_snapshots(gpu_grid_, state)) {
+        mp.free_state(state);
+        state = nullptr;
+    }
+    return state;
+}
+
+bool Advance::restore_gpu_state(const void* state, Fields &arenaFieldsCurr) {
+    if (!state || gpu_force_cpu() || !gpu_features_supported()) return false;
+    init_metal_if_needed(arenaFieldsCurr.nX(), arenaFieldsCurr.nY(),
+                         arenaFieldsCurr.nEta());
+    if (!gpu_ready_) return false;
+    auto& mp = GPUPipelines::instance();
+    if (!mp.restore_snapshots(gpu_grid_, state)) return false;
+    // as after the last substep of a GPU step (try_gpu_advance)
+    gpu_owns_state_          = true;
+    gpu_state_authoritative_ = false;
+    host_curr_fresh_ = false;
+    host_prev_fresh_ = false;
+    prev_fresh_buf_  = nullptr;
+    curr_synced_buf_ = nullptr;
+    mp.read_and_reset_nonfinite();
+    return true;
+}
+
+bool Advance::read_gpu_state(std::vector<float> &host) {
+    void* state = save_gpu_state();
+    if (!state) return false;
+    host.resize(gpu_state_floats());
+    const bool ok = GPUPipelines::instance().read_state(state, host.data(),
+                                                        host.size());
+    free_gpu_state(state);
+    return ok;
+}
+
+void Advance::free_gpu_state(void* state) {
+    if (state) GPUPipelines::instance().free_state(state);
+}
+
 // ── Feature support predicate ────────────────────────────────────────────────
 //
 // Gate the GPU dispatch on the configuration falling inside the support matrix

@@ -49,6 +49,12 @@ class MUSIC {
 
     std::shared_ptr<HydroinfoMUSIC> hydro_info_ptr;
 
+    // MusicCheckpoint (music_checkpoint.h)
+    double checkpoint_tau_ = 0.;
+    std::shared_ptr<MusicCheckpoint> checkpoint_;
+    std::shared_ptr<const MusicCheckpoint> resume_from_;
+    std::string resume_status_;
+
     pretty_ostream music_message;
 
     int currTauIdx;
@@ -71,6 +77,25 @@ class MUSIC {
 
     //! this is a shell function to run hydro
     int run_hydro();
+
+    //! Take a MusicCheckpoint in every run from now on, at the last
+    //! freeze-out step whose RK step ends by tau [fm/c] (0: none).  Each run
+    //! replaces the previous one's.  GPU runs only.
+    void set_checkpoint_tau(double tau) {checkpoint_tau_ = tau;}
+    double get_checkpoint_tau() const {return(checkpoint_tau_);}
+    //! the last run's checkpoint (nullptr if none was asked for; not valid()
+    //! if it could not be taken, e.g. the run ended first)
+    std::shared_ptr<const MusicCheckpoint> get_checkpoint() const {
+        return(checkpoint_);
+    }
+    //! The next run starts from this checkpoint instead of tau0, if it fits
+    //! (Evolve::set_resume).  One run only.  MUSIC_RESTART_VERIFY=1: the
+    //! run goes from tau0 and compares its state with the checkpoint's.
+    void set_resume_from(std::shared_ptr<const MusicCheckpoint> c) {
+        resume_from_ = std::move(c);
+    }
+    //! what the last run did with set_resume_from ("" if not asked)
+    const std::string &get_resume_status() const {return(resume_status_);}
 
     void prepare_run_hydro_one_time_step();
     int run_hydro_upto(const double tauEnd);

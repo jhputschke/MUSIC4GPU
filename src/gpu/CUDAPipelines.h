@@ -61,6 +61,18 @@ public:
     // Synchronizes before returning.
     double reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y);
 
+    // A copy of snap_prev and snap_curr (epsilon, rhob, u, Wmunu, pi_b each,
+    // prev first), for a run to resume from another run's state
+    // (MusicCheckpoint).  state_floats() floats; alloc_state allocates them,
+    // save_snapshots / restore_snapshots copy GPU -> state / state -> GPU and
+    // synchronize, read_state copies a state to host memory.
+    static size_t state_floats(const GPUGrid& gpu);
+    void* alloc_state(size_t floats);
+    void  free_state(void* state);
+    bool  save_snapshots(GPUGrid& gpu, void* state);
+    bool  restore_snapshots(GPUGrid& gpu, const void* state);
+    bool  read_state(const void* state, float* host, size_t floats);
+
     // Cell updates in which gpu_first_rk_step_w_full set a non-finite
     // W^{mu nu} or Pi to 0 since the last call (resets the count).
     // Synchronizes the compute stream.

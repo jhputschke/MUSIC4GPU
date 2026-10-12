@@ -14,6 +14,7 @@
 #include "hydro_source_base.h"
 #include "pretty_ostream.h"
 #include "HydroinfoMUSIC.h"
+#include "music_checkpoint.h"
 #include "surfaceCell.h"
 
 // this is a control class for the hydrodynamic evolution
@@ -48,6 +49,28 @@ class Evolve {
     // MUSIC_DEBUG_NONFINITE / MUSIC_DEBUG_CELL (evolve.cpp); no-ops unless set
     void debug_hooks(Fields &prev, Fields &curr, int it, double tau);
 
+    // MusicCheckpoint (music_checkpoint.h): take one in this run, or start
+    // from one -- or, verifying, run from tau0 and compare at its step
+    std::shared_ptr<MusicCheckpoint> checkpoint_out_;
+    double checkpoint_tau_ = 0.;
+    std::shared_ptr<const MusicCheckpoint> resume_from_;
+    bool verify_resume_ = false;
+    std::string resume_status_;
+    std::string checkpoint_key(Fields &arena_initial) const;
+    std::string resume_rejection(const MusicCheckpoint &c,
+                                 const std::string &key, int iFreezeStart,
+                                 double tau0);
+    void take_checkpoint(int it, double tau, int iFreezeStart, int frozen,
+                         double eps_max_cur, const std::string &key,
+                         Fields &arena_current, HydroinfoMUSIC &hydro_info);
+    bool restore_checkpoint(const MusicCheckpoint &c, Fields* fpPrev,
+                            Fields* fpCurr, Fields &freezeoutFieldPrev,
+                            Fields &freezeoutFieldCurr, double &eps_max_cur,
+                            HydroinfoMUSIC &hydro_info);
+    void verify_checkpoint(const MusicCheckpoint &c, int it, double tau,
+                           int frozen, double eps_max_cur,
+                           Fields &arena_current, HydroinfoMUSIC &hydro_info);
+
  public:
     Evolve(const EOS &eos, InitData &DATA_in,
            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in,
@@ -64,6 +87,24 @@ class Evolve {
 
     int EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                  Fields &arenaFieldsNext, HydroinfoMUSIC &hydro_info_ptr);
+
+    //! Take a MusicCheckpoint in this run, into `out`: at its last
+    //! freeze-out step before tau (iteration `it`, after the freeze-out
+    //! stage, before AdvanceRK).  GPU runs only.
+    void request_checkpoint(std::shared_ptr<MusicCheckpoint> out, double tau) {
+        checkpoint_out_ = std::move(out);
+        checkpoint_tau_ = tau;
+    }
+    //! Start this run from `from` -- if it was taken in a run with the same
+    //! parameters, initial arena and initial-state source, and this run's jet
+    //! source adds nothing before its step; otherwise from tau0.  verify: run
+    //! from tau0 regardless and compare the state with `from` at its step.
+    void set_resume(std::shared_ptr<const MusicCheckpoint> from, bool verify) {
+        resume_from_ = std::move(from);
+        verify_resume_ = verify;
+    }
+    //! what this run did with set_resume, for the log; "" if not asked
+    const std::string &resume_status() const { return resume_status_; }
 
     int EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                           Fields &arenaFieldsCurr, Fields &arenaFieldsNext,

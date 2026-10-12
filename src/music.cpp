@@ -1,6 +1,7 @@
 // Original copyright 2011 @ Bjoern Schenke, Sangyong Jeon, and Charles Gale
 // Massively cleaned up and improved by Chun Shen 2015-2016
 #include <stdio.h>
+#include <cstdlib>
 #include <sys/stat.h>
 #include <vector>
 #include <memory>
@@ -151,12 +152,26 @@ void MUSIC::initialize_hydro_xscape(int nx, int ny, int nz,
 int MUSIC::run_hydro() {
     evolve_ptr_= std::make_shared<Evolve> (eos, DATA, hydro_source_terms_ptr,
                                            hydro_source_terms_from_jet_ptr_);
+    checkpoint_.reset();
+    if (checkpoint_tau_ > 0.) {
+        checkpoint_ = std::make_shared<MusicCheckpoint>();
+        evolve_ptr_->request_checkpoint(checkpoint_, checkpoint_tau_);
+    }
+    resume_status_.clear();
+    if (resume_from_) {
+        const char* v = getenv("MUSIC_RESTART_VERIFY");
+        evolve_ptr_->set_resume(resume_from_, v != nullptr && v[0] == '1');
+    }
 
     if (hydro_info_ptr == nullptr && DATA.store_hydro_info_in_memory == 1) {
         hydro_info_ptr = std::make_shared<HydroinfoMUSIC> ();
     }
     evolve_ptr_->EvolveIt(arenaFieldsPrev_, arenaFieldsCurr_, arenaFieldsNext_,
                           (*hydro_info_ptr));
+    if (resume_from_) {
+        resume_status_ = evolve_ptr_->resume_status();
+        resume_from_.reset();
+    }
     if (DATA.store_hydro_info_in_memory == 1)
         hydro_info_ptr->dump_ideal_lattice_if_requested();
     flag_hydro_run = 1;

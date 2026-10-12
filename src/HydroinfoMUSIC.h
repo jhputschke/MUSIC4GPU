@@ -93,6 +93,19 @@ class HydroinfoMUSIC {
     void commit_frame(double tau);
     void drop_frame();
 
+    //! The store as it is (MusicCheckpoint), and set to another run's: its
+    //! frames, frame count and last tau.  restore_frames appends to the
+    //! (empty) store of a run that has just started.
+    void copy_frames(std::vector<fluidCell_ideal> &out) const {
+        out.assign(lattice_ideal.begin(), lattice_ideal.end());
+    }
+    void restore_frames(const std::vector<fluidCell_ideal> &frames,
+                        int ntau, double tau_max) {
+        lattice_ideal.insert(lattice_ideal.end(), frames.begin(), frames.end());
+        itaumax = ntau;
+        hydroTauMax = tau_max;
+    }
+
     int get_number_of_fluid_cells() const {return(lattice_ideal.size());}
     void get_fluid_cell_with_index(const int idx, fluidCell *info) const;
 

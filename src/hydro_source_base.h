@@ -2,6 +2,7 @@
 #ifndef SRC_HYDRO_SOURCE_BASE_H_
 #define SRC_HYDRO_SOURCE_BASE_H_
 
+#include <cstdint>
 #include "data.h"
 #include "pretty_ostream.h"
 #include "data_struct.h"
@@ -22,6 +23,11 @@ class HydroSourceBase {
     virtual ~HydroSourceBase() {}
 
     virtual int get_number_of_sources() const {return(0);}
+
+    //! A hash of the source's input, so a MusicCheckpoint can tell whether
+    //! two runs have the same initial-state source; 0 = unknown, and a run
+    //! with sources and no fingerprint never starts from a checkpoint.
+    virtual std::uint64_t fingerprint() const {return(0);}
 
     void set_sigma_tau(double sigma_tau_in) {sigma_tau_ = sigma_tau_in;}
     void set_sigma_x  (double sigma_x_in  ) {sigma_x_   = sigma_x_in  ;}

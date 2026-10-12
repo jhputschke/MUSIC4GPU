@@ -160,6 +160,18 @@ class Advance {
     // ix <= fac_x, ix >= Nx - 2*fac_x, iy <= fac_y, iy >= Ny - 2*fac_y, any
     // eta; 0 if those cells all have e <= 0.  Only while gpu_owns_state().
     double reduce_max_edge_gpu(int fac_x, int fac_y);
+
+    // The GPU state of a step boundary (snap_prev, snap_curr) for a
+    // MusicCheckpoint: save_gpu_state copies it into a new state buffer
+    // (nullptr if the GPU does not own the state); restore_gpu_state sets up
+    // the GPU grid if needed, copies a saved state in and leaves the GPU
+    // owning it with the host arenas stale, as after a GPU step;
+    // read_gpu_state copies the current one to host memory.
+    size_t gpu_state_floats() const;
+    void*  save_gpu_state();
+    bool   restore_gpu_state(const void* state, Fields &arenaFieldsCurr);
+    bool   read_gpu_state(std::vector<float> &host);
+    static void free_gpu_state(void* state);
     // Cell updates since the last call in which the GPU set a non-finite
     // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();
