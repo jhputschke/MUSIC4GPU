@@ -1986,6 +1986,38 @@ __global__ void gpu_first_rk_step_w_full(
 // IEEE-754 trick: for non-negative floats, bit-casting to int preserves order,
 // so atomicMax on the integer representation gives the correct float maximum.
 
+__global__ void gpu_reduce_max_eps_edge(
+    const float* __restrict__ epsilon,
+    int Nx, int Ny, int Ncells, int fx, int fy,
+    float* out_eps)
+{
+    extern __shared__ float sdata[];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    int       idx    = static_cast<int>(blockIdx.x * blockDim.x) + tid;
+    const int stride = static_cast<int>(blockDim.x * gridDim.x);
+
+    float le = 0.f;
+    for (; idx < Ncells; idx += stride) {
+        const int ix = idx % Nx;                  // cell_idx: Nx*(Ny*ieta + iy) + ix
+        const int iy = (idx / Nx) % Ny;
+        if (ix <= fx || ix >= Nx - 2*fx || iy <= fy || iy >= Ny - 2*fy) {
+            le = fmaxf(le, __ldg(&epsilon[idx]));
+        }
+    }
+    sdata[tid] = le;
+    __syncthreads();
+
+    for (int s = static_cast<int>(blockDim.x) >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicMax(reinterpret_cast<int*>(out_eps), __float_as_int(sdata[0]));
+    }
+}
+
 __global__ void gpu_reduce_max_eps_rhob(
     const float* __restrict__ epsilon,
     const float* __restrict__ rhob,

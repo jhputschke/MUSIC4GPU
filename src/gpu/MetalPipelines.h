@@ -76,6 +76,10 @@ public:
     // epsilon/rhob on the host after wait() has ensured the last kernel is done.
     void reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max);
 
+    // max(epsilon) over the transverse edge bands of snap_curr (as
+    // CUDAPipelines::reduce_max_edge), scanned on the host like reduce_max.
+    double reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y);
+
     // Cell updates in which gpu_first_rk_step_w_full set a non-finite
     // W^{mu nu} or Pi to 0 since the last call (resets the count).  Waits for
     // the last committed command buffer; counts from an open batch arrive at

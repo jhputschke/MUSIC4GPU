@@ -284,16 +284,17 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         //}
 
         if (it % Nskip_timestep == 0) {
+            const bool mem_frames = (DATA.store_hydro_info_in_memory == 1
+                                     && DATA.store_hydro_info_frames == 1);
 #ifdef MUSIC_USE_GPU
             // Memory-ideal output is packed directly on the GPU (no full-arena
             // D2H).  Sync the host arena only for consumers that read it: the
             // file evolution writers, or the memory path when GPU packing is
             // unavailable (CPU holds the current state).
-            const bool gpu_pack_mem = (DATA.store_hydro_info_in_memory == 1
+            const bool gpu_pack_mem = (mem_frames
                                        && DATA.outputEvolutionData == 0
                                        && advance.gpu_owns_state());
-            if (DATA.outputEvolutionData > 0
-                    || (DATA.store_hydro_info_in_memory == 1 && !gpu_pack_mem)) {
+            if (DATA.outputEvolutionData > 0 || (mem_frames && !gpu_pack_mem)) {
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
             }
 #endif
@@ -307,16 +308,19 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                 grid_info.OutputEvolutionDataXYEta_vorticity(
                                             *fpCurr, *fpPrev, tau);
             }
-            if (DATA.store_hydro_info_in_memory == 1) {
+            if (DATA.store_hydro_info_in_memory == 1 && !mem_frames) {
+                hydro_info_ptr.commit_frame(tau);   // tau bookkeeping, no cells
+            } else if (mem_frames) {
 #ifdef MUSIC_USE_GPU
                 bool mem_done = false;
                 if (gpu_pack_mem) {
-                    std::vector<fluidCell_ideal> packed_frame;
-                    if (advance.pack_evolution_ideal(packed_frame)) {
-                        hydro_info_ptr.dump_ideal_info_frame_to_memory(
-                                tau, packed_frame);
+                    // packed straight into a new frame of the store
+                    if (advance.pack_evolution_ideal(hydro_info_ptr.begin_frame(
+                                advance.evolution_pack_cells()))) {
+                        hydro_info_ptr.commit_frame(tau);
                         mem_done = true;
                     } else {
+                        hydro_info_ptr.drop_frame();
                         // gpu_owns_state implies the pack succeeds; sync
                         // defensively so the CPU fallback reads fresh state.
                         advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
@@ -337,8 +341,9 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             //}
         }
 
-        if (it == iFreezeStart || it == iFreezeStart + 10
-            || it == iFreezeStart + 30 || it == iFreezeStart + 50) {
+        if (DATA.output_momentum_anisotropy_vs_etas == 1
+            && (it == iFreezeStart || it == iFreezeStart + 10
+                || it == iFreezeStart + 30 || it == iFreezeStart + 50)) {
 #ifdef MUSIC_USE_GPU
             advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
@@ -700,14 +705,15 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         }
 
         if (tauIdx % Nskip_timestep == 0) {
+            const bool mem_frames = (DATA.store_hydro_info_in_memory == 1
+                                     && DATA.store_hydro_info_frames == 1);
 #ifdef MUSIC_USE_GPU
             // See EvolveIt: pack memory-ideal output on the GPU; only sync the
             // host arena for file writers or the host fallback.
-            const bool gpu_pack_mem = (DATA.store_hydro_info_in_memory == 1
+            const bool gpu_pack_mem = (mem_frames
                                        && DATA.outputEvolutionData == 0
                                        && advance.gpu_owns_state());
-            if (DATA.outputEvolutionData > 0
-                    || (DATA.store_hydro_info_in_memory == 1 && !gpu_pack_mem)) {
+            if (DATA.outputEvolutionData > 0 || (mem_frames && !gpu_pack_mem)) {
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
             }
 #endif
@@ -721,16 +727,19 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                 grid_info.OutputEvolutionDataXYEta_vorticity(
                                             *fpCurr, *fpPrev, tau);
             }
-            if (DATA.store_hydro_info_in_memory == 1) {
+            if (DATA.store_hydro_info_in_memory == 1 && !mem_frames) {
+                hydro_info_ptr.commit_frame(tau);   // tau bookkeeping, no cells
+            } else if (mem_frames) {
 #ifdef MUSIC_USE_GPU
                 bool mem_done = false;
                 if (gpu_pack_mem) {
-                    std::vector<fluidCell_ideal> packed_frame;
-                    if (advance.pack_evolution_ideal(packed_frame)) {
-                        hydro_info_ptr.dump_ideal_info_frame_to_memory(
-                                tau, packed_frame);
+                    // packed straight into a new frame of the store
+                    if (advance.pack_evolution_ideal(hydro_info_ptr.begin_frame(
+                                advance.evolution_pack_cells()))) {
+                        hydro_info_ptr.commit_frame(tau);
                         mem_done = true;
                     } else {
+                        hydro_info_ptr.drop_frame();
                         // gpu_owns_state implies the pack succeeds; sync
                         // defensively so the CPU fallback reads fresh state.
                         advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
@@ -976,6 +985,12 @@ int Evolve::frozen_without_surface(Fields &arena_current) {
 //! ix >= nx - 2*fac_x (same in y): a cell at or above e_fo in those bands
 bool Evolve::transverse_edge_is_hot(Fields &arena_current, double eps_fo) {
 #ifdef MUSIC_USE_GPU
+    // On the GPU's float state, without copying the grid to the host: the
+    // host copy holds the same floats as doubles, so max >= e_fo there is the
+    // same test (and eps_fo > 0, so the reduction's floor of 0 never counts).
+    if (advance.gpu_owns_state()) {
+        return advance.reduce_max_edge_gpu(DATA.fac_x, DATA.fac_y) >= eps_fo;
+    }
     advance.sync_curr_from_gpu_readonly(arena_current);
 #endif
     const int nx = arena_current.nX();

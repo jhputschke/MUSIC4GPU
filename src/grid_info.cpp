@@ -383,12 +383,12 @@ void Cell_info::OutputEvolutionDataXYEta_memory(
     const int ny_out   = (arena.nY()   - 1)/n_skip_y   + 1;
     const int neta_out = (arena.nEta() - 1)/n_skip_eta + 1;
 
-    // Fill a per-frame buffer in parallel.  Each cell writes its own slot at a
-    // flat index matching the original push order (ix outer, iy middle, ieta
-    // inner), so the appended lattice is byte-identical to the former serial
-    // push_back loop.  The EOS getters are const and thread-safe (cf. the
-    // parallelized diagnostic loops in this file).
-    std::vector<fluidCell_ideal> frame(
+    // Fill a new frame of the store in parallel.  Each cell writes its own
+    // slot at a flat index matching the original push order (ix outer, iy
+    // middle, ieta inner), so the appended lattice is byte-identical to the
+    // former serial push_back loop.  The EOS getters are const and
+    // thread-safe (cf. the parallelized diagnostic loops in this file).
+    fluidCell_ideal *frame = hydro_info_ptr.begin_frame(
             static_cast<size_t>(nx_out)*ny_out*neta_out);
     #pragma omp parallel for collapse(3) schedule(static)
     for (int ix_idx = 0; ix_idx < nx_out; ix_idx++) {
@@ -440,7 +440,7 @@ void Cell_info::OutputEvolutionDataXYEta_memory(
         }
     }
 
-    hydro_info_ptr.dump_ideal_info_frame_to_memory(tau, frame);
+    hydro_info_ptr.commit_frame(tau);
 }
 
 //! This function outputs hydro evolution file in binary format

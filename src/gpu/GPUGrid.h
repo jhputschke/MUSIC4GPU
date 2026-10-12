@@ -171,10 +171,13 @@ public:
 
     // Phase 2b: scratch buffer for the GPU-packed ideal evolution output
     // (8 floats per down-sampled cell). Lazily (re)allocated by
-    // CUDAPipelines::pack_evolution_ideal to fit n_out; managed (cudaMallocManaged)
-    // and freed in release(). Not registered in buf_handles_ (it is re-sized
-    // independently of the one-shot allocate()).
+    // CUDAPipelines::pack_evolution_ideal to fit n_out and freed in release():
+    // managed (cudaMallocManaged) with coherent host memory; otherwise a device
+    // buffer plus the pinned host buffer evo_pack_host it is DMA'd into, so
+    // the host never reads managed pages fault by fault over PCIe. Not
+    // registered in buf_handles_ (re-sized independently of allocate()).
     float* evo_pack_out    = nullptr;
+    float* evo_pack_host   = nullptr;
     size_t evo_pack_floats = 0;
 
     // Upload pre-sampled EOS tables (P, dP/de, s, T) to GPU shared memory.

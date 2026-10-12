@@ -3,11 +3,33 @@
 #ifndef SRC_HYDROINFOMUSIC_H_
 #define SRC_HYDROINFOMUSIC_H_
 
-#include <vector>
+#include <cstddef>
+#include <memory>
+#include <new>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 #include "data_struct.h"
 #include "data.h"
 #include "pretty_ostream.h"
+
+//! std::allocator, except that resize() leaves new elements default- rather
+//! than value-initialised: a frame of the store is written by the pack right
+//! after it is added, so zeroing it first would be one more pass over 19 MB.
+template <class T>
+struct DefaultInitAllocator : std::allocator<T> {
+    template <class U> struct rebind { using other = DefaultInitAllocator<U>; };
+    using std::allocator<T>::allocator;
+    template <class U>
+    void construct(U *p) noexcept(std::is_nothrow_default_constructible<U>::value) {
+        ::new (static_cast<void *>(p)) U;
+    }
+    template <class U, class... Args>
+    void construct(U *p, Args &&... args) {
+        ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+    }
+};
 
 class HydroinfoMUSIC {
  private:
@@ -30,7 +52,9 @@ class HydroinfoMUSIC {
 
     int itaumax, ixmax, iymax, ietamax;
 
-    std::vector<fluidCell_ideal> lattice_ideal;
+    std::vector<fluidCell_ideal, DefaultInitAllocator<fluidCell_ideal>>
+        lattice_ideal;
+    size_t pending_frame_start_ = 0;    // begin_frame .. commit/drop_frame
     pretty_ostream music_message;
 
  public:
@@ -61,8 +85,13 @@ class HydroinfoMUSIC {
     void dump_ideal_info_to_memory(double tau, float eta, float epsilon,
                                    float pressure, float entropy, float T,
                                    float ux, float uy, float ueta);
-    void dump_ideal_info_frame_to_memory(
-            double tau, const std::vector<fluidCell_ideal> &frame);
+    //! Add one frame of n cells to the store and return where it starts, for
+    //! the caller to fill in place (ix outer, iy middle, ieta inner, as the
+    //! per-cell dump_ideal_info_to_memory sequence); then commit_frame(tau),
+    //! or drop_frame() if it could not be filled.
+    fluidCell_ideal *begin_frame(size_t n);
+    void commit_frame(double tau);
+    void drop_frame();
 
     int get_number_of_fluid_cells() const {return(lattice_ideal.size());}
     void get_fluid_cell_with_index(const int idx, fluidCell *info) const;

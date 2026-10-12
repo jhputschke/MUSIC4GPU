@@ -4,6 +4,7 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -273,6 +274,25 @@ void MetalPipelines::reduce_max(GPUGrid& gpu, double& eps_max, double& rhob_max)
         if (e[i] > static_cast<float>(eps_max))  eps_max  = static_cast<double>(e[i]);
         if (r[i] > static_cast<float>(rhob_max)) rhob_max = static_cast<double>(r[i]);
     }
+}
+
+double MetalPipelines::reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y) {
+    if (!ready_ || !gpu.snap_curr.epsilon) return 0.0;
+    const int Nx = gpu.Nx(), Ny = gpu.Ny(), Neta = gpu.Neta();
+    const float* e = gpu.snap_curr.epsilon;
+    float m = 0.f;
+    for (int ieta = 0; ieta < Neta; ++ieta)
+    for (int iy = 0; iy < Ny; ++iy) {
+        const float* row = e + static_cast<size_t>(Nx) * (Ny * ieta + iy);
+        if (iy <= fac_y || iy >= Ny - 2*fac_y) {          // the whole row
+            for (int ix = 0; ix < Nx; ++ix) m = std::max(m, row[ix]);
+        } else {                                          // its two ends
+            for (int ix = 0; ix < Nx && ix <= fac_x; ++ix) m = std::max(m, row[ix]);
+            for (int ix = std::max(Nx - 2*fac_x, 0); ix < Nx; ++ix)
+                m = std::max(m, row[ix]);
+        }
+    }
+    return static_cast<double>(m);
 }
 
 // ── wait ──────────────────────────────────────────────────────────────────────

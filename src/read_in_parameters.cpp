@@ -327,6 +327,8 @@ InitData read_in_parameters(std::string input_file) {
 
     parameter_list.store_hydro_info_in_memory =
         (getParameter(input_file, "store_hydro_info_in_memory", 0));
+    parameter_list.store_hydro_info_frames =
+        (getParameter(input_file, "store_hydro_info_frames", 1));
     // output_evolution_data:
     // 2: output bulk information in binary format
     parameter_list.outputEvolutionData =
@@ -918,6 +920,12 @@ InitData read_in_parameters(std::string input_file) {
         istringstream(tempinput) >> temp_diag_N_tau;
     parameter_list.output_diagnostics_every_N_timesteps = temp_diag_N_tau;
 
+    // The momentum anisotropy and eccentricities vs eta_s at four fixed steps
+    // after the freeze-out search starts.  1 (default) writes them; 0 skips
+    // the serial pass over every cell and its .dat files.
+    parameter_list.output_momentum_anisotropy_vs_etas = getParameter(
+        input_file, "output_momentum_anisotropy_vs_etas", 1);
+
     int temp_evo_N_x = 1;
     tempinput = Util::StringFind4(input_file, "output_evolution_every_N_x");
     if(tempinput != "empty") istringstream ( tempinput ) >> temp_evo_N_x;
@@ -1047,6 +1055,13 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
 
     if (parameter_name == "store_hydro_info_in_memory")
         parameter_list.store_hydro_info_in_memory = static_cast<int>(value);
+
+    if (parameter_name == "store_hydro_info_frames")
+        parameter_list.store_hydro_info_frames = static_cast<int>(value);
+
+    if (parameter_name == "output_momentum_anisotropy_vs_etas")
+        parameter_list.output_momentum_anisotropy_vs_etas =
+            static_cast<int>(value);
 
     if (parameter_name == "Viscosity_Flag_Yes_1_No_0")
         parameter_list.viscosity_flag = static_cast<int>(value);
