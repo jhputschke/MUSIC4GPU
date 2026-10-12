@@ -203,6 +203,11 @@ typedef struct init_data {
 
     //! flag to store hydro evolution in memory for jetscape
     int store_hydro_info_in_memory;
+    //! With store_hydro_info_in_memory: 1 (default) stores every output frame;
+    //! 0 keeps the store's grid and tau bookkeeping (get_ntau, hydro_tau_max)
+    //! but packs and stores no cells, for an instance whose evolution nobody
+    //! reads.
+    int store_hydro_info_frames;
 
     //! decide whether to output files for movie
     int output_movie_flag;

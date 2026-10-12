@@ -395,6 +395,7 @@ void HydroinfoMUSIC::set_grid_infomatioin(const InitData &DATA) {
         static_cast<size_t>(ixmax)*iymax*ietamax;
     const size_t est_frames =
         static_cast<size_t>(DATA.nt/n_skip_tau) + 2;
+    if (DATA.store_hydro_info_frames == 0) return;      // tau bookkeeping only
     lattice_ideal.reserve(cells_per_frame*est_frames);
 #ifdef __linux__
     // The store is written once, frame by frame, into pages it touches for the

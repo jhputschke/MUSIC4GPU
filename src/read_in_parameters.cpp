@@ -327,6 +327,8 @@ InitData read_in_parameters(std::string input_file) {
 
     parameter_list.store_hydro_info_in_memory =
         (getParameter(input_file, "store_hydro_info_in_memory", 0));
+    parameter_list.store_hydro_info_frames =
+        (getParameter(input_file, "store_hydro_info_frames", 1));
     // output_evolution_data:
     // 2: output bulk information in binary format
     parameter_list.outputEvolutionData =
@@ -1053,6 +1055,9 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
 
     if (parameter_name == "store_hydro_info_in_memory")
         parameter_list.store_hydro_info_in_memory = static_cast<int>(value);
+
+    if (parameter_name == "store_hydro_info_frames")
+        parameter_list.store_hydro_info_frames = static_cast<int>(value);
 
     if (parameter_name == "output_momentum_anisotropy_vs_etas")
         parameter_list.output_momentum_anisotropy_vs_etas =

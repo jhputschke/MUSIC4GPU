@@ -284,16 +284,17 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         //}
 
         if (it % Nskip_timestep == 0) {
+            const bool mem_frames = (DATA.store_hydro_info_in_memory == 1
+                                     && DATA.store_hydro_info_frames == 1);
 #ifdef MUSIC_USE_GPU
             // Memory-ideal output is packed directly on the GPU (no full-arena
             // D2H).  Sync the host arena only for consumers that read it: the
             // file evolution writers, or the memory path when GPU packing is
             // unavailable (CPU holds the current state).
-            const bool gpu_pack_mem = (DATA.store_hydro_info_in_memory == 1
+            const bool gpu_pack_mem = (mem_frames
                                        && DATA.outputEvolutionData == 0
                                        && advance.gpu_owns_state());
-            if (DATA.outputEvolutionData > 0
-                    || (DATA.store_hydro_info_in_memory == 1 && !gpu_pack_mem)) {
+            if (DATA.outputEvolutionData > 0 || (mem_frames && !gpu_pack_mem)) {
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
             }
 #endif
@@ -307,7 +308,9 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                 grid_info.OutputEvolutionDataXYEta_vorticity(
                                             *fpCurr, *fpPrev, tau);
             }
-            if (DATA.store_hydro_info_in_memory == 1) {
+            if (DATA.store_hydro_info_in_memory == 1 && !mem_frames) {
+                hydro_info_ptr.commit_frame(tau);   // tau bookkeeping, no cells
+            } else if (mem_frames) {
 #ifdef MUSIC_USE_GPU
                 bool mem_done = false;
                 if (gpu_pack_mem) {
@@ -702,14 +705,15 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         }
 
         if (tauIdx % Nskip_timestep == 0) {
+            const bool mem_frames = (DATA.store_hydro_info_in_memory == 1
+                                     && DATA.store_hydro_info_frames == 1);
 #ifdef MUSIC_USE_GPU
             // See EvolveIt: pack memory-ideal output on the GPU; only sync the
             // host arena for file writers or the host fallback.
-            const bool gpu_pack_mem = (DATA.store_hydro_info_in_memory == 1
+            const bool gpu_pack_mem = (mem_frames
                                        && DATA.outputEvolutionData == 0
                                        && advance.gpu_owns_state());
-            if (DATA.outputEvolutionData > 0
-                    || (DATA.store_hydro_info_in_memory == 1 && !gpu_pack_mem)) {
+            if (DATA.outputEvolutionData > 0 || (mem_frames && !gpu_pack_mem)) {
                 advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
             }
 #endif
@@ -723,7 +727,9 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                 grid_info.OutputEvolutionDataXYEta_vorticity(
                                             *fpCurr, *fpPrev, tau);
             }
-            if (DATA.store_hydro_info_in_memory == 1) {
+            if (DATA.store_hydro_info_in_memory == 1 && !mem_frames) {
+                hydro_info_ptr.commit_frame(tau);   // tau bookkeeping, no cells
+            } else if (mem_frames) {
 #ifdef MUSIC_USE_GPU
                 bool mem_done = false;
                 if (gpu_pack_mem) {
