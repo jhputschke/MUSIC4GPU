@@ -90,6 +90,8 @@ public:
     void copy_to_gpu(const Fields& src, GPUSnapshot& dst) const;
     void copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const;
     void copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const;
+    // epsilon only (Fields::e_), for the freeze-out search's scan
+    void copy_epsilon_to_cpu(const GPUSnapshot& src, Fields& dst) const;
 
     // Rotate GPUSnapshot pointer aliases: snap_prev ← snap_curr ← snap_future
     // ← (old snap_prev as scratch).  Matches the CPU arena rotation done in

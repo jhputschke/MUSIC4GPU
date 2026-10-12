@@ -126,6 +126,21 @@ __global__ void gpu_reduce_max_eps_edge(
     int Nx, int Ny, int Ncells, int fx, int fy,
     float* out_eps);
 
+// All 21 fields (epsilon, rhob, u[4], Wmunu[14], pi_b) of the n cells
+// cells[0..n), from the snapshot arrays and, unless null, from `kept` (a
+// snapshot copied into one array in that order, 21 x Ncells floats).
+// Writes field-major: out[f*n + j] from the snapshot, out[(21 + f)*n + j] from
+// `kept`.  For the freeze-out search (CUDAPipelines::gather_cells).
+__global__ void gpu_gather_cells(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ rhob,
+    const float* __restrict__ u,
+    const float* __restrict__ Wmunu,
+    const float* __restrict__ pi_b,
+    const float* __restrict__ kept,
+    const int* __restrict__ cells, int n, int Ncells,
+    float* __restrict__ out);
+
 // Pack ideal-hydro output for the down-sampled evolution grid (Phase 2b).
 // One thread per output cell; reads snap_curr (epsilon, u) and the device EOS
 // tables, writes 8 floats per cell into `out` in fluidCell_ideal field order

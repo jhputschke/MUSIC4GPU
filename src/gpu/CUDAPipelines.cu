@@ -59,6 +59,10 @@ CUDAPipelines& CUDAPipelines::instance() {
 }
 
 CUDAPipelines::~CUDAPipelines() {
+    if (gather_cells_dev_)  cudaFree(gather_cells_dev_);
+    if (gather_out_dev_)    cudaFree(gather_out_dev_);
+    if (gather_cells_host_) cudaFreeHost(gather_cells_host_);
+    if (gather_out_host_)   cudaFreeHost(gather_out_host_);
     if (copy_event_) {
         cudaEventDestroy(static_cast<cudaEvent_t>(copy_event_));
         copy_event_ = nullptr;
@@ -361,6 +365,82 @@ bool CUDAPipelines::read_state(const void* state, float* host, size_t floats) {
     if (!state || !host) return false;
     return cudaMemcpy(host, state, floats * sizeof(float), cudaMemcpyDefault)
         == cudaSuccess;
+}
+
+// ── freeze-out search: keep a step, gather its cells ────────────────────────
+
+size_t CUDAPipelines::curr_state_floats(const GPUGrid& gpu) {
+    return state_floats(gpu) / 2;
+}
+
+bool CUDAPipelines::keep_curr(GPUGrid& gpu, void* state) {
+    if (!ready_ || !state) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    float* dst = static_cast<float*>(state);
+    bool ok = true;
+    // ordered after the kernels that wrote snap_curr and before those that
+    // overwrite it (the same stream), so no synchronization here
+    for_each_snapshot_array(gpu.snap_curr, nc, [&](float* a, size_t n) {
+        ok = ok && cudaMemcpyAsync(dst, a, n * sizeof(float),
+                                   cudaMemcpyDefault, stream) == cudaSuccess;
+        dst += n;
+    });
+    return ok;
+}
+
+bool CUDAPipelines::gather_cells(GPUGrid& gpu, const void* kept,
+                                 const int* cells, int n, float* host_curr,
+                                 float* host_kept) {
+    if (!ready_ || n < 0 || (kept && !host_kept)) return false;
+    if (n == 0) return true;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const int nf = 3 + GPU_U_COMPS + GPU_WMUNU_COMPS;          // 21
+    const size_t need = static_cast<size_t>(n);
+    if (gather_cap_ < need) {
+        if (gather_cells_dev_)  cudaFree(gather_cells_dev_);
+        if (gather_out_dev_)    cudaFree(gather_out_dev_);
+        if (gather_cells_host_) cudaFreeHost(gather_cells_host_);
+        if (gather_out_host_)   cudaFreeHost(gather_out_host_);
+        gather_cells_dev_  = nullptr;
+        gather_out_dev_    = nullptr;
+        gather_cells_host_ = nullptr;
+        gather_out_host_   = nullptr;
+        gather_cap_        = 0;
+        // room to grow; the surface's cells are a few % of the grid
+        const size_t cap = std::max(need + need / 2,
+                                    static_cast<size_t>(gpu.Ncells()) / 16);
+        const size_t out_bytes = 2 * nf * cap * sizeof(float);
+        if (cudaMalloc(&gather_cells_dev_, cap * sizeof(int)) != cudaSuccess
+            || cudaMalloc(&gather_out_dev_, out_bytes) != cudaSuccess
+            || cudaMallocHost(&gather_cells_host_, cap * sizeof(int)) != cudaSuccess
+            || cudaMallocHost(&gather_out_host_, out_bytes) != cudaSuccess) {
+            return false;
+        }
+        gather_cap_ = cap;
+    }
+    std::memcpy(gather_cells_host_, cells, need * sizeof(int));
+    if (cudaMemcpyAsync(gather_cells_dev_, gather_cells_host_,
+                        need * sizeof(int), cudaMemcpyHostToDevice,
+                        stream) != cudaSuccess) return false;
+    const GPUSnapshot& s = gpu.snap_curr;
+    const int block = 256;
+    gpu_gather_cells<<<(n + block - 1) / block, block, 0, stream>>>(
+        s.epsilon, s.rhob, s.u, s.Wmunu, s.pi_b,
+        static_cast<const float*>(kept), gather_cells_dev_, n, gpu.Ncells(),
+        gather_out_dev_);
+    check_launch("gpu_gather_cells");
+    const size_t out_floats = (kept ? 2 : 1) * nf * need;
+    if (cudaMemcpyAsync(gather_out_host_, gather_out_dev_,
+                        out_floats * sizeof(float), cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess) return false;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+    std::memcpy(host_curr, gather_out_host_, nf * need * sizeof(float));
+    if (kept) {
+        std::memcpy(host_kept, gather_out_host_ + nf * need,
+                    nf * need * sizeof(float));
+    }
+    return true;
 }
 
 // ── pack_evolution_ideal ──────────────────────────────────────────────────────

@@ -350,8 +350,7 @@ void Evolve::take_checkpoint(int it, double tau, int iFreezeStart, int frozen,
 }
 
 bool Evolve::restore_checkpoint(const MusicCheckpoint &c, Fields* fpPrev,
-                                Fields* fpCurr, Fields &freezeoutFieldPrev,
-                                Fields &freezeoutFieldCurr,
+                                Fields* fpCurr, FreezeoutSteps &fo,
                                 double &eps_max_cur,
                                 HydroinfoMUSIC &hydro_info) {
 #ifdef MUSIC_USE_GPU
@@ -362,11 +361,9 @@ bool Evolve::restore_checkpoint(const MusicCheckpoint &c, Fields* fpPrev,
         FO_nBvsEta_ = c.FO_nBvsEta;
         FO_nQvsEta_ = c.FO_nQvsEta;
         FO_nSvsEta_ = c.FO_nSvsEta;
-        // Cornelius' previous check: the arenas of the checkpoint's step, as
-        // the freeze-out stage stored them there
-        advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-        store_previous_step_for_freezeout(*fpPrev, freezeoutFieldPrev);
-        store_previous_step_for_freezeout(*fpCurr, freezeoutFieldCurr);
+        // Cornelius' previous check: the checkpoint's step, as the
+        // freeze-out stage stored it there
+        freezeout_store_step(fo, *fpPrev, *fpCurr);
     }
     emax_last_check_ = c.emax_last_check;
     eps_max_cur = c.eps_max_cur;
@@ -380,8 +377,8 @@ bool Evolve::restore_checkpoint(const MusicCheckpoint &c, Fields* fpPrev,
     }
     return true;
 #else
-    (void)c; (void)fpPrev; (void)fpCurr; (void)freezeoutFieldPrev;
-    (void)freezeoutFieldCurr; (void)eps_max_cur; (void)hydro_info;
+    (void)c; (void)fpPrev; (void)fpCurr; (void)fo; (void)eps_max_cur;
+    (void)hydro_info;
     return false;
 #endif
 }
@@ -522,10 +519,19 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
     Fields* fpCurr = &arenaFieldsCurr;
     Fields* fpNext = &arenaFieldsNext;
 
-    Fields freezeoutFieldPrev(arenaFieldsCurr.nX(), arenaFieldsCurr.nY(),
-                              arenaFieldsCurr.nEta());
-    Fields freezeoutFieldCurr(arenaFieldsCurr.nX(), arenaFieldsCurr.nY(),
-                              arenaFieldsCurr.nEta());
+    // the steps the freeze-out search compares
+    FreezeoutSteps fo;
+    if (DATA.freeze_out_surface != 0) {
+        for (int k = 0; k < 2; k++) {
+            fo.curr[k].resizeFields(arenaFieldsCurr.nX(), arenaFieldsCurr.nY(),
+                                    arenaFieldsCurr.nEta());
+            if (DATA.output_vorticity == 1) {
+                fo.prev[k].resizeFields(arenaFieldsCurr.nX(),
+                                        arenaFieldsCurr.nY(),
+                                        arenaFieldsCurr.nEta());
+            }
+        }
+    }
 
     int it = 0;
     nonfinite_total_ = 0;
@@ -582,8 +588,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         } else if (verify_resume_) {
             verify_it = c.it;
             resume_status_ = "run from tau0 to verify the checkpoint";
-        } else if (restore_checkpoint(c, fpPrev, fpCurr, freezeoutFieldPrev,
-                                      freezeoutFieldCurr, eps_max_cur,
+        } else if (restore_checkpoint(c, fpPrev, fpCurr, fo, eps_max_cur,
                                       hydro_info_ptr)) {
             resume_it = c.it;
             resume_frozen = c.frozen;
@@ -630,15 +635,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         if (it == iFreezeStart && DATA.freeze_out_surface == 0) {
             emax_last_check_ = max_energy_density_raw(*fpCurr);
         } else if (it == iFreezeStart) {
-#ifdef MUSIC_USE_GPU
-            // store_previous_step_for_freezeout reads the full arenas, so
-            // bring snap_curr/snap_prev back into the host Fields first if
-            // the GPU has been authoritative.  Read-only — leaves
-            // gpu_owns_state_ set so the next AdvanceIt rk0 skips its H2D.
-            advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
-            store_previous_step_for_freezeout(*fpPrev, freezeoutFieldPrev);
-            store_previous_step_for_freezeout(*fpCurr, freezeoutFieldCurr);
+            freezeout_store_step(fo, *fpPrev, *fpCurr);
         }
 
         //if (DATA.Initial_profile == 13) {
@@ -892,22 +889,8 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             }
             // avoid freeze-out at the first time step
             if ((it - iFreezeStart)%facTau == 0 && it > iFreezeStart) {
-#ifdef MUSIC_USE_GPU
-                // Sync the host arenas only on the steps where the surface
-                // is actually evaluated (every facTau steps), not every step.
-                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
                 bench::Timer _bt_fo("evolve.freezeout_surface");
-                if (!DATA.boost_invariant) {
-                    frozen = FindFreezeOutSurface_Cornelius(
-                                tau, *fpPrev, *fpCurr,
-                                freezeoutFieldPrev, freezeoutFieldCurr);
-                } else {
-                    frozen = FindFreezeOutSurface_boostinvariant_Cornelius(
-                                tau, *fpCurr, freezeoutFieldCurr);
-                }
-                store_previous_step_for_freezeout(*fpPrev, freezeoutFieldPrev);
-                store_previous_step_for_freezeout(*fpCurr, freezeoutFieldCurr);
+                frozen = freezeout_check(fo, tau, *fpPrev, *fpCurr);
             }
             if (DATA.reRunHydro) {
                 return(-1);
@@ -1280,6 +1263,201 @@ void Evolve::store_previous_step_for_freezeout(Fields &arenaCurr,
 }
 
 
+// ── Freeze-out steps ────────────────────────────────────────────────────────
+//
+// Cornelius compares the step being checked with the previously checked one,
+// facTau steps earlier (FreezeoutSteps).  The step being checked goes into
+// slot k; afterwards the slots swap roles, so nothing is copied from the one
+// into the other.
+//
+// While the GPU holds the state, only e of the step comes to the host.  The
+// cubes the search visits are found from e alone (freezeout_cubes_to_visit),
+// and the other fields are gathered for their corner cells only: from the
+// GPU's current state, and from a copy of the previously checked step kept on
+// the GPU.  The search then reads the same values as from a full copy (the
+// GPU's floats as doubles), so the surface is the same, cell for cell.
+// MUSIC_FREEZEOUT_GATHER=0 copies every field of every cell instead.
+
+FreezeoutSteps::~FreezeoutSteps() {
+    free_checkpoint_gpu_state(gpu_state);
+}
+
+//! the e scan and the gather (not for the boost-invariant search or the
+//! vorticity output, which read more than the cube corners)
+bool Evolve::freezeout_gather() const {
+    static const bool off = [] {
+        const char* e = getenv("MUSIC_FREEZEOUT_GATHER");
+        return e && strcmp(e, "0") == 0;
+    }();
+    return !off && !DATA.boost_invariant && DATA.output_vorticity == 0;
+}
+
+//! the current step as the one the next check compares with
+void Evolve::freezeout_store_step(FreezeoutSteps &fo, Fields &prev,
+                                  Fields &curr) {
+    Fields &dst = fo.curr[fo.k];
+    Fields* dst_prev = (DATA.output_vorticity == 1) ? &fo.prev[fo.k] : nullptr;
+    fo.kept_on_gpu = false;
+#ifdef MUSIC_USE_GPU
+    if (advance.gpu_owns_state()) {
+        if (freezeout_gather() && advance.copy_epsilon_to(dst)
+                && advance.keep_state(fo.gpu_state)) {
+            fo.kept_on_gpu = true;
+        } else {
+            advance.copy_state_to(dst_prev, dst);
+        }
+    } else
+#endif
+    {
+        store_previous_step_for_freezeout(curr, dst);
+        if (dst_prev) store_previous_step_for_freezeout(prev, *dst_prev);
+    }
+    fo.k ^= 1;
+}
+
+//! the freeze-out search between the current step and the previous check's
+int Evolve::freezeout_check(FreezeoutSteps &fo, double tau, Fields &prev,
+                            Fields &curr) {
+    const bool vorticity = (DATA.output_vorticity == 1);
+    Fields &now  = fo.curr[fo.k];
+    Fields &last = fo.curr[fo.k ^ 1];
+    Fields* now_prev = vorticity ? &fo.prev[fo.k] : nullptr;
+    const unsigned char* visit = nullptr;
+    bool kept_now = false;
+#ifdef MUSIC_USE_GPU
+    if (advance.gpu_owns_state()) {
+        if (freezeout_gather() && advance.copy_epsilon_to(now)) {
+            freezeout_cubes_to_visit(fo, now, last);
+            // the gather reads the kept copy before keep_state replaces it
+            if (advance.gather_cells(fo.kept_on_gpu ? fo.gpu_state : nullptr,
+                                     fo.cells, now, &last)) {
+                visit = fo.visit.data();
+                kept_now = advance.keep_state(fo.gpu_state);
+            }
+        }
+        if (!visit) {
+            // everything, of both steps
+            advance.copy_state_to(now_prev, now);
+            if (fo.kept_on_gpu && !advance.copy_kept_to(fo.gpu_state, last)) {
+                music_message << "Freeze-out: the previous step is not "
+                              << "readable from the GPU.";
+                music_message.flush("error");
+                exit(1);
+            }
+        }
+    } else
+#endif
+    {
+        store_previous_step_for_freezeout(curr, now);
+        if (now_prev) store_previous_step_for_freezeout(prev, *now_prev);
+    }
+    // the steps before the two, for the vorticity output only
+    Fields &now_p  = vorticity ? *now_prev : now;
+    Fields &last_p = vorticity ? fo.prev[fo.k ^ 1] : last;
+    int frozen;
+    if (!DATA.boost_invariant) {
+        frozen = FindFreezeOutSurface_Cornelius(tau, now_p, now, last_p, last,
+                                                visit);
+    } else {
+        frozen = FindFreezeOutSurface_boostinvariant_Cornelius(tau, now, last);
+    }
+    // the next check reads this step's gathered cells from the GPU's copy,
+    // or, without one, everything from the host
+    fo.kept_on_gpu = (visit != nullptr) && kept_now;
+#ifdef MUSIC_USE_GPU
+    if (visit && !kept_now) advance.copy_state_to(nullptr, now);
+#endif
+    fo.k ^= 1;
+    return frozen;
+}
+
+//! The cubes FindFreezeOutSurface_Cornelius_XY looks at: those its test
+//! finds crossed by a surface of epsFO_list (2) and those with a non-finite
+//! e at a corner (1, skipped there with a warning), in fo.visit by the
+//! cube's first cell; and the corner cells of the crossed ones in fo.cells,
+//! each once.  Reads e of both steps only.
+void Evolve::freezeout_cubes_to_visit(FreezeoutSteps &fo, Fields &now,
+                                      Fields &last) {
+    bench::Timer _bt("evolve.freezeout_scan");
+    const int nx = now.nX();
+    const int ny = now.nY();
+    const int neta = now.nEta();
+    const int fac_x = DATA.fac_x;
+    const int fac_y = DATA.fac_y;
+    const int fac_eta = 1;
+    const size_t ncells = static_cast<size_t>(nx)*ny*neta;
+    fo.visit.assign(ncells, 0);
+    std::vector<double> eps_list;
+    for (const double eps : epsFO_list) eps_list.push_back(eps/hbarc);
+    const std::vector<double> &ec = now.e_;
+    const std::vector<double> &ep = last.e_;
+    const int dx = fac_x;
+    const int dy = nx*fac_y;
+    const int de = nx*ny*fac_eta;
+
+    // as FindFreezeOutSurface_Cornelius_XY: arena_current = now,
+    // arena_freezeout = last; the crossed cubes' cells per eta slice
+    const int nslices = (neta - fac_eta + fac_eta - 1)/fac_eta;
+    std::vector<std::vector<int>> crossed(nslices);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int islice = 0; islice < nslices; islice++) {
+        const int ieta = islice*fac_eta;
+        for (int ix = 0; ix < nx - fac_x; ix += fac_x)
+        for (int iy = 0; iy < ny - fac_y; iy += fac_y) {
+            const int Idx000 = now.getFieldIdx(ix, iy, ieta);
+            const int Idx100 = Idx000 + dx;
+            const int Idx010 = Idx000 + dy;
+            const int Idx110 = Idx000 + dx + dy;
+            const int Idx001 = Idx000 + de;
+            const int Idx101 = Idx000 + dx + de;
+            const int Idx011 = Idx000 + dy + de;
+            const int Idx111 = Idx000 + dx + dy + de;
+            const int idx[8] = {Idx000, Idx100, Idx010, Idx110,
+                                Idx001, Idx101, Idx011, Idx111};
+            bool finite = true;
+            for (int i = 0; i < 8; i++) {
+                finite = finite && std::isfinite(ec[idx[i]])
+                                && std::isfinite(ep[idx[i]]);
+            }
+            if (!finite) {
+                fo.visit[Idx000] = 1;
+                continue;
+            }
+            for (const double epsFO : eps_list) {
+                // Cornelius_XY's test, term for term
+                int intersect = 1;
+                if ((ec[Idx111] - epsFO)*(ep[Idx000] - epsFO) > 0.)
+                if ((ec[Idx100] - epsFO)*(ep[Idx011] - epsFO) > 0.)
+                if ((ec[Idx010] - epsFO)*(ep[Idx101] - epsFO) > 0.)
+                if ((ec[Idx001] - epsFO)*(ep[Idx110] - epsFO) > 0.)
+                if ((ec[Idx110] - epsFO)*(ep[Idx001] - epsFO) > 0.)
+                if ((ec[Idx101] - epsFO)*(ep[Idx010] - epsFO) > 0.)
+                if ((ec[Idx011] - epsFO)*(ep[Idx100] - epsFO) > 0.)
+                if ((ec[Idx000] - epsFO)*(ep[Idx111] - epsFO) > 0.)
+                    intersect = 0;
+                if (intersect) {
+                    fo.visit[Idx000] = 2;
+                    crossed[islice].insert(crossed[islice].end(), idx, idx + 8);
+                    break;
+                }
+            }
+        }
+    }
+    // each corner once (fo.listed is all 0 between calls)
+    fo.listed.resize(ncells, 0);
+    fo.cells.clear();
+    for (const auto &c : crossed) {
+        for (const int i : c) {
+            if (!fo.listed[i]) {
+                fo.listed[i] = 1;
+                fo.cells.push_back(i);
+            }
+        }
+    }
+    for (const int i : fo.cells) fo.listed[i] = 0;
+}
+
+
 void Evolve::AdvanceRK(double tau, Fields* &fpPrev, Fields* &fpCurr,
                        Fields* &fpNext) {
     // control function for Runge-Kutta evolution in tau
@@ -1395,7 +1573,8 @@ bool Evolve::transverse_edge_is_hot(Fields &arena_current, double eps_fo) {
 // Cornelius freeze out  (C. Shen, 11/2014)
 int Evolve::FindFreezeOutSurface_Cornelius(double tau,
         Fields &arena_prev, Fields &arena_current,
-        Fields &arena_freezeout_prev, Fields &arena_freezeout) {
+        Fields &arena_freezeout_prev, Fields &arena_freezeout,
+        const unsigned char* visit) {
     const int neta = arena_current.nEta();
     const int fac_eta = 1;
     int intersections = 0;
@@ -1422,7 +1601,7 @@ int Evolve::FindFreezeOutSurface_Cornelius(double tau,
             intersections += FindFreezeOutSurface_Cornelius_XY(
                 tau, ieta, arena_prev, arena_current,
                 arena_freezeout_prev, arena_freezeout, thread_id, epsFO,
-                slice_cells[islice]);
+                slice_cells[islice], visit);
         }
         // No reserve(size + n_new) here: an exact reserve every pass defeats
         // the vector's geometric growth and re-copies the whole accumulated
@@ -1449,7 +1628,8 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                                               Fields &arena_freezeout_prev,
                                               Fields &arena_freezeout,
                                               int thread_id, double epsFO,
-                                              std::vector<SurfaceCell> &surface_out) {
+                                              std::vector<SurfaceCell> &surface_out,
+                                              const unsigned char* visit) {
     const bool surface_in_binary = DATA.freeze_surface_in_binary;
     const int nx = arena_current.nX();
     const int ny = arena_current.nY();
@@ -1521,6 +1701,7 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
         for (int iy = 0; iy < ny - fac_y; iy += fac_y) {
             double y = iy*(DATA.delta_y) - (DATA.y_size/2.0);
             int Idx000 = arena_current.getFieldIdx(ix, iy, ieta);
+            if (visit && !visit[Idx000]) continue;
             int Idx100 = arena_current.getFieldIdx(ix+fac_x, iy, ieta);
             int Idx110 = arena_current.getFieldIdx(ix+fac_x, iy+fac_y, ieta);
             int Idx010 = arena_current.getFieldIdx(ix, iy+fac_y, ieta);

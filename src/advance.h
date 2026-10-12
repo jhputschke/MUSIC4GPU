@@ -172,6 +172,24 @@ class Advance {
     bool   restore_gpu_state(const void* state, Fields &arenaFieldsCurr);
     bool   read_gpu_state(std::vector<float> &host);
     static void free_gpu_state(void* state);
+    // The freeze-out search (evolve.cpp, freeze-out steps).  Only while
+    // gpu_owns_state(); they fill Fields other than the arenas and leave the
+    // sync caches below alone.
+    //   copy_state_to(prev, curr): snap_curr, and snap_prev unless prev is
+    //       null, into host Fields
+    //   copy_epsilon_to(curr): e of snap_curr only
+    //   keep_state(state): a copy of snap_curr on the GPU, in `state`
+    //       (allocated on the first call; free_gpu_state)
+    //   gather_cells(kept, cells, curr, kept_into): every field of the
+    //       listed cells, of snap_curr into curr and of `kept` (unless null)
+    //       into kept_into
+    bool copy_state_to(Fields *prev, Fields &curr);
+    bool copy_epsilon_to(Fields &curr);
+    bool keep_state(void* &state);
+    bool gather_cells(const void* kept, const std::vector<int> &cells,
+                      Fields &curr, Fields *kept_into);
+    //   copy_kept_to(state, f): all of a keep_state copy into host Fields
+    bool copy_kept_to(const void* state, Fields &f);
     // Cell updates since the last call in which the GPU set a non-finite
     // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();
@@ -223,6 +241,9 @@ class Advance {
     // the start of the next AdvanceIt substep (state changed on GPU).
     bool host_curr_fresh_ = false;
     bool host_prev_fresh_ = false;
+    // gather_cells' host buffers (21 floats per cell each)
+    std::vector<float> gather_curr_;
+    std::vector<float> gather_kept_;
    public:
 #endif
 
