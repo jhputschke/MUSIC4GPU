@@ -229,7 +229,8 @@ Changes that need no setting:
 - The no-surface stop test's edge check is a GPU reduction (CUDA kernel; a host scan of the
   shared buffer on Metal), with no grid copy.
 
-The Metal parts of the checkpoint and of the edge check have not been compiled or run yet.
+The Metal parts of the checkpoint and of the edge check were built and checked on an M3 Max
+(2026-10-11): outputs bit-identical to the code before these changes.
 
 ### Benchmarks (indicative)
 
