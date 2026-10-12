@@ -17,6 +17,22 @@
 #include "music_checkpoint.h"
 #include "surfaceCell.h"
 
+//! The two steps the freeze-out search compares (evolve.cpp, freeze-out
+//! steps): the step being checked goes into slot k, the other slot holds the
+//! previously checked one; then the slots swap roles.
+struct FreezeoutSteps {
+    Fields curr[2];
+    Fields prev[2];             //!< the step before each; vorticity output only
+    int k = 0;
+    //! the previous checked step's fields other than e are only in gpu_state
+    bool kept_on_gpu = false;
+    void* gpu_state = nullptr;  //!< a GPU copy of the previous checked step
+    std::vector<unsigned char> visit;   //!< cubes to visit, by their first cell
+    std::vector<int> cells;             //!< cells to gather
+    std::vector<unsigned char> listed;  //!< scratch for listing them once
+    ~FreezeoutSteps();
+};
+
 // this is a control class for the hydrodynamic evolution
 class Evolve {
  private:
@@ -64,9 +80,16 @@ class Evolve {
                          double eps_max_cur, const std::string &key,
                          Fields &arena_current, HydroinfoMUSIC &hydro_info);
     bool restore_checkpoint(const MusicCheckpoint &c, Fields* fpPrev,
-                            Fields* fpCurr, Fields &freezeoutFieldPrev,
-                            Fields &freezeoutFieldCurr, double &eps_max_cur,
-                            HydroinfoMUSIC &hydro_info);
+                            Fields* fpCurr, FreezeoutSteps &fo,
+                            double &eps_max_cur, HydroinfoMUSIC &hydro_info);
+
+    // the freeze-out search's steps (evolve.cpp, freeze-out steps)
+    bool freezeout_gather() const;
+    void freezeout_store_step(FreezeoutSteps &fo, Fields &prev, Fields &curr);
+    int freezeout_check(FreezeoutSteps &fo, double tau, Fields &prev,
+                        Fields &curr);
+    void freezeout_cubes_to_visit(FreezeoutSteps &fo, Fields &now,
+                                  Fields &last);
     void verify_checkpoint(const MusicCheckpoint &c, int it, double tau,
                            int frozen, double eps_max_cur,
                            Fields &arena_current, HydroinfoMUSIC &hydro_info);
@@ -119,9 +142,11 @@ class Evolve {
     void FreezeOut_equal_tau_Surface_XY(double tau,
                                         int ieta, Fields &arena_current,
                                         int thread_id, double epsFO);
+    //! visit: only the cubes whose first cell is non-zero there (all if null)
     int FindFreezeOutSurface_Cornelius(double tau,
         Fields &arena_prev, Fields &arena_current,
-        Fields &arena_freezeout_prev, Fields &arena_freezeout);
+        Fields &arena_freezeout_prev, Fields &arena_freezeout,
+        const unsigned char* visit = nullptr);
 
     int FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                                           Fields &arena_prev,
@@ -129,7 +154,8 @@ class Evolve {
                                           Fields &arena_freezeout_prev,
                                           Fields &arena_freezeout,
                                           int thread_id, double epsFO,
-                                          std::vector<SurfaceCell> &surface_out);
+                                          std::vector<SurfaceCell> &surface_out,
+                                          const unsigned char* visit = nullptr);
     int FindFreezeOutSurface_boostinvariant_Cornelius(
                 double tau, Fields &arena_current, Fields &arena_freezeout);
 

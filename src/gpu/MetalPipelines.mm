@@ -357,6 +357,49 @@ bool MetalPipelines::read_state(const void* state, float* host, size_t floats) {
     return true;
 }
 
+// ── freeze-out search: keep a step, gather its cells ────────────────────────
+
+size_t MetalPipelines::curr_state_floats(const GPUGrid& gpu) {
+    return state_floats(gpu) / 2;
+}
+
+bool MetalPipelines::keep_curr(GPUGrid& gpu, void* state) {
+    if (!ready_ || !state) return false;
+    wait();
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    float* dst = static_cast<float*>(state);
+    for_each_snapshot_array(gpu.snap_curr, nc, [&](float* a, size_t n) {
+        std::memcpy(dst, a, n * sizeof(float));
+        dst += n;
+    });
+    return true;
+}
+
+bool MetalPipelines::gather_cells(GPUGrid& gpu, const void* kept,
+                                  const int* cells, int n, float* host_curr,
+                                  float* host_kept) {
+    if (!ready_ || n < 0 || (kept && !host_kept)) return false;
+    wait();
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    const size_t m  = static_cast<size_t>(n);
+    const GPUSnapshot& s = gpu.snap_curr;
+    const float* k = static_cast<const float*>(kept);
+    for (size_t j = 0; j < m; ++j) {
+        const size_t c = static_cast<size_t>(cells[j]);
+        host_curr[j]     = s.epsilon[c];
+        host_curr[m + j] = s.rhob[c];
+        for (int q = 0; q < GPU_U_COMPS; ++q)
+            host_curr[(2 + q)*m + j] = s.u[q*nc + c];
+        for (int q = 0; q < GPU_WMUNU_COMPS; ++q)
+            host_curr[(6 + q)*m + j] = s.Wmunu[q*nc + c];
+        host_curr[20*m + j] = s.pi_b[c];
+        if (k) {
+            for (int f = 0; f < 21; ++f) host_kept[f*m + j] = k[f*nc + c];
+        }
+    }
+    return true;
+}
+
 // ── wait ──────────────────────────────────────────────────────────────────────
 
 void MetalPipelines::wait() {

@@ -92,6 +92,13 @@ public:
     bool  restore_snapshots(GPUGrid& gpu, const void* state);
     bool  read_state(const void* state, float* host, size_t floats);
 
+    // The freeze-out search (evolve.cpp), as CUDAPipelines::keep_curr and
+    // gather_cells; on the host, like reduce_max (shared memory).
+    static size_t curr_state_floats(const GPUGrid& gpu);
+    bool  keep_curr(GPUGrid& gpu, void* state);
+    bool  gather_cells(GPUGrid& gpu, const void* kept, const int* cells,
+                       int n, float* host_curr, float* host_kept);
+
     // Cell updates in which gpu_first_rk_step_w_full set a non-finite
     // W^{mu nu} or Pi to 0 since the last call (resets the count).  Waits for
     // the last committed command buffer; counts from an open batch arrive at

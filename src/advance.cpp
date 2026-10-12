@@ -380,6 +380,88 @@ void Advance::free_gpu_state(void* state) {
     if (state) GPUPipelines::instance().free_state(state);
 }
 
+bool Advance::copy_state_to(Fields *prev, Fields &curr) {
+    if (!gpu_owns_state_ || !gpu_ready_) return false;
+    bench::Timer _bt("advance.freezeout_copy_state");
+    gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_curr, curr);
+    gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_curr, curr);
+    if (prev) {
+        gpu_grid_.copy_primitives_to_cpu(gpu_grid_.snap_prev, *prev);
+        gpu_grid_.copy_wmunu_to_cpu     (gpu_grid_.snap_prev, *prev);
+    }
+    return true;
+}
+
+bool Advance::copy_epsilon_to(Fields &curr) {
+    if (!gpu_owns_state_ || !gpu_ready_) return false;
+    bench::Timer _bt("advance.freezeout_copy_e");
+    gpu_grid_.copy_epsilon_to_cpu(gpu_grid_.snap_curr, curr);
+    return true;
+}
+
+bool Advance::keep_state(void* &state) {
+    if (!gpu_owns_state_ || !gpu_ready_) return false;
+    auto& mp = GPUPipelines::instance();
+    if (!state) state = mp.alloc_state(GPUPipelines::curr_state_floats(gpu_grid_));
+    return state && mp.keep_curr(gpu_grid_, state);
+}
+
+bool Advance::gather_cells(const void* kept, const std::vector<int> &cells,
+                           Fields &curr, Fields *kept_into) {
+    if (!gpu_owns_state_ || !gpu_ready_ || (kept && !kept_into)) return false;
+    bench::Timer _bt("advance.freezeout_gather");
+    const size_t n = cells.size();
+    const int nf = 3 + GPU_U_COMPS + GPU_WMUNU_COMPS;
+    gather_curr_.resize(nf * n);
+    gather_kept_.resize(kept ? nf * n : 0);
+    if (!GPUPipelines::instance().gather_cells(
+                gpu_grid_, kept, cells.data(), static_cast<int>(n),
+                gather_curr_.data(), kept ? gather_kept_.data() : nullptr)) {
+        return false;
+    }
+    // field f of cell j at [f*n + j]: epsilon, rhob, u[4], Wmunu[14], pi_b
+    auto scatter = [&](const std::vector<float> &g, Fields &f) {
+        std::vector<double>* dst[21];
+        dst[0] = &f.e_;
+        dst[1] = &f.rhob_;
+        for (int m = 0; m < GPU_U_COMPS; m++) dst[2 + m] = &f.u_[m];
+        for (int m = 0; m < GPU_WMUNU_COMPS; m++) dst[6 + m] = &f.Wmunu_[m];
+        dst[20] = &f.piBulk_;
+        for (int k = 0; k < nf; k++) {
+            double* d = dst[k]->data();
+            const float* src = g.data() + k*n;
+            for (size_t j = 0; j < n; j++) {
+                d[cells[j]] = static_cast<double>(src[j]);
+            }
+        }
+    };
+    scatter(gather_curr_, curr);
+    if (kept) scatter(gather_kept_, *kept_into);
+    return true;
+}
+
+bool Advance::copy_kept_to(const void* state, Fields &f) {
+    if (!gpu_ready_ || !state) return false;
+    std::vector<float> h(GPUPipelines::curr_state_floats(gpu_grid_));
+    if (!GPUPipelines::instance().read_state(state, h.data(), h.size())) {
+        return false;
+    }
+    // the snapshot's arrays in order: epsilon, rhob, u[4], Wmunu[14], pi_b
+    const size_t nc = static_cast<size_t>(gpu_grid_.Ncells());
+    std::vector<double>* dst[21];
+    dst[0] = &f.e_;
+    dst[1] = &f.rhob_;
+    for (int m = 0; m < GPU_U_COMPS; m++) dst[2 + m] = &f.u_[m];
+    for (int m = 0; m < GPU_WMUNU_COMPS; m++) dst[6 + m] = &f.Wmunu_[m];
+    dst[20] = &f.piBulk_;
+    for (int k = 0; k < 21; k++) {
+        for (size_t c = 0; c < nc; c++) {
+            (*dst[k])[c] = static_cast<double>(h[k*nc + c]);
+        }
+    }
+    return true;
+}
+
 // ── Feature support predicate ────────────────────────────────────────────────
 //
 // Gate the GPU dispatch on the configuration falling inside the support matrix

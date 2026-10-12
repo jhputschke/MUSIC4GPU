@@ -464,6 +464,20 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const 
     }
 }
 
+void GPUGrid::copy_epsilon_to_cpu(const GPUSnapshot& src, Fields& dst) const {
+    const float* s_eps = src.epsilon;
+    if (!g_cuda_coherent) {
+        cudaMemcpy(src.epsilon_stage, src.epsilon,
+                   static_cast<size_t>(Ncells_) * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        s_eps = src.epsilon_stage;
+    }
+    const int Ncells = Ncells_;
+    double* __restrict__ dst_e = dst.e_.data();
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < Ncells; ++c) dst_e[c] = static_cast<double>(s_eps[c]);
+}
+
 void GPUGrid::refresh_u_curr_stage() {
     // Discrete path only: bring snap_curr.u back to its pinned staging so the
     // host-side hydro-source pre-pass can read it after a snapshot rotation

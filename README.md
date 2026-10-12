@@ -218,6 +218,7 @@ PR #19 and branch `music2_restart`. Defaults keep the earlier behaviour.
 | `MUSIC::set_checkpoint_tau(tau)` | 0 (off) | Every run keeps a `MusicCheckpoint` (`src/music_checkpoint.h`) at its last freeze-out step whose RK step ends by τ, after that step's freeze-out stage: `snap_prev`/`snap_curr` (a copy on the GPU), the surface so far, the stop-test bookkeeping, the store's frames, and a key (the parameters that shape the evolution, a hash of the initial arena, the initial-state source's fingerprint). `get_checkpoint()` returns it. |
 | `MUSIC::set_resume_from(checkpoint)` | — | The next run starts from the checkpoint and enters its step at `AdvanceRK`, if the key matches, the needed surface and frames are there, and its own jet source adds nothing before that step. Otherwise it runs from τ0. `get_resume_status()` says which. One run only. X-SCAPE: `MpiMusic::set_checkpoint_tau` / `set_restart_from`, the jet leg of the two-stage chain starting from the background's state. GPU runs only. |
 | `MUSIC_RESTART_VERIFY=1` (env) | unset | A run given a checkpoint runs from τ0 instead, and at the checkpoint's step compares its state with it bit for bit (GPU state, surface, max e and counters, store frames); the log says `identical to the checkpoint` or what differs. |
+| `MUSIC_FREEZEOUT_GATHER=0` (env) | unset | The freeze-out search copies every field of every cell of the checked step from the GPU, instead of e alone and the fields of the cubes the surface crosses (below). The surface is the same either way; for comparisons. |
 
 Changes that need no setting:
 - Charge lists that are not evolved (`turn_on_rhob`, `turn_on_QS`) no longer trigger a string
@@ -228,6 +229,15 @@ Changes that need no setting:
   of managed memory. `MUSIC_CUDA_FORCE_DISCRETE=1` exercises that path on a coherent GPU.
 - The no-surface stop test's edge check is a GPU reduction (CUDA kernel; a host scan of the
   shared buffer on Metal), with no grid copy.
+- The freeze-out search (Cornelius, every `facTau` steps) no longer copies the GPU state into
+  the host arenas and then both arenas into the "previous step" buffers. Two buffers take the
+  checked steps in turn (`FreezeoutSteps`), and while the GPU holds the state only e comes to
+  the host: the cubes the surface crosses are found from e, and the other fields are gathered
+  for their corner cells only, from the GPU state and from a copy of the previously checked
+  step kept on the GPU (CUDA kernel `gpu_gather_cells`; a host gather from the shared buffers
+  on Metal). The surface is bit-identical. Not for the boost-invariant search or
+  `output_vorticity`, which read more than the cube corners: they take full copies, into the
+  same two buffers.
 
 The Metal parts of the checkpoint and of the edge check were built and checked on an M3 Max
 (2026-10-11): outputs bit-identical to the code before these changes.

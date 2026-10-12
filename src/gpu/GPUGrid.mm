@@ -305,6 +305,13 @@ void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const {
     }
 }
 
+void GPUGrid::copy_epsilon_to_cpu(const GPUSnapshot& src, Fields& dst) const {
+    const int Ncells = Ncells_;
+    double* __restrict__ dst_e = dst.e_.data();
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < Ncells; ++c) dst_e[c] = static_cast<double>(src.epsilon[c]);
+}
+
 void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const {
     const int Ncells = Ncells_;
     double* __restrict__ dst_e    = dst.e_   .data();

@@ -73,6 +73,17 @@ public:
     bool  restore_snapshots(GPUGrid& gpu, const void* state);
     bool  read_state(const void* state, float* host, size_t floats);
 
+    // The freeze-out search (evolve.cpp): keep_curr copies snap_curr into
+    // `state` (curr_state_floats() floats, alloc_state) on the compute
+    // stream.  gather_cells copies all fields (epsilon, rhob, u[4],
+    // Wmunu[14], pi_b) of the n cells cells[0..n) of snap_curr, and of `kept`
+    // unless it is null, to host memory, field-major: host_curr[f*n + j],
+    // host_kept[f*n + j].  Synchronizes.
+    static size_t curr_state_floats(const GPUGrid& gpu);
+    bool  keep_curr(GPUGrid& gpu, void* state);
+    bool  gather_cells(GPUGrid& gpu, const void* kept, const int* cells,
+                       int n, float* host_curr, float* host_kept);
+
     // Cell updates in which gpu_first_rk_step_w_full set a non-finite
     // W^{mu nu} or Pi to 0 since the last call (resets the count).
     // Synchronizes the compute stream.
@@ -122,4 +133,12 @@ private:
     // block is factored from this at dispatch time, adapting to Neta so 2-D
     // (Neta==1) grids don't waste the eta thread dimension.
     int   max_block_threads_ = 256;
+    // gather_cells: device buffers for the cell list and the gathered
+    // fields, and the pinned host buffers they are copied through; grown as
+    // needed (gather_cap_ cells)
+    int*   gather_cells_dev_  = nullptr;
+    float* gather_out_dev_    = nullptr;
+    int*   gather_cells_host_ = nullptr;
+    float* gather_out_host_   = nullptr;
+    size_t gather_cap_        = 0;
 };

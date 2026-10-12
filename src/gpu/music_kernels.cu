@@ -2018,6 +2018,33 @@ __global__ void gpu_reduce_max_eps_edge(
     }
 }
 
+// ── Gather the cells the freeze-out search reads ─────────────────────────────
+
+__global__ void gpu_gather_cells(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ rhob,
+    const float* __restrict__ u,
+    const float* __restrict__ Wmunu,
+    const float* __restrict__ pi_b,
+    const float* __restrict__ kept,
+    const int* __restrict__ cells, int n, int Ncells,
+    float* __restrict__ out)
+{
+    const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (j >= n) return;
+    const size_t c  = static_cast<size_t>(cells[j]);
+    const size_t nc = static_cast<size_t>(Ncells);
+    const size_t m  = static_cast<size_t>(n);
+    out[j]         = epsilon[c];
+    out[m + j]     = rhob[c];
+    for (int k = 0; k < 4; ++k)  out[(2 + k)*m + j] = u[k*nc + c];
+    for (int k = 0; k < 14; ++k) out[(6 + k)*m + j] = Wmunu[k*nc + c];
+    out[20*m + j]  = pi_b[c];
+    if (kept) {
+        for (int f = 0; f < 21; ++f) out[(21 + f)*m + j] = kept[f*nc + c];
+    }
+}
+
 __global__ void gpu_reduce_max_eps_rhob(
     const float* __restrict__ epsilon,
     const float* __restrict__ rhob,
