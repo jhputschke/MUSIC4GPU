@@ -136,14 +136,19 @@ class HydroSourceStrings : public HydroSourceBase {
     //! this function returns the energy source term J^\mu at a given point
     //! (tau, x, y, eta_s)
     //! The energy source reads the string and remnant lists, rhob the baryon
-    //! list, rhoq the baryon or electric list; with all four empty every one
+    //! list, rhoq the baryon or electric list; with all of them empty every one
     //! of them returns exactly zero.  With evolve_QCD_string_mode 4 that is
-    //! every step after the strings are deposited at the start.
+    //! every step after the strings are deposited at the start.  A charge that
+    //! is not evolved (turn_on_rhob, turn_on_QS) has no source, so its lists
+    //! do not count: 3dMCGlauber's electric-charge strings would otherwise
+    //! cost a full source fill of zeros at many later steps.
     bool has_active_sources_current_tau() const override {
-        return(!(QCD_strings_list_current_tau.empty()
-                 && QCD_strings_remnant_list_current_tau.empty()
-                 && QCD_strings_baryon_list_current_tau.empty()
-                 && QCD_strings_electric_list_current_tau.empty()));
+        const bool baryon = !QCD_strings_baryon_list_current_tau.empty();
+        const bool electric = !QCD_strings_electric_list_current_tau.empty();
+        return(!QCD_strings_list_current_tau.empty()
+               || !QCD_strings_remnant_list_current_tau.empty()
+               || (DATA.turn_on_rhob == 1 && baryon)
+               || (DATA.turn_on_QS == 1 && (baryon || electric)));
     }
 
     void get_hydro_energy_source(const double tau, const double x,
