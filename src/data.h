@@ -225,6 +225,11 @@ typedef struct init_data {
     // 3D runs also check_conservation_law.  N=1 (default) preserves legacy
     // every-step behavior; larger N skips the calls on non-matching steps.
     int output_diagnostics_every_N_timesteps;
+    //! 1 (default): write momentum_anisotropy_tau_*.dat and
+    //! eccentricities_evo_{ed,nB}_tau_*.dat at four fixed steps after the
+    //! freeze-out search starts (Cell_info::output_momentum_anisotropy_vs_etas,
+    //! serial, EOS calls per cell); 0: skip them.
+    int output_momentum_anisotropy_vs_etas;
     bool output_hydro_params_header;
     double output_evolution_T_cut;
     double output_evolution_e_cut;

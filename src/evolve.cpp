@@ -337,8 +337,9 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             //}
         }
 
-        if (it == iFreezeStart || it == iFreezeStart + 10
-            || it == iFreezeStart + 30 || it == iFreezeStart + 50) {
+        if (DATA.output_momentum_anisotropy_vs_etas == 1
+            && (it == iFreezeStart || it == iFreezeStart + 10
+                || it == iFreezeStart + 30 || it == iFreezeStart + 50)) {
 #ifdef MUSIC_USE_GPU
             advance.sync_curr_from_gpu_readonly(*fpCurr);
 #endif
