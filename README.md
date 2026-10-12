@@ -171,8 +171,9 @@ bug fixes and features the CUDA and Metal back-ends have since received:
   W/Π guard; PR #13, [`docs/VacReset_BUG.md`](docs/VacReset_BUG.md));
 - the parallel, deterministic freeze-out surface with the surface pressure initialised (#12);
 - the X-SCAPE jet source slot (liquefier droplets), the `freeze_out_surface` switch (#9),
-  the source-fill speed-ups (#10), the `StringFind4` EOF guard (#11), and releasing the
-  evolution store's memory (#15);
+  the source-fill speed-ups (#10), the `StringFind4` EOF guard (#11), releasing the
+  evolution store's memory (#15), less host work per run (#19), and `MusicCheckpoint`
+  (branch `music2_restart`);
 - the CPU-vs-GPU validation above (#16).
 
 Use CUDA or Metal for productions; the Kokkos branch needs these changes merged in, and its
@@ -203,6 +204,32 @@ slower:
 - Finite net-baryon EOS / μ_B-dependent shear (the GPU EOS table is sampled at rhob = 0)
 - μ_B-dependent shear multiplier (`muB_dependent_shear_to_s != 0`)
 - Cooper–Frye freeze-out / Cornelius surface finding, initial-condition construction, evolution output
+
+### Settings for X-SCAPE productions
+
+The rest of a run's host work, and how to switch it, for the X-SCAPE productions. These
+changes came with the bit-identical CPU fixes of js-contrib's `docs/Plans/REPORT_CPU_GPU.md`,
+PR #19 and branch `music2_restart`. Defaults keep the earlier behaviour.
+
+| setting | default | effect |
+|---|---|---|
+| `output_momentum_anisotropy_vs_etas` (input file, `set_parameter`) | 1 | 0 skips `Cell_info::output_momentum_anisotropy_vs_etas` at the four early steps of a run: the `momentum_anisotropy_tau_*.dat` / `eccentricities_evo_*_tau_*.dat` files, a serial pass over every cell and a GPU → host copy each. X-SCAPE: `<Hydro><MUSIC><output_momentum_anisotropy_vs_etas>`; the js-contrib production XMLs set 0. |
+| `store_hydro_info_frames` (input file, `set_parameter`) | 1 | With `store_hydro_info_in_memory 1`, 0 keeps the store's grid and τ bookkeeping (`get_ntau`, `hydro_tau_max`) but packs and stores no frame and reserves no memory for one: for an instance whose evolution nobody reads. X-SCAPE: `MpiMusic::set_store_evolution(false)`. |
+| `MUSIC::set_checkpoint_tau(tau)` | 0 (off) | Every run keeps a `MusicCheckpoint` (`src/music_checkpoint.h`) at its last freeze-out step whose RK step ends by τ, after that step's freeze-out stage: `snap_prev`/`snap_curr` (a copy on the GPU), the surface so far, the stop-test bookkeeping, the store's frames, and a key (the parameters that shape the evolution, a hash of the initial arena, the initial-state source's fingerprint). `get_checkpoint()` returns it. |
+| `MUSIC::set_resume_from(checkpoint)` | — | The next run starts from the checkpoint and enters its step at `AdvanceRK`, if the key matches, the needed surface and frames are there, and its own jet source adds nothing before that step. Otherwise it runs from τ0. `get_resume_status()` says which. One run only. X-SCAPE: `MpiMusic::set_checkpoint_tau` / `set_restart_from`, the jet leg of the two-stage chain starting from the background's state. GPU runs only. |
+| `MUSIC_RESTART_VERIFY=1` (env) | unset | A run given a checkpoint runs from τ0 instead, and at the checkpoint's step compares its state with it bit for bit (GPU state, surface, max e and counters, store frames); the log says `identical to the checkpoint` or what differs. |
+
+Changes that need no setting:
+- Charge lists that are not evolved (`turn_on_rhob`, `turn_on_QS`) no longer trigger a string
+  source fill of zeros.
+- The stored frames are packed straight into the end of the in-memory store, whose reserved
+  memory is `madvise(MADV_HUGEPAGE)`'d on Linux.
+- On discrete CUDA GPUs the pack goes through a device buffer and a pinned host buffer instead
+  of managed memory. `MUSIC_CUDA_FORCE_DISCRETE=1` exercises that path on a coherent GPU.
+- The no-surface stop test's edge check is a GPU reduction (CUDA kernel; a host scan of the
+  shared buffer on Metal), with no grid copy.
+
+The Metal parts of the checkpoint and of the edge check have not been compiled or run yet.
 
 ### Benchmarks (indicative)
 
