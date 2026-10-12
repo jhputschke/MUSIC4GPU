@@ -1,5 +1,6 @@
 // Copyright 2019 Chun Shen
 
+#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -69,6 +70,18 @@ double HydroSourceStrings::getStringEndTau(
 void HydroSourceStrings::read_in_QCD_strings_and_partons(
         std::vector< std::vector<double> > QCDStringList_in) {
     music_message.info("read in QCD strings list from vector");
+
+    // FNV-1a over every value of the list, for fingerprint()
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const auto &row: QCDStringList_in) {
+        h = (h ^ row.size()) * 1099511628211ULL;
+        for (const double v: row) {
+            std::uint64_t w;
+            std::memcpy(&w, &v, sizeof(w));
+            h = (h ^ w) * 1099511628211ULL;
+        }
+    }
+    fingerprint_ = (h == 0) ? 1 : h;
 
     for (auto string_i: QCDStringList_in) {
         std::shared_ptr<QCD_string> new_string(new QCD_string);

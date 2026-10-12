@@ -296,6 +296,73 @@ double CUDAPipelines::reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y) {
     return static_cast<double>(*gpu.reduce_eps_out);
 }
 
+// ── checkpoint state (MusicCheckpoint) ──────────────────────────────────────
+
+namespace {
+// the snapshot's arrays in state order, with their lengths in floats
+template <class Snap, class F>
+void for_each_snapshot_array(Snap& s, size_t nc, F f) {
+    f(s.epsilon, nc);
+    f(s.rhob,    nc);
+    f(s.u,       GPU_U_COMPS * nc);
+    f(s.Wmunu,   GPU_WMUNU_COMPS * nc);
+    f(s.pi_b,    nc);
+}
+}  // namespace
+
+size_t CUDAPipelines::state_floats(const GPUGrid& gpu) {
+    return 2 * static_cast<size_t>(gpu.Ncells())
+             * (3 + GPU_U_COMPS + GPU_WMUNU_COMPS);
+}
+
+void* CUDAPipelines::alloc_state(size_t floats) {
+    void* p = nullptr;
+    if (cudaMalloc(&p, floats * sizeof(float)) != cudaSuccess) return nullptr;
+    return p;
+}
+
+void CUDAPipelines::free_state(void* state) {
+    if (state) cudaFree(state);
+}
+
+bool CUDAPipelines::save_snapshots(GPUGrid& gpu, void* state) {
+    if (!ready_ || !state) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    float* dst = static_cast<float*>(state);
+    bool ok = true;
+    for (GPUSnapshot* s : {&gpu.snap_prev, &gpu.snap_curr}) {
+        for_each_snapshot_array(*s, nc, [&](float* a, size_t n) {
+            ok = ok && cudaMemcpyAsync(dst, a, n * sizeof(float),
+                                       cudaMemcpyDefault, stream) == cudaSuccess;
+            dst += n;
+        });
+    }
+    return ok && cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
+bool CUDAPipelines::restore_snapshots(GPUGrid& gpu, const void* state) {
+    if (!ready_ || !state) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    const float* src = static_cast<const float*>(state);
+    bool ok = true;
+    for (GPUSnapshot* s : {&gpu.snap_prev, &gpu.snap_curr}) {
+        for_each_snapshot_array(*s, nc, [&](float* a, size_t n) {
+            ok = ok && cudaMemcpyAsync(a, src, n * sizeof(float),
+                                       cudaMemcpyDefault, stream) == cudaSuccess;
+            src += n;
+        });
+    }
+    return ok && cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
+bool CUDAPipelines::read_state(const void* state, float* host, size_t floats) {
+    if (!state || !host) return false;
+    return cudaMemcpy(host, state, floats * sizeof(float), cudaMemcpyDefault)
+        == cudaSuccess;
+}
+
 // ── pack_evolution_ideal ──────────────────────────────────────────────────────
 
 bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,

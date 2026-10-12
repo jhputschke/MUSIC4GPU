@@ -14,6 +14,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 
 #include "evolve.h"
 #include "cornelius.h"
@@ -156,6 +157,305 @@ void Evolve::debug_hooks(Fields &prev, Fields &curr, int it, double tau) {
 // gpu_first_rk_step_w_full sets a non-finite W^{mu nu} or Pi to 0 and counts the
 // cell update.  Read the count every 10 steps: warn on the first, keep a total,
 // and with MUSIC_ABORT_ON_NONFINITE=1 stop the run instead.
+// ── MusicCheckpoint: one run starting from another's state ─────────────────
+// js-contrib docs/Plans/PLAN_music2_restart.md.  The two-stage X-SCAPE chain's
+// jet leg is bit-identical to the background until its first droplet
+// deposits; with a checkpoint of the background it starts there instead.
+
+void free_checkpoint_gpu_state(void* state) {
+#ifdef MUSIC_USE_GPU
+    Advance::free_gpu_state(state);
+#else
+    (void)state;
+#endif
+}
+
+namespace {
+//! FNV-1a over 64-bit words, for the initial arena and the string list
+std::uint64_t hash_words(const void* data, std::size_t bytes,
+                         std::uint64_t h = 1469598103934665603ULL) {
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    std::size_t i = 0;
+    for (; i + 8 <= bytes; i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 1099511628211ULL;
+    }
+    for (; i < bytes; i++) h = (h ^ p[i]) * 1099511628211ULL;
+    return h;
+}
+
+std::uint64_t hash_vector(const std::vector<double> &v, std::uint64_t h) {
+    return hash_words(v.data(), v.size()*sizeof(double), h);
+}
+}  // namespace
+
+//! Everything that must agree between the run that takes a checkpoint and
+//! the run that starts from it, as "name=value;" fields (exact: hexfloat).
+std::string Evolve::checkpoint_key(Fields &arena) const {
+    std::ostringstream k;
+    k << std::hexfloat;
+#define KEY(field) k << #field "=" << DATA.field << ";"
+    KEY(mode); KEY(Initial_profile); KEY(beastMode); KEY(boost_invariant);
+    KEY(nx); KEY(ny); KEY(neta); KEY(nt); KEY(x_size); KEY(y_size);
+    KEY(eta_size); KEY(tau_size); KEY(tau0); KEY(delta_x); KEY(delta_y);
+    KEY(delta_eta); KEY(delta_tau); KEY(rk_order); KEY(minmod_theta);
+    KEY(whichEOS); KEY(facTau); KEY(fac_x); KEY(fac_y); KEY(fac_eta);
+    KEY(turn_on_rhob); KEY(turn_on_QS); KEY(viscosity_flag);
+    KEY(turn_on_shear); KEY(turn_on_bulk); KEY(turn_on_diff);
+    KEY(shear_to_s); KEY(quest_revert_strength); KEY(T_dependent_shear_to_s);
+    KEY(muB_dependent_shear_to_s); KEY(shear_2_min); KEY(shear_2_slope);
+    KEY(shear_2_curv); KEY(shear_3_T_kink_in_GeV);
+    KEY(shear_3_low_T_slope_in_GeV); KEY(shear_3_high_T_slope_in_GeV);
+    KEY(shear_3_at_kink); KEY(T_dependent_bulk_to_s);
+    KEY(bulk_2_normalisation); KEY(bulk_2_width_in_GeV);
+    KEY(bulk_2_peak_in_GeV); KEY(bulk_3_max); KEY(bulk_3_width_in_GeV);
+    KEY(bulk_3_T_peak_in_GeV); KEY(bulk_3_lambda_asymm); KEY(bulk_10_max);
+    KEY(bulk_10_width_high); KEY(bulk_10_width_low); KEY(bulk_10_Tpeak);
+    KEY(shear_relax_time_factor); KEY(bulk_relax_time_factor);
+    KEY(bulk_relaxation_type); KEY(include_second_order_terms);
+    KEY(include_vorticity_terms); KEY(kappa_coefficient);
+    KEY(stringSourceSigmaX); KEY(stringSourceSigmaEta);
+    KEY(stringTransverseShiftFrac); KEY(preEqFlowFactor);
+    KEY(string_quench_factor); KEY(parton_quench_factor);
+    KEY(outputEvolutionData); KEY(output_evolution_every_N_timesteps);
+    KEY(output_evolution_every_N_x); KEY(output_evolution_every_N_y);
+    KEY(output_evolution_every_N_eta); KEY(doFreezeOut);
+    KEY(doFreezeOut_lowtemp); KEY(freezeOutTauStartMax); KEY(freezeOutMethod);
+    KEY(TFO); KEY(useEpsFO); KEY(epsilonFreeze); KEY(N_freeze_out);
+    KEY(eps_freeze_min); KEY(eps_freeze_max); KEY(freeze_eps_flag);
+    KEY(surface_in_memory); KEY(output_hydro_debug_info);
+#undef KEY
+    k << "epsFO=";
+    for (const double e : epsFO_list) k << e << ",";
+    k << ";";
+    if (hydro_source_terms_ptr) {
+        k << "source=" << hydro_source_terms_ptr->get_number_of_sources()
+          << "/" << hydro_source_terms_ptr->fingerprint()
+          << "/" << hydro_source_terms_ptr->get_source_tau_min()
+          << "/" << hydro_source_terms_ptr->get_source_tau_max()
+          << "/" << hydro_source_terms_ptr->get_source_tauStart_max() << ";";
+    }
+    std::uint64_t h = hash_vector(arena.e_, 1469598103934665603ULL);
+    h = hash_vector(arena.rhob_, h);
+    h = hash_vector(arena.piBulk_, h);
+    for (const auto &u : arena.u_) h = hash_vector(u, h);
+    for (const auto &w : arena.Wmunu_) h = hash_vector(w, h);
+    k << "initial_arena=" << std::hex << h << ";";
+    return k.str();
+}
+
+//! Why this run cannot start from `c` ("" if it can), before the jet-source
+//! test.
+std::string Evolve::resume_rejection(const MusicCheckpoint &c,
+                                     const std::string &key,
+                                     int iFreezeStart, double tau0) {
+#ifndef MUSIC_USE_GPU
+    (void)c; (void)key; (void)iFreezeStart; (void)tau0;
+    return "a CPU build";
+#else
+    if (!c.valid || !c.gpu_state) return "the checkpoint was not taken";
+    if (c.gpu_state_floats != advance.gpu_state_floats()
+            && advance.gpu_state_floats() != 0)
+        return "the GPU grids differ";
+    if (c.key != key) {
+        // name the first differing field
+        std::size_t a = 0;
+        while (a < key.size() && a < c.key.size()) {
+            std::size_t ea = key.find(';', a), eb = c.key.find(';', a);
+            if (key.compare(a, ea - a, c.key, a, eb - a) != 0) {
+                return "the runs differ in " + key.substr(a, ea - a)
+                       + " (checkpoint: " + c.key.substr(a, eb - a) + ")";
+            }
+            if (ea == std::string::npos) break;
+            a = ea + 1;
+        }
+        return "the runs differ";
+    }
+    if (hydro_source_terms_ptr
+            && hydro_source_terms_ptr->get_number_of_sources() > 0
+            && hydro_source_terms_ptr->fingerprint() == 0)
+        return "the initial-state source has no fingerprint";
+    if (c.iFreezeStart != iFreezeStart) return "iFreezeStart differs";
+    if (DATA.beastMode == 2 && c.it >= 200) return "beastMode 2 past step 200";
+    if (DATA.outputEvolutionData != 0) return "evolution files are written";
+    if (DATA.doFreezeOut == 1 && DATA.freeze_out_surface == 1
+            && !c.has_surface)
+        return "this run builds the freeze-out surface, the checkpoint's "
+               "run did not";
+    if (DATA.store_hydro_info_in_memory == 1 && !c.has_store)
+        return "this run keeps an evolution store, the checkpoint's did not";
+    if (DATA.store_hydro_info_in_memory == 1
+            && DATA.store_hydro_info_frames == 1 && !c.has_frames)
+        return "this run stores frames, the checkpoint has none";
+    (void)tau0;
+    return "";
+#endif
+}
+
+void Evolve::take_checkpoint(int it, double tau, int iFreezeStart, int frozen,
+                             double eps_max_cur, const std::string &key,
+                             Fields &arena_current,
+                             HydroinfoMUSIC &hydro_info) {
+#ifdef MUSIC_USE_GPU
+    MusicCheckpoint &c = *checkpoint_out_;
+    c.gpu_state = advance.save_gpu_state();
+    if (!c.gpu_state) {
+        music_message << "Checkpoint at step " << it << ": the GPU does not "
+                      << "hold the state, none taken.";
+        music_message.flush("warning");
+        return;
+    }
+    c.gpu_state_floats = advance.gpu_state_floats();
+    c.key = key;
+    c.it = it;
+    c.tau = tau;
+    c.delta_tau = DATA.delta_tau;
+    c.facTau = DATA.facTau;
+    c.iFreezeStart = iFreezeStart;
+    c.frozen = frozen;
+    c.has_surface = (DATA.doFreezeOut == 1 && DATA.freeze_out_surface == 1
+                     && DATA.surface_in_memory);
+    if (c.has_surface) {
+        c.surface = surfaceCellVec_;
+        c.FO_nBvsEta = FO_nBvsEta_;
+        c.FO_nQvsEta = FO_nQvsEta_;
+        c.FO_nSvsEta = FO_nSvsEta_;
+    }
+    // what the no-surface stop test holds after its check at this
+    // (freeze-out) step: max e of the step
+    c.emax_last_check = max_energy_density_raw(arena_current);
+    c.eps_max_cur = eps_max_cur;
+    c.nonfinite_total = nonfinite_total_;
+    c.nonfinite_first_it = nonfinite_first_it_;
+    c.has_store = (DATA.store_hydro_info_in_memory == 1);
+    c.has_frames = c.has_store && DATA.store_hydro_info_frames == 1;
+    if (c.has_frames) hydro_info.copy_frames(c.frames);
+    if (c.has_store) {
+        c.store_ntau = hydro_info.get_ntau();
+        c.store_tau_max = hydro_info.get_hydro_tau_max();
+    }
+    c.valid = true;
+    music_message << "Checkpoint at step " << it << ", tau = " << tau
+                  << " fm/c: GPU state "
+                  << c.gpu_state_floats*sizeof(float)/1048576 << " MB, "
+                  << c.surface.size() << " surface cells, "
+                  << c.store_ntau << " frames ("
+                  << c.frames.size()*sizeof(fluidCell_ideal)/1048576 << " MB).";
+    music_message.flush("info");
+#else
+    (void)it; (void)tau; (void)iFreezeStart; (void)frozen; (void)eps_max_cur;
+    (void)key; (void)arena_current; (void)hydro_info;
+#endif
+}
+
+bool Evolve::restore_checkpoint(const MusicCheckpoint &c, Fields* fpPrev,
+                                Fields* fpCurr, Fields &freezeoutFieldPrev,
+                                Fields &freezeoutFieldCurr,
+                                double &eps_max_cur,
+                                HydroinfoMUSIC &hydro_info) {
+#ifdef MUSIC_USE_GPU
+    if (!advance.restore_gpu_state(c.gpu_state, *fpCurr)) return false;
+    const bool surface = (DATA.doFreezeOut == 1 && DATA.freeze_out_surface == 1);
+    if (surface) {
+        surfaceCellVec_ = c.surface;
+        FO_nBvsEta_ = c.FO_nBvsEta;
+        FO_nQvsEta_ = c.FO_nQvsEta;
+        FO_nSvsEta_ = c.FO_nSvsEta;
+        // Cornelius' previous check: the arenas of the checkpoint's step, as
+        // the freeze-out stage stored them there
+        advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
+        store_previous_step_for_freezeout(*fpPrev, freezeoutFieldPrev);
+        store_previous_step_for_freezeout(*fpCurr, freezeoutFieldCurr);
+    }
+    emax_last_check_ = c.emax_last_check;
+    eps_max_cur = c.eps_max_cur;
+    nonfinite_total_ = c.nonfinite_total;
+    nonfinite_first_it_ = c.nonfinite_first_it;
+    if (DATA.store_hydro_info_in_memory == 1) {
+        const bool frames = (DATA.store_hydro_info_frames == 1);
+        hydro_info.restore_frames(frames ? c.frames
+                                         : std::vector<fluidCell_ideal>(),
+                                  c.store_ntau, c.store_tau_max);
+    }
+    return true;
+#else
+    (void)c; (void)fpPrev; (void)fpCurr; (void)freezeoutFieldPrev;
+    (void)freezeoutFieldCurr; (void)eps_max_cur; (void)hydro_info;
+    return false;
+#endif
+}
+
+//! MUSIC_RESTART_VERIFY: this run went from tau0 to the checkpoint's step;
+//! is its state the checkpoint's, bit for bit?
+void Evolve::verify_checkpoint(const MusicCheckpoint &c, int it, double tau,
+                               int frozen, double eps_max_cur,
+                               Fields &arena_current,
+                               HydroinfoMUSIC &hydro_info) {
+#ifdef MUSIC_USE_GPU
+    std::vector<std::string> diff;
+    auto check = [&](bool same, const std::string &what) {
+        if (!same) diff.push_back(what);
+    };
+    check(it == c.it && tau == c.tau, "step / tau");
+    check(frozen == c.frozen, "frozen");
+    std::vector<float> mine, theirs(c.gpu_state_floats);
+    if (advance.read_gpu_state(mine) && mine.size() == theirs.size()
+            && GPUPipelines::instance().read_state(c.gpu_state, theirs.data(),
+                                                   theirs.size())) {
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < mine.size(); i++)
+            n += std::memcmp(&mine[i], &theirs[i], sizeof(float)) != 0;
+        check(n == 0, "GPU state (" + std::to_string(n) + " of "
+                      + std::to_string(mine.size()) + " floats)");
+    } else {
+        diff.push_back("GPU state (not readable)");
+    }
+    if (DATA.doFreezeOut == 1 && DATA.freeze_out_surface == 1 && c.has_surface) {
+        const bool same_surface = surfaceCellVec_.size() == c.surface.size()
+            && std::memcmp(surfaceCellVec_.data(), c.surface.data(),
+                           c.surface.size()*sizeof(SurfaceCell)) == 0;
+        check(same_surface, "surface (" + std::to_string(surfaceCellVec_.size())
+                            + " vs " + std::to_string(c.surface.size()) + " cells)");
+        check(FO_nBvsEta_ == c.FO_nBvsEta && FO_nQvsEta_ == c.FO_nQvsEta
+              && FO_nSvsEta_ == c.FO_nSvsEta, "FO_n*vsEta");
+    }
+    const double emax = max_energy_density_raw(arena_current);
+    check(std::memcmp(&emax, &c.emax_last_check, sizeof(double)) == 0,
+          "max e");
+    check(std::memcmp(&eps_max_cur, &c.eps_max_cur, sizeof(double)) == 0,
+          "eps_max_cur");
+    check(nonfinite_total_ == c.nonfinite_total, "non-finite count");
+    if (DATA.store_hydro_info_in_memory == 1 && c.has_store) {
+        check(hydro_info.get_ntau() == c.store_ntau
+              && hydro_info.get_hydro_tau_max() == c.store_tau_max,
+              "store frame count");
+        if (DATA.store_hydro_info_frames == 1 && c.has_frames) {
+            std::vector<fluidCell_ideal> frames;
+            hydro_info.copy_frames(frames);
+            check(frames.size() == c.frames.size()
+                  && std::memcmp(frames.data(), c.frames.data(),
+                                 frames.size()*sizeof(fluidCell_ideal)) == 0,
+                  "store frames");
+        }
+    }
+    std::ostringstream m;
+    m << "restart verify at step " << it << ": ";
+    if (diff.empty()) {
+        m << "identical to the checkpoint";
+    } else {
+        m << "DIFFERS from the checkpoint in";
+        for (const auto &d : diff) m << " [" << d << "]";
+    }
+    resume_status_ = m.str();
+    music_message << resume_status_;
+    music_message.flush(diff.empty() ? "info" : "warning");
+#else
+    (void)c; (void)it; (void)tau; (void)frozen; (void)eps_max_cur;
+    (void)arena_current; (void)hydro_info;
+#endif
+}
+
 void Evolve::check_nonfinite_gpu(int it, double tau) {
 #ifdef MUSIC_USE_GPU
     if (it % 10 != 0) return;
@@ -237,8 +537,74 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
     const double max_allowed_e_increase_factor = 5.;
     double tau = tau0;
     const int NtauBlock = 200;
+
+    // MusicCheckpoint: where to take one (the last freeze-out step whose RK
+    // step ends by checkpoint_tau_), and whether to start from one
+    std::string run_key;
+    if (checkpoint_out_ || resume_from_) run_key = checkpoint_key(*fpCurr);
+    int checkpoint_it = -1;
+    if (checkpoint_out_ && checkpoint_tau_ > tau0) {
+        double tau_k = tau0;
+        for (int k = 0; tau_k + DATA.delta_tau <= checkpoint_tau_ + 1e-9; k++) {
+            if (k > iFreezeStart && (k - iFreezeStart) % DATA.facTau == 0
+                    && !(DATA.beastMode == 2 && k >= NtauBlock)) {
+                checkpoint_it = k;
+            }
+            tau_k += DATA.delta_tau;
+        }
+    }
+    int resume_it = -1;
+    int verify_it = -1;
+    int resume_frozen = 0;
+    if (resume_from_) {
+        const MusicCheckpoint &c = *resume_from_;
+        std::string why = resume_rejection(c, run_key, iFreezeStart, tau0);
+        // the jet source must add nothing before the checkpoint's step: the
+        // test Advance makes per step, in step order as a full run makes it
+        // (the liquefier normalizes a droplet at its first step in reach)
+        auto &jets = hydro_source_terms_from_jets_ptr_;
+        double tau_k = tau0;
+        for (int k = 0; why.empty() && k < c.it; k++) {
+            if (jets && jets->get_number_of_sources() > 0) {
+                jets->prepare_list_for_current_tau_frame(tau_k);
+                if (jets->has_active_sources_current_tau()) {
+                    std::ostringstream w;
+                    w << "the jet source deposits at step " << k << " (tau = "
+                      << tau_k << " fm/c), before the checkpoint's step "
+                      << c.it;
+                    why = w.str();
+                }
+            }
+            tau_k += DATA.delta_tau;
+        }
+        if (!why.empty()) {
+            resume_status_ = "run from tau0: " + why;
+        } else if (verify_resume_) {
+            verify_it = c.it;
+            resume_status_ = "run from tau0 to verify the checkpoint";
+        } else if (restore_checkpoint(c, fpPrev, fpCurr, freezeoutFieldPrev,
+                                      freezeoutFieldCurr, eps_max_cur,
+                                      hydro_info_ptr)) {
+            resume_it = c.it;
+            resume_frozen = c.frozen;
+            it = c.it;
+            tau = c.tau;
+            std::ostringstream m;
+            m << "started from the checkpoint at step " << c.it << " (tau = "
+              << c.tau << " fm/c)";
+            resume_status_ = m.str();
+        } else {
+            resume_status_ = "run from tau0: the GPU state could not be restored";
+        }
+        music_message << "Restart: " << resume_status_;
+        music_message.flush("info");
+    }
+
     while (tau < tauMax) {
         bench::Timer _bt_step("evolve.step_total");
+        // a run started from a checkpoint enters its step at AdvanceRK: the
+        // checkpoint's run did the rest of that step
+        const bool resumed_step = (it == resume_it);
         if (DATA.beastMode == 2 && it > 0 && (it % NtauBlock == 0)) {
             DATA.delta_tau = std::min(0.04, 2*DATA.delta_tau);
             DATA.facTau = std::max(1, static_cast<int>(DATA.facTau/2));
@@ -283,7 +649,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         //    }
         //}
 
-        if (it % Nskip_timestep == 0) {
+        if (!resumed_step && it % Nskip_timestep == 0) {
             const bool mem_frames = (DATA.store_hydro_info_in_memory == 1
                                      && DATA.store_hydro_info_frames == 1);
 #ifdef MUSIC_USE_GPU
@@ -341,7 +707,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             //}
         }
 
-        if (DATA.output_momentum_anisotropy_vs_etas == 1
+        if (!resumed_step && DATA.output_momentum_anisotropy_vs_etas == 1
             && (it == iFreezeStart || it == iFreezeStart + 10
                 || it == iFreezeStart + 30 || it == iFreezeStart + 50)) {
 #ifdef MUSIC_USE_GPU
@@ -350,7 +716,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             grid_info.output_momentum_anisotropy_vs_etas(tau, *fpCurr);
         }
 
-        if (DATA.beastMode == 0) {
+        if (!resumed_step && DATA.beastMode == 0) {
             if (DATA.Initial_profile == 0) {
                 if (   fabs(tau - 1.0) < 1e-8 || fabs(tau - 1.2) < 1e-8
                     || fabs(tau - 1.5) < 1e-8 || fabs(tau - 2.0) < 1e-8
@@ -504,8 +870,10 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
         }  // if for not beast mode
 
         // determine freeze-out surface
-        int frozen = 0;
-        if (freezeout_flag == 1 && DATA.freeze_out_surface == 0) {
+        int frozen = resumed_step ? resume_frozen : 0;
+        if (resumed_step) {
+            // done in the checkpoint's run
+        } else if (freezeout_flag == 1 && DATA.freeze_out_surface == 0) {
             // No surface: the equal-tau surface of the first step only adds
             // surface cells (it always returns 0), so it is skipped as well.
             if ((it - iFreezeStart)%facTau == 0 && it > iFreezeStart) {
@@ -544,6 +912,15 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             if (DATA.reRunHydro) {
                 return(-1);
             }
+        }
+
+        if (it == checkpoint_it) {
+            take_checkpoint(it, tau, iFreezeStart, frozen, eps_max_cur,
+                            run_key, *fpCurr, hydro_info_ptr);
+        }
+        if (it == verify_it) {
+            verify_checkpoint(*resume_from_, it, tau, frozen, eps_max_cur,
+                              *fpCurr, hydro_info_ptr);
         }
 
         debug_hooks(*fpPrev, *fpCurr, it, tau);

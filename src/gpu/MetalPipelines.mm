@@ -295,6 +295,68 @@ double MetalPipelines::reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y) {
     return static_cast<double>(m);
 }
 
+// ── checkpoint state (MusicCheckpoint) ──────────────────────────────────────
+// Shared (unified) memory: the snapshot buffers are host-readable once wait()
+// has joined the last command buffer, so the state is a host copy.
+
+namespace {
+template <class Snap, class F>
+void for_each_snapshot_array(Snap& s, size_t nc, F f) {
+    f(s.epsilon, nc);
+    f(s.rhob,    nc);
+    f(s.u,       GPU_U_COMPS * nc);
+    f(s.Wmunu,   GPU_WMUNU_COMPS * nc);
+    f(s.pi_b,    nc);
+}
+}  // namespace
+
+size_t MetalPipelines::state_floats(const GPUGrid& gpu) {
+    return 2 * static_cast<size_t>(gpu.Ncells())
+             * (3 + GPU_U_COMPS + GPU_WMUNU_COMPS);
+}
+
+void* MetalPipelines::alloc_state(size_t floats) {
+    return std::malloc(floats * sizeof(float));
+}
+
+void MetalPipelines::free_state(void* state) {
+    std::free(state);
+}
+
+bool MetalPipelines::save_snapshots(GPUGrid& gpu, void* state) {
+    if (!ready_ || !state) return false;
+    wait();
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    float* dst = static_cast<float*>(state);
+    for (GPUSnapshot* s : {&gpu.snap_prev, &gpu.snap_curr}) {
+        for_each_snapshot_array(*s, nc, [&](float* a, size_t n) {
+            std::memcpy(dst, a, n * sizeof(float));
+            dst += n;
+        });
+    }
+    return true;
+}
+
+bool MetalPipelines::restore_snapshots(GPUGrid& gpu, const void* state) {
+    if (!ready_ || !state) return false;
+    wait();
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    const float* src = static_cast<const float*>(state);
+    for (GPUSnapshot* s : {&gpu.snap_prev, &gpu.snap_curr}) {
+        for_each_snapshot_array(*s, nc, [&](float* a, size_t n) {
+            std::memcpy(a, src, n * sizeof(float));
+            src += n;
+        });
+    }
+    return true;
+}
+
+bool MetalPipelines::read_state(const void* state, float* host, size_t floats) {
+    if (!state || !host) return false;
+    std::memcpy(host, state, floats * sizeof(float));
+    return true;
+}
+
 // ── wait ──────────────────────────────────────────────────────────────────────
 
 void MetalPipelines::wait() {

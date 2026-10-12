@@ -117,6 +117,8 @@ class HydroSourceStrings : public HydroSourceBase {
     StringSegments string_segments(const QCD_string &st,
                                    const double tau) const;
 
+    std::uint64_t fingerprint_ = 0;
+
  public:
     HydroSourceStrings() = delete;
     HydroSourceStrings(InitData &DATA_in);
@@ -142,6 +144,9 @@ class HydroSourceStrings : public HydroSourceBase {
     //! is not evolved (turn_on_rhob, turn_on_QS) has no source, so its lists
     //! do not count: 3dMCGlauber's electric-charge strings would otherwise
     //! cost a full source fill of zeros at many later steps.
+    //! a hash of the string list read from a vector (0 when read from a file)
+    std::uint64_t fingerprint() const override {return(fingerprint_);}
+
     bool has_active_sources_current_tau() const override {
         const bool baryon = !QCD_strings_baryon_list_current_tau.empty();
         const bool electric = !QCD_strings_electric_list_current_tau.empty();
