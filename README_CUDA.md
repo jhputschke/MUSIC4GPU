@@ -695,6 +695,15 @@ level of the time discretization: energy-weighted |Δe|/e above e_fo 2e-4 at
 3e-4 — the size of the GPU-vs-CPU difference. With `late_delta_tau 0` the
 output is bit-identical to the stall-break build.
 
+**Also on the branch, bit-identical: Cornelius without per-element heap
+allocations.** Every centroid and normal of a line, polygon or polyhedron,
+every cube and hypercube split and the polygon/polyhedron assembly allocated
+and freed small arrays, and every η slice of every check constructed a new
+`Cornelius` (hundreds of allocations each).  Fixed-size stack arrays and one
+`Cornelius` per OpenMP thread, re-`init`ed per slice: the search per check
+13.1 → 9.2 ms (−30 %) and the whole freeze-out step 17.5 → 12.9 ms on the
+GB10 (OMP 4, 0–10 % Au+Au), the surfaces identical.
+
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
 | Phase | Change | Per-step speedup | Key kernel-level result |

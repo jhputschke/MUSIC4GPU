@@ -1674,6 +1674,10 @@ int Evolve::FindFreezeOutSurface_Cornelius(double tau,
         const int nslices = (neta - fac_eta + fac_eta - 1)/fac_eta;
         std::vector<std::vector<SurfaceCell>> slice_cells(nslices);
         const bool parallel = DATA.surface_in_memory;
+        const int nthreads = parallel ? omp_get_max_threads() : 1;
+        while (static_cast<int>(cornelius_threads_.size()) < nthreads) {
+            cornelius_threads_.push_back(std::make_shared<Cornelius>());
+        }
         bench::Timer _bt_find("evolve.freezeout_find");
         #pragma omp parallel for reduction(+:intersections) \
                 schedule(dynamic, 1) if (parallel)
@@ -1750,9 +1754,9 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
 
     U_derivative u_derivative_helper(DATA, eos);
 
-    // initialize Cornelius
+    // initialize this thread's Cornelius (init only sets the spacing)
     double lattice_spacing[4] = {DTAU, DX, DY, DETA};
-    std::shared_ptr<Cornelius> cornelius_ptr(new Cornelius());
+    std::shared_ptr<Cornelius> cornelius_ptr = cornelius_threads_[thread_id];
     cornelius_ptr->init(dim, epsFO, lattice_spacing);
 
     // initialize the hyper-cube for Cornelius
