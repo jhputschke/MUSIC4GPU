@@ -20,6 +20,8 @@
 //! The two steps the freeze-out search compares (evolve.cpp, freeze-out
 //! steps): the step being checked goes into slot k, the other slot holds the
 //! previously checked one; then the slots swap roles.
+class Cornelius;
+
 struct FreezeoutSteps {
     Fields curr[2];
     Fields prev[2];             //!< the step before each; vorticity output only
@@ -69,6 +71,18 @@ class Evolve {
     // from one -- or, verifying, run from tau0 and compare at its step
     std::shared_ptr<MusicCheckpoint> checkpoint_out_;
     double checkpoint_tau_ = 0.;
+    bool   late_switched_       = false;  //!< late_delta_tau applied
+    double tau_last_check_      = -1.;    //!< tau of the last freeze-out check
+    //! Cornelius' tau spacing for the first check after the step switch
+    //! (-1: to be measured at that check; 0: facTau * delta_tau)
+    double dtau_check_override_ = 0.;
+    double late_delta_tau_org_ = 0.;  //!< the step parameters before the switch,
+    int    late_facTau_org_ = 0;      //!< restored when the run ends (DATA is
+    int    late_skip_org_ = 0;        //!< shared by every run of the instance)
+    void late_step_restore();
+    //! one Cornelius per OpenMP thread, reused by every slice and check:
+    //! constructing one allocates hundreds of small arrays
+    std::vector<std::shared_ptr<Cornelius>> cornelius_threads_;
     std::shared_ptr<const MusicCheckpoint> resume_from_;
     bool verify_resume_ = false;
     std::string resume_status_;

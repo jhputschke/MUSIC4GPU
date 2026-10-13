@@ -533,6 +533,7 @@ inline float gpu_solve_v(float v_guess, float T00, float M, float J0,
     gpu_vel_fdf(v_root, T00, M, J0, fv, dfdv, P_tab, dPde_tab, ep);
 
     for (int it = 0; it < 60; it++) {
+        const float v_old = v_root;
         if (((v_root - v_h) * dfdv - fv) * ((v_root - v_l) * dfdv - fv) > 0.f
             || abs(2.f * fv) > abs(dv_prev * dfdv)) {
             dv_prev = dv_curr;
@@ -546,7 +547,11 @@ inline float gpu_solve_v(float v_guess, float T00, float M, float J0,
         gpu_vel_fdf(v_root, T00, M, J0, fv, dfdv, P_tab, dPde_tab, ep);
         if (fv * fv_l < 0.f) { v_h = v_root; fv_h = fv; }
         else                  { v_l = v_root; fv_l = fv; }
-        if (abs(dv_curr) < ABS_ERR) break;
+        // Converged: the step is below the tolerance, or the iterate can no
+        // longer change in single precision (the root to float resolution; a
+        // step of 1e-7 is below the ulp of v near 1, and such a lane would
+        // otherwise run all 60 iterations and hold its warp with it).
+        if (abs(dv_curr) < ABS_ERR || v_root == v_old) break;
     }
     return v_root;
 }
@@ -594,6 +599,7 @@ inline float gpu_solve_u0(float u0_guess, float T00, float K00, float M, float J
     gpu_u0_fdf(u0_root, T00, K00, M, J0, fu0, dfdu0, P_tab, dPde_tab, ep);
 
     for (int it = 0; it < 60; it++) {
+        const float u0_old = u0_root;
         if (((u0_root - u0_h) * dfdu0 - fu0) * ((u0_root - u0_l) * dfdu0 - fu0) > 0.f
             || abs(2.f * fu0) > abs(du0_prev * dfdu0)) {
             du0_prev = du0_curr;
@@ -607,7 +613,9 @@ inline float gpu_solve_u0(float u0_guess, float T00, float K00, float M, float J
         gpu_u0_fdf(u0_root, T00, K00, M, J0, fu0, dfdu0, P_tab, dPde_tab, ep);
         if (fu0 * fu0_l < 0.f) { u0_h = u0_root; fu0_h = fu0; }
         else                    { u0_l = u0_root; fu0_l = fu0; }
-        if (abs(du0_curr) < ABS_ERR) break;
+        // Converged, or stalled at float resolution (an absolute 1e-7 is below
+        // the ulp of any u0 above ~1.7; see gpu_solve_v).
+        if (abs(du0_curr) < ABS_ERR || u0_root == u0_old) break;
     }
     return u0_root;
 }

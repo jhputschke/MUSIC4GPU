@@ -631,6 +631,18 @@ InitData read_in_parameters(std::string input_file) {
     if (tempinput != "empty")
         istringstream(tempinput) >> tempdelta_tau;
     parameter_list.delta_tau = tempdelta_tau;
+    // late_delta_tau, late_tau_switch: from tau >= late_tau_switch the step
+    // is late_delta_tau, with facTau and output_evolution_every_N_timesteps
+    // scaled so that the freeze-out checks and the stored frames keep their
+    // spacing in fm/c (0: a constant step).  See Evolve::EvolveIt.
+    double templatedt = 0.;
+    tempinput = Util::StringFind4(input_file, "late_delta_tau");
+    if (tempinput != "empty") istringstream(tempinput) >> templatedt;
+    parameter_list.late_delta_tau = templatedt;
+    double templatetau = 0.;
+    tempinput = Util::StringFind4(input_file, "late_tau_switch");
+    if (tempinput != "empty") istringstream(tempinput) >> templatetau;
+    parameter_list.late_tau_switch = templatetau;
     music_message << " DeltaTau = " << parameter_list.delta_tau << " fm";
     music_message.flush("info");
 
@@ -1035,6 +1047,11 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
 
     if (parameter_name == "Initial_time_tau_0")
         parameter_list.tau0 = value;
+
+    if (parameter_name == "late_delta_tau")
+        parameter_list.late_delta_tau = value;
+    if (parameter_name == "late_tau_switch")
+        parameter_list.late_tau_switch = value;
 
     if (parameter_name == "dtau") {
         parameter_list.delta_tau = value;

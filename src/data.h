@@ -90,6 +90,10 @@ typedef struct init_data {
     double delta_eta;
     double delta_tau;
     double delta_tau_org;
+    //! a larger time step from late_tau_switch on (0: constant step);
+    //! facTau and the frame cadence are scaled with it (Evolve::EvolveIt)
+    double late_delta_tau;
+    double late_tau_switch;
     double dtaudxRatio;
 
     bool resetDtau;

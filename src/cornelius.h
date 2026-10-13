@@ -98,6 +98,8 @@ class Polyhedron : public GeneralElement
 {
   private:
     static const int MAX_POLYGONS = 24;
+    //the lines of a polygon, Polygon::MAX_LINES: one tetrahedron each
+    static const int MAX_TETRA_PER_POLYGON = 24;
     Polygon **polygons;
     int Npolygons;
     int Ntetrahedra;

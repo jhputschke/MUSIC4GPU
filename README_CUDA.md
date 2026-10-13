@@ -638,6 +638,72 @@ copy-back in `AdvanceIt`.  It remains deferred to a follow-up.
 
 ---
 
+## Phase 7 — Reconstruction solvers: stop at float resolution (2026-10-12)
+
+The first kernel profile at the production grid (100 × 100 × 60, `nsys` on the
+GB10, a two-stage X-SCAPE job of 1,436 steps) put `gpu_make_delta_qi` at 52 %
+of all GPU time (3.65 ms per launch, 14.05 ms of kernels per step).  Three
+restructurings aimed at its arithmetic changed nothing measurable:
+
+| change | `delta_qi` per launch | bit-identical |
+|---|---:|---|
+| baseline | 3.65 ms | — |
+| q = τT^{τμ} precomputed per cell (75 → 0 evaluations per cell) | 3.51 + 0.16 ms (`gpu_make_q`) | no (FMA contraction differs for the stored product) |
+| P and dP/de from one table index per solver iteration | ~3.5 ms | no (same reason) |
+| P(e) once per reconstructed state in the flux loop | 3.56 ms | yes |
+| Newton started at the previous velocity instead of 0.5 | 3.51 ms | no |
+| bracket [v₀ ± 0.05] as the CPU's `solve_v_Hybrid` | 5.48 ms | no — the Brent safeguard bisects a narrow bracket |
+
+The time was in lanes that never converge: both solvers break on an absolute
+step below 1e-7, which is below the float32 ulp of u⁰ above ~1.7 and of v
+near 1.  Such a lane runs all 60 iterations, and its warp with it.  The fix
+is one condition per solver: **also stop when the iterate no longer changes in
+single precision** (`v_root == v_old`, `u0_root == u0_old`), i.e. at the root
+to float resolution.
+
+| | baseline | stall break |
+|---|---:|---:|
+| `gpu_make_delta_qi` per launch | 3.65 ms | **1.71 ms** (−53 %) |
+| `gpu_finalize_ideal` per launch | 0.39 ms | 0.37 ms |
+| GPU kernels per step | 14.05 ms | **10.1 ms** (−29 %) |
+| MUSIC step, one job alone (`evolve.step_total`, background / jet leg) | 28.9 / 23.4 ms | 24.3 / 19.7 ms |
+| jet event on a reused background, one job alone | 13.4 s | 11.2 s |
+
+**Not bit-identical**, by construction: a stalled lane now returns the iterate
+at which it stalled, a few ulp from where 60 iterations would have left it.
+Over a run the difference stays at the float-rounding level: in 0–10 % Au+Au
+(2 events, both legs) the energy-weighted |Δe|/e above e_fo is ~1e-6, the
+largest single-cell |Δe|/e above e_fo 8e-4 at τ ≈ 3–5 fm/c (~50 of 23,000
+cells beyond 1e-4, none at late times), the total energy within 2e-6, the
+freeze-out surfaces equal to ±2 elements per leg; O+O the same.  That is
+~1000× below the GPU-vs-CPU difference (`docs/MUSIC_CPU_vs_GPU.md`).  The
+Metal kernel has the same two conditions; it is not yet compiled or run on a
+Mac.
+
+**On the same branch: a larger late time step** (`late_delta_tau` /
+`late_tau_switch`, README.md), so that one physics validation covers both.
+With 0.02 → 0.05 fm/c from τ = 3 fm/c (the X-SCAPE production XMLs), the
+0–10 % Au+Au background takes 272 steps instead of 479 and a jet leg from the
+checkpoint 282 instead of 501 (−43 %); the kernels per step are unchanged, so
+the GPU time per leg drops by the same fraction (the two-event job above: 8.1 s
+of kernels instead of 14.5). The host work per fm/c (checks, string fills) does
+not shrink, so a job alone gains less: a jet event 11.2 → 8.3 s on the GB10.
+The frames stay on their 0.1 fm/c grid (the total energy per frame agrees
+with the constant step to 1e-4 around the switch); the fields differ at the
+level of the time discretization: energy-weighted |Δe|/e above e_fo 2e-4 at
+τ = 3.5 fm/c, 1.2e-3 from 6 fm/c on, single cells ≤ 5e-3, total energy within
+3e-4 — the size of the GPU-vs-CPU difference. With `late_delta_tau 0` the
+output is bit-identical to the stall-break build.
+
+**Also on the branch, bit-identical: Cornelius without per-element heap
+allocations.** Every centroid and normal of a line, polygon or polyhedron,
+every cube and hypercube split and the polygon/polyhedron assembly allocated
+and freed small arrays, and every η slice of every check constructed a new
+`Cornelius` (hundreds of allocations each).  Fixed-size stack arrays and one
+`Cornelius` per OpenMP thread, re-`init`ed per slice: the search per check
+13.1 → 9.2 ms (−30 %) and the whole freeze-out step 17.5 → 12.9 ms on the
+GB10 (OMP 4, 0–10 % Au+Au), the surfaces identical.
+
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
 | Phase | Change | Per-step speedup | Key kernel-level result |

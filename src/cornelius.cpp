@@ -281,12 +281,11 @@ void Line::calculate_normal()
   normal[const_i[0]] = 0;
   normal[const_i[1]] = 0;
   //Now we check if the normal is in the correct direction
-  double *Vout = new double[DIM];
+  double Vout[DIM];
   for (int j=0; j < DIM; j++) {
     Vout[j] = out[j] - centroid[j];
   }
   check_normal_direction(normal,Vout);
-  delete[] Vout;
   normal_calculated = 1;
 }
 
@@ -490,7 +489,7 @@ bool Polygon::add_line(Line *l, int donotcheck)
 void Polygon::calculate_centroid()
 {
   //We need a vector for the mean of the corners.
-  double *mean = new double[DIM];
+  double mean[DIM];
   for (int i=0; i < DIM; i++ ) {
     mean[i] = 0;
   }
@@ -513,22 +512,21 @@ void Polygon::calculate_centroid()
       centroid[i] = mean[i];
     }
     centroid_calculated = 1;
-    delete[] mean;
     return;
   }
   //If more than 3 corners, calculation of the centroid is more
   //complicated
   //Here we from triangles from the lines and the mean point
-  double *sum_up = new double[DIM]; //areas of the single triangles 
+  double sum_up[DIM]; //areas of the single triangles 
   double sum_down = 0; //area of all the triangles
   for (int i=0; i < DIM; i++) {
     sum_up[i] = 0;
   }
   //a and b are vectors which from the triangle
-  double *a = new double[DIM];
-  double *b = new double[DIM];
+  double a[DIM];
+  double b[DIM];
   //centroid of the triangle (this is always on a plane)
-  double *cm_i = new double[DIM];
+  double cm_i[DIM];
   for (int i=0; i < Nlines; i++) {
     double *p1 = lines[i]->get_start();
     double *p2 = lines[i]->get_end();
@@ -555,11 +553,6 @@ void Polygon::calculate_centroid()
   }
   //centroid is now calculated and memory is freed
   centroid_calculated = 1;
-  delete[] sum_up;
-  delete[] mean;
-  delete[] a;
-  delete[] b;
-  delete[] cm_i;
 }
 
 /**
@@ -575,17 +568,16 @@ void Polygon::calculate_normal()
     calculate_centroid();
   //First we find the normal for each triangle formed from
   //one edge and centroid
-  double **normals = new double*[Nlines]; //these are the normals
-  double *Vout = new double[DIM]; //the point which is always outside
+  double normals[MAX_LINES][DIM]; //these are the normals (Nlines <= MAX_LINES)
+  double Vout[DIM]; //the point which is always outside
   for (int i=0; i < Nlines; i++) {
-    normals[i] = new double[DIM];
     for (int j=0; j < DIM; j++) {
       normals[i][j] = 0;
     }
   }
   //Normal is defined by these two vectors
-  double *a = new double[DIM];
-  double *b = new double[DIM];
+  double a[DIM];
+  double b[DIM];
   //Loop over all triangles
   for (int i=0; i < Nlines; i++) {
     //First we calculate the vectors which form the triangle
@@ -619,13 +611,6 @@ void Polygon::calculate_normal()
   }
   //Normal is now calculated and memory can be freed
   normal_calculated = 1;
-  delete[] a;
-  delete[] b;
-  for (int i=0; i < Nlines; i++) {
-    delete[] normals[i];
-  }
-  delete[] normals;
-  delete[] Vout;
 }
 
 /**
@@ -682,6 +667,8 @@ class Polyhedron : public GeneralElement
 {
   private:
     static const int MAX_POLYGONS = 24;
+    //the lines of a polygon, Polygon::MAX_LINES: one tetrahedron each
+    static const int MAX_TETRA_PER_POLYGON = 24;
     Polygon **polygons;
     int Npolygons;
     int Ntetrahedra;
@@ -865,7 +852,7 @@ void Polyhedron::tetravolume(double *a, double *b, double *c, double *n)
  */
 void Polyhedron::calculate_centroid()
 {
-  double *mean = new double[DIM];
+  double mean[DIM];
   for (int i=0; i < DIM; i++ ) {
     mean[i] = 0;
   }
@@ -885,12 +872,12 @@ void Polyhedron::calculate_centroid()
     mean[j] = mean[j]/double(2.0*Ntetrahedra);
   }
   //Some memory allocated for temporary variables
-  double *a       = new double[DIM];
-  double *b       = new double[DIM];
-  double *c       = new double[DIM];
-  double *n       = new double[DIM];
-  double *cm_i    = new double[DIM];
-  double *sum_up  = new double[DIM];
+  double a[DIM];
+  double b[DIM];
+  double c[DIM];
+  double n[DIM];
+  double cm_i[DIM];
+  double sum_up[DIM];
   double sum_down = 0;
   for (int i=0; i < DIM; i++) {
     sum_up[i] = 0;
@@ -934,13 +921,6 @@ void Polyhedron::calculate_centroid()
   }
   //Centroid is now calculated and we can free memory
   centroid_calculated = 1;
-  delete[] a;
-  delete[] b;
-  delete[] c;
-  delete[] n;
-  delete[] cm_i;
-  delete[] sum_up;
-  delete[] mean;
 }
 
 /**
@@ -956,13 +936,18 @@ void Polyhedron::calculate_normal()
   if ( !centroid_calculated )
     calculate_centroid();
   //First we allocate memory for temporary variables
-  double *Vout = new double[DIM];
-  double *a    = new double[DIM];
-  double *b    = new double[DIM];
-  double *c    = new double[DIM];
-  double **normals = new double*[Ntetrahedra];
-  for (int i=0; i < Ntetrahedra; i++) {
-    normals[i] = new double[DIM];
+  double Vout[DIM];
+  double a[DIM];
+  double b[DIM];
+  double c[DIM];
+  // one normal per tetrahedron: at most MAX_POLYGONS polygons of at most
+  // MAX_TETRA_PER_POLYGON lines each; a bigger element keeps the heap
+  double normals_fixed[MAX_POLYGONS*MAX_TETRA_PER_POLYGON][DIM];
+  double (*normals)[DIM] = normals_fixed;
+  double (*normals_heap)[DIM] = 0;
+  if ( Ntetrahedra > MAX_POLYGONS*MAX_TETRA_PER_POLYGON ) {
+    normals_heap = new double[Ntetrahedra][DIM];
+    normals = normals_heap;
   }
   int Ntetra = 0; //Index of tetrahedron we are dealing with
   for (int i=0; i < Npolygons; i++ ) {
@@ -1000,14 +985,7 @@ void Polyhedron::calculate_normal()
   }
   //Normal is now determined and we can free memory
   normal_calculated = 1;
-  for (int i=0; i < Ntetrahedra; i++) {
-    delete[] normals[i];
-  }
-  delete[] a;
-  delete[] b;
-  delete[] c;
-  delete[] normals;
-  delete[] Vout;
+  delete[] normals_heap;
 }
 
 /**
@@ -1525,11 +1503,12 @@ void Cube::init(double ***&c, int c_i, double c_v, double *&dex)
  */
 void Cube::split_to_squares()
 {
-  double **sq = new double*[STEPS];
-  int *c_i = new int[STEPS];
-  double *c_v = new double[STEPS];
+  double sq_storage[STEPS][STEPS];
+  double *sq[STEPS];
+  int c_i[STEPS];
+  double c_v[STEPS];
   for (int i=0; i < STEPS; i++) {
-    sq[i] = new double[STEPS]; 
+    sq[i] = sq_storage[i];
   }
   int Nsquares = 0;
   for (int i=0; i < DIM; i++) {
@@ -1557,12 +1536,6 @@ void Cube::split_to_squares()
       }
     }
   }
-  for (int i=0; i < STEPS; i++) {
-    delete[] sq[i];
-  }
-  delete[] sq; 
-  delete[] c_i;
-  delete[] c_v;
 }
 
 /**
@@ -1603,7 +1576,7 @@ void Cube::construct_polygons(double value0)
   if ( ambiguous > 0 ) {
     //Surface is ambiguous, so let's connect the lines to polygons and see how
     //many polygons we have
-    int *not_used = new int[Nlines];
+    int not_used[NSQUARES*2]; //Nlines <= NSQUARES*2
     for (int i=0; i < Nlines; i++) {
       not_used[i] = 1;
     }
@@ -1632,7 +1605,6 @@ void Cube::construct_polygons(double value0)
       //When we have reached this point one complete polygon is formed
       Npolygons++;
     } while ( used < Nlines );
-    delete[] not_used;
   } else {
     //Surface is not ambiguous, so we have only one polygons and all lines
     //can be added to it without ordering them
@@ -1829,11 +1801,14 @@ void Hypercube::init(double ****c, double *dex)
  */
 void Hypercube::split_to_cubes()
 {
-  double ***cu = new double**[STEPS];
+  double cu_storage[STEPS][STEPS][STEPS];
+  double *cu_rows[STEPS][STEPS];
+  double **cu_planes[STEPS];
+  double ***cu = cu_planes;
   for (int i=0; i < STEPS; i++) {
-    cu[i] = new double*[STEPS]; 
+    cu_planes[i] = cu_rows[i];
     for (int j=0; j < STEPS; j++) {
-      cu[i][j] = new double[STEPS]; 
+      cu_rows[i][j] = cu_storage[i][j];
     }
   }
   int Ncubes = 0;
@@ -1862,13 +1837,6 @@ void Hypercube::split_to_cubes()
       Ncubes++;
     }
   }
-  for (int i=0; i < STEPS; i++) {
-    for (int j=0; j < STEPS; j++) {
-      delete[] cu[i][j];
-    }
-    delete[] cu[i];
-  }
-  delete[] cu;
 }
 
 /**
@@ -1899,7 +1867,7 @@ void Hypercube::construct_polyhedrons(double value0)
   if ( ambiguous > 0 ) {
     //Here surface might be ambiguous and we need to connect the polygons and
     //see how many polyhedrons we have
-    int *not_used = new int[Npolygons];
+    int not_used[NCUBES*10]; //Npolygons <= NCUBES*10
     for (int i=0; i < Npolygons; i++) {
       not_used[i] = 1;
     }
@@ -1924,7 +1892,6 @@ void Hypercube::construct_polyhedrons(double value0)
       //When we have reached this point one complete polyhedron is formed
       Npolyhedrons++;
     } while ( used < Npolygons );
-    delete[] not_used;
     /*if ( ambiguous == 0 && Npolyhedrons != 1 ) {
       cout << "error" << endl;
     }*/
@@ -2154,8 +2121,8 @@ void Cornelius::find_surface_2d(double **cube)
     cout << "Cornelius not initialized for 2D case" << endl;
     exit(1);
   }
-  int *c_i = new int[cube_dim];
-  double *c_v = new double[cube_dim];
+  int c_i[2];
+  double c_v[2];
   c_i[0] = 0;
   c_i[1] = 1;
   c_v[0] = 0;
@@ -2170,8 +2137,6 @@ void Cornelius::find_surface_2d(double **cube)
       centroids[i][j] = l[i].get_centroid()[j];
     }
   }
-  delete[] c_i;
-  delete[] c_v;
 }
 
 /**
