@@ -680,6 +680,21 @@ freeze-out surfaces equal to ±2 elements per leg; O+O the same.  That is
 Metal kernel has the same two conditions; it is not yet compiled or run on a
 Mac.
 
+**On the same branch: a larger late time step** (`late_delta_tau` /
+`late_tau_switch`, README.md), so that one physics validation covers both.
+With 0.02 → 0.05 fm/c from τ = 3 fm/c (the X-SCAPE production XMLs), the
+0–10 % Au+Au background takes 272 steps instead of 479 and a jet leg from the
+checkpoint 282 instead of 501 (−43 %); the kernels per step are unchanged, so
+the GPU time per leg drops by the same fraction (the two-event job above: 8.1 s
+of kernels instead of 14.5). The host work per fm/c (checks, string fills) does
+not shrink, so a job alone gains less: a jet event 11.2 → 8.3 s on the GB10.
+The frames stay on their 0.1 fm/c grid (the total energy per frame agrees
+with the constant step to 1e-4 around the switch); the fields differ at the
+level of the time discretization: energy-weighted |Δe|/e above e_fo 2e-4 at
+τ = 3.5 fm/c, 1.2e-3 from 6 fm/c on, single cells ≤ 5e-3, total energy within
+3e-4 — the size of the GPU-vs-CPU difference. With `late_delta_tau 0` the
+output is bit-identical to the stall-break build.
+
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
 | Phase | Change | Per-step speedup | Key kernel-level result |

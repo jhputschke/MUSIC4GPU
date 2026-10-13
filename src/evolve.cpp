@@ -190,6 +190,22 @@ std::uint64_t hash_vector(const std::vector<double> &v, std::uint64_t h) {
 }
 }  // namespace
 
+//! Undo the late-step switch in DATA at the end of a run, and tell the
+//! sources, so that the instance's next run starts with the original step.
+void Evolve::late_step_restore() {
+    if (!late_switched_) return;
+    DATA.delta_tau = late_delta_tau_org_;
+    DATA.facTau = late_facTau_org_;
+    DATA.output_evolution_every_N_timesteps = late_skip_org_;
+    if (hydro_source_terms_ptr) {
+        hydro_source_terms_ptr->hydro_dtau_changed(DATA.delta_tau, -1.);
+    }
+    if (hydro_source_terms_from_jets_ptr_) {
+        hydro_source_terms_from_jets_ptr_->hydro_dtau_changed(DATA.delta_tau, -1.);
+    }
+    late_switched_ = false;
+}
+
 //! Everything that must agree between the run that takes a checkpoint and
 //! the run that starts from it, as "name=value;" fields (exact: hexfloat).
 std::string Evolve::checkpoint_key(Fields &arena) const {
@@ -200,6 +216,7 @@ std::string Evolve::checkpoint_key(Fields &arena) const {
     KEY(nx); KEY(ny); KEY(neta); KEY(nt); KEY(x_size); KEY(y_size);
     KEY(eta_size); KEY(tau_size); KEY(tau0); KEY(delta_x); KEY(delta_y);
     KEY(delta_eta); KEY(delta_tau); KEY(rk_order); KEY(minmod_theta);
+    KEY(late_delta_tau); KEY(late_tau_switch);
     KEY(whichEOS); KEY(facTau); KEY(fac_x); KEY(fac_y); KEY(fac_eta);
     KEY(turn_on_rhob); KEY(turn_on_QS); KEY(viscosity_flag);
     KEY(turn_on_shear); KEY(turn_on_bulk); KEY(turn_on_diff);
@@ -278,6 +295,8 @@ std::string Evolve::resume_rejection(const MusicCheckpoint &c,
         return "the initial-state source has no fingerprint";
     if (c.iFreezeStart != iFreezeStart) return "iFreezeStart differs";
     if (DATA.beastMode == 2 && c.it >= 200) return "beastMode 2 past step 200";
+    if (DATA.late_delta_tau > 0. && c.tau >= DATA.late_tau_switch - 1e-9)
+        return "the checkpoint lies after the late-step switch";
     if (DATA.outputEvolutionData != 0) return "evolution files are written";
     if (DATA.doFreezeOut == 1 && DATA.freeze_out_surface == 1
             && !c.has_surface)
@@ -480,6 +499,13 @@ void Evolve::check_nonfinite_gpu(int it, double tau) {
 
 int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                      Fields &arenaFieldsNext, HydroinfoMUSIC &hydro_info_ptr) {
+    // DATA outlives this run: whatever the late-step switch changed in it
+    // is put back on every way out of here (the next run of this instance
+    // starts with the original step, and so do its sources).
+    struct LateStepGuard {
+        Evolve &e;
+        ~LateStepGuard() { e.late_step_restore(); }
+    } late_step_guard{*this};
     // first pass some control parameters
     int freezeout_flag          = DATA.doFreezeOut;
     int freezeout_lowtemp_flag  = DATA.doFreezeOut_lowtemp;
@@ -594,6 +620,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             resume_frozen = c.frozen;
             it = c.it;
             tau = c.tau;
+            tau_last_check_ = c.tau;   // the checkpoint's step is a freeze-out step
             std::ostringstream m;
             m << "started from the checkpoint at step " << c.it << " (tau = "
               << c.tau << " fm/c)";
@@ -617,6 +644,55 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                 std::max(1, static_cast<int>(
                                 DATA.output_evolution_every_N_timesteps/2)));
         }
+        // A larger step from late_tau_switch on (late_delta_tau > 0): facTau
+        // and the frame cadence are scaled with it, so that the checks and the
+        // stored frames keep their spacing in fm/c.  The switch waits for a
+        // step that is a frame step before and after it, so the frames stay on
+        // their grid; the first check after it is closer to the previous one
+        // than facTau steps, and Cornelius gets that spacing (dtau_check_override_).
+        // The sources are told (hydro_dtau_changed): the jet source's window,
+        // normalization and pruning depend on the step.
+        if (DATA.late_delta_tau > 0. && !late_switched_ && !resumed_step
+                && tau >= DATA.late_tau_switch - 1e-9) {
+            const double ratio = DATA.late_delta_tau/DATA.delta_tau;
+            const int fac_new  = std::max(1, static_cast<int>(
+                                     std::lround(DATA.facTau/ratio)));
+            const int skip_new = std::max(1, static_cast<int>(std::lround(
+                        DATA.output_evolution_every_N_timesteps/ratio)));
+            if (it % DATA.output_evolution_every_N_timesteps == 0
+                    && it % skip_new == 0) {
+                music_message << "late step: delta_tau " << DATA.delta_tau
+                              << " -> " << DATA.late_delta_tau
+                              << " fm/c at step " << it << " (tau = " << tau
+                              << " fm/c), facTau " << DATA.facTau << " -> "
+                              << fac_new << ", a frame every " << skip_new
+                              << " steps";
+                music_message.flush("info");
+                if (std::abs(fac_new*DATA.late_delta_tau
+                             - DATA.facTau*DATA.delta_tau) > 1e-6) {
+                    music_message << "late step: the freeze-out check spacing "
+                                  << "changes from " << DATA.facTau*DATA.delta_tau
+                                  << " to " << fac_new*DATA.late_delta_tau
+                                  << " fm/c";
+                    music_message.flush("warning");
+                }
+                late_delta_tau_org_ = DATA.delta_tau;
+                late_facTau_org_ = DATA.facTau;
+                late_skip_org_ = DATA.output_evolution_every_N_timesteps;
+                DATA.delta_tau = DATA.late_delta_tau;
+                DATA.facTau = fac_new;
+                DATA.output_evolution_every_N_timesteps = skip_new;
+                if (hydro_source_terms_ptr) {
+                    hydro_source_terms_ptr->hydro_dtau_changed(DATA.delta_tau, tau);
+                }
+                if (hydro_source_terms_from_jets_ptr_) {
+                    hydro_source_terms_from_jets_ptr_->hydro_dtau_changed(
+                                                        DATA.delta_tau, tau);
+                }
+                late_switched_ = true;
+                if (tau_last_check_ > 0.) dtau_check_override_ = -1.;
+            }
+        }
         int facTau = DATA.facTau;
         int Nskip_timestep = DATA.output_evolution_every_N_timesteps;
         int Nskip_diag     = DATA.output_diagnostics_every_N_timesteps;
@@ -636,6 +712,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             emax_last_check_ = max_energy_density_raw(*fpCurr);
         } else if (it == iFreezeStart) {
             freezeout_store_step(fo, *fpPrev, *fpCurr);
+            tau_last_check_ = tau;
         }
 
         //if (DATA.Initial_profile == 13) {
@@ -890,7 +967,12 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
             // avoid freeze-out at the first time step
             if ((it - iFreezeStart)%facTau == 0 && it > iFreezeStart) {
                 bench::Timer _bt_fo("evolve.freezeout_surface");
+                if (dtau_check_override_ < 0.) {
+                    dtau_check_override_ = tau - tau_last_check_;
+                }
                 frozen = freezeout_check(fo, tau, *fpPrev, *fpCurr);
+                dtau_check_override_ = 0.;
+                tau_last_check_ = tau;
             }
             if (DATA.reRunHydro) {
                 return(-1);
@@ -1659,7 +1741,9 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
     int fac_y   = DATA.fac_y;
     int fac_eta = 1;
 
-    const double DTAU = facTau*DATA.delta_tau;
+    // the first check after a late-step switch is closer to the previous one
+    const double DTAU = (dtau_check_override_ > 0.) ? dtau_check_override_
+                                                    : facTau*DATA.delta_tau;
     const double DX   = fac_x*DATA.delta_x;
     const double DY   = fac_y*DATA.delta_y;
     const double DETA = fac_eta*DATA.delta_eta;
@@ -2460,7 +2544,9 @@ int Evolve::FindFreezeOutSurface_boostinvariant_Cornelius(
         const double DX   = fac_x*DATA.delta_x;
         const double DY   = fac_y*DATA.delta_y;
         const double DETA = 1.0;
-        const double DTAU = facTau*DATA.delta_tau;
+        // the first check after a late-step switch is closer to the previous one
+        const double DTAU = (dtau_check_override_ > 0.) ? dtau_check_override_
+                                                        : facTau*DATA.delta_tau;
 
         double lattice_spacing[3] = {DTAU, DX, DY};
         double x_fraction[2][3];

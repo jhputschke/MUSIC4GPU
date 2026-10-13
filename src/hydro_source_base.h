@@ -104,6 +104,11 @@ class HydroSourceBase {
     //! get_hydro_*_source() returns exactly zero there, so the caller may skip
     //! evaluating it.  The default is the conservative true.
     virtual bool has_active_sources_current_tau() const {return(true);}
+
+    //! The hydro's time step changed to dtau at tau (late_delta_tau).
+    //! A source whose deposition depends on the step (its window, its
+    //! normalization, its pruning) follows it here; the default ignores it.
+    virtual void hydro_dtau_changed(const double dtau, const double tau) {}
 };
 
 #endif  // SRC_HYDRO_SOURCE_BASE_H_
