@@ -56,9 +56,16 @@ if (USE_METAL)
 
     find_program(XCRUN xcrun REQUIRED)
 
+    # The shaders' minimum macOS follows the C++ code's (CMAKE_OSX_DEPLOYMENT_TARGET, e.g.
+    # 26.0 for a wheel); unset, metal targets its SDK's default, as before.
+    set(METAL_MIN_OS "")
+    if (CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(METAL_MIN_OS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
+
     add_custom_command(
         OUTPUT  ${METAL_AIR}
-        COMMAND ${XCRUN} -sdk macosx metal
+        COMMAND ${XCRUN} -sdk macosx metal ${METAL_MIN_OS}
                     -c ${METAL_SRC}
                     -I ${CMAKE_CURRENT_SOURCE_DIR}/gpu
                     -o ${METAL_AIR}
