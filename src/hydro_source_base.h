@@ -3,6 +3,7 @@
 #define SRC_HYDRO_SOURCE_BASE_H_
 
 #include <cstdint>
+#include <vector>
 #include "data.h"
 #include "pretty_ostream.h"
 #include "data_struct.h"
@@ -104,6 +105,25 @@ class HydroSourceBase {
     //! get_hydro_*_source() returns exactly zero there, so the caller may skip
     //! evaluating it.  The default is the conservative true.
     virtual bool has_active_sources_current_tau() const {return(true);}
+
+    //! Optional: the energy source of every cell of a grid at one query
+    //! time, for a caller that fills its whole grid.  x, y, eta_s are the
+    //! cell centres (ascending).  A source that implements it returns true,
+    //! with (ix, iy, ieta) of each cell where get_hydro_energy_source() is
+    //! non-zero in cells (three entries per cell, each cell once) and its
+    //! j_mu in j_mu (four entries per cell); the values must be exactly those
+    //! of get_hydro_energy_source() and every cell left out exactly zero.
+    //! Only for a source that does not depend on u_mu and whose charge
+    //! sources (rhob, rhoq, rhos) are zero at tau.  A source made of few
+    //! localized pieces (jet droplets) can then visit the cells each piece
+    //! reaches instead of being asked at every cell.  The default returns
+    //! false: the caller asks cell by cell.
+    virtual bool get_hydro_energy_source_on_grid(
+        const double tau, const std::vector<double> &x,
+        const std::vector<double> &y, const std::vector<double> &eta_s,
+        std::vector<int> &cells, std::vector<double> &j_mu) const {
+        return(false);
+    }
 
     //! The hydro's time step changed to dtau at tau (late_delta_tau).
     //! A source whose deposition depends on the step (its window, its

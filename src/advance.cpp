@@ -488,10 +488,37 @@ bool Advance::gpu_features_supported() const {
     return true;
 }
 
+// MUSIC_SOURCE_GRID_FILL: how the pre-pass below gets the jet source.
+//   unset / 1  from the source's grid fill, if it has one (default)
+//   0          cell by cell, as before the grid fill existed
+//   check      the grid fill, and each fill compared with cell by cell
+static int source_grid_fill_mode() {
+    static const int mode = []() {
+        const char* e = getenv("MUSIC_SOURCE_GRID_FILL");
+        if (e == nullptr || e[0] == '\0') return 1;
+        if (e[0] == '0') return 0;
+        if (e[0] == 'c' || e[0] == 'C') return 2;
+        return 1;
+    }();
+    return mode;
+}
+
+Advance::SourceFillCheck::~SourceFillCheck() {
+    if (fills == 0) return;
+    fprintf(stderr, "[MUSIC-SOURCE-CHECK] %ld source fills compared with the "
+                    "loop over all cells: %ld non-zero entries, %ld differ\n",
+            fills, cells, differ);
+}
+
 // CPU-side pre-pass that fills qi_source_buf with tau_rk * j^alpha at each
 // cell.  This mirrors the per-cell logic in FirstRKStepT (alpha = 0..3 for
 // energy + momentum, alpha = 4 for baryon when turn_on_rhob).  The result is
 // consumed by gpu_finalize_ideal when params.has_hydro_source == 1.
+//
+// The initial-state source is asked at every cell.  The jet source is too,
+// unless it implements get_hydro_energy_source_on_grid(): it then hands over
+// the cells its droplets reach -- a few hundred of the grid's millions -- and
+// only those are written.  The buffer holds the same values either way.
 void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
                                           Fields &arenaFieldsCurr,
                                           bool with_main, bool with_jets) {
@@ -504,16 +531,116 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
     const double tauRkFactor = (DATA.CoorType == 1) ? 1.0 : tau_rk;
 
     // qi_source_buf layout: [alpha * Ncells + cell]; written for alpha 0..4.
-    // Zero the buffer first so unused alpha slots stay clean.
     float* qb = gpu_grid_.qi_source_buf;
-    std::memset(qb, 0, static_cast<size_t>(5) * N * sizeof(float));
-
-    const bool rhob_src = (DATA.turn_on_rhob == 1);
 
     // Every cell queries tau_rk: let the sources precompute what depends on
     // it alone once, not per cell (results unchanged).
     if (with_main) hydro_source_terms_ptr->prepare_for_query_tau(tau_rk);
     if (with_jets) hydro_source_terms_from_jets_ptr_->prepare_for_query_tau(tau_rk);
+
+    const int grid_mode = source_grid_fill_mode();
+    bool jets_on_grid = false;
+    if (with_jets && grid_mode != 0) {
+        if (static_cast<int>(src_x_.size()) != Nx
+            || static_cast<int>(src_y_.size()) != Ny
+            || static_cast<int>(src_eta_.size()) != Neta) {
+            // the cell centres, as the loop over all cells computes them
+            src_x_.resize(Nx);
+            src_y_.resize(Ny);
+            src_eta_.resize(Neta);
+            for (int ix = 0; ix < Nx; ++ix)
+                src_x_[ix] = -DATA.x_size/2. + ix * DATA.delta_x;
+            for (int iy = 0; iy < Ny; ++iy)
+                src_y_[iy] = -DATA.y_size/2. + iy * DATA.delta_y;
+            for (int ieta = 0; ieta < Neta; ++ieta)
+                src_eta_[ieta] = -DATA.eta_size/2. + ieta * DATA.delta_eta;
+        }
+        jets_on_grid =
+            hydro_source_terms_from_jets_ptr_->get_hydro_energy_source_on_grid(
+                tau_rk, src_x_, src_y_, src_eta_, src_cells_, src_j_);
+    }
+    // what is left for the loop over all cells
+    const bool loop_jets = with_jets && !jets_on_grid;
+    const bool loop_all  = with_main || loop_jets;
+
+    // Zero what the last fill wrote: the whole buffer after a loop over all
+    // cells (or at the first fill), else just the cells written.  Leaving
+    // the rest untouched also keeps its pages on the GPU.
+    if (loop_all || src_buf_unknown_) {
+        std::memset(qb, 0, static_cast<size_t>(5) * N * sizeof(float));
+    } else {
+        for (const int c : src_written_) {
+            for (int ii = 0; ii < 5; ii++) qb[ii * N + c] = 0.f;
+        }
+    }
+    src_written_.clear();
+    src_buf_unknown_ = loop_all;
+
+    if (loop_all) {
+        fill_hydro_source_all_cells(qb, tau_rk, arenaFieldsCurr,
+                                    with_main, loop_jets);
+    }
+
+    if (jets_on_grid) {
+        // The jet source's cells.  Where the initial-state source is active
+        // as well, the cell's value is redone from both, as the loop over
+        // all cells adds them (in double, before the one cast to float).
+        const size_t n_cells = src_cells_.size() / 3;
+        for (size_t k = 0; k < n_cells; ++k) {
+            const int ix   = src_cells_[3*k];
+            const int iy   = src_cells_[3*k + 1];
+            const int ieta = src_cells_[3*k + 2];
+            const int c = arenaFieldsCurr.getFieldIdx(ix, iy, ieta);
+            EnergyFlowVec j_mu = {0};
+            if (with_main) {
+                FlowVec u_local;
+                for (int ii = 0; ii < 4; ii++)
+                    u_local[ii] = arenaFieldsCurr.u_[ii][c];
+                hydro_source_terms_ptr->get_hydro_energy_source(
+                        tau_rk, src_x_[ix], src_y_[iy], src_eta_[ieta],
+                        u_local, j_mu);
+            }
+            for (int ii = 0; ii < 4; ii++) {
+                j_mu[ii] += src_j_[4*k + ii];
+                qb[ii * N + c] = static_cast<float>(tauRkFactor * j_mu[ii]);
+            }
+            if (!loop_all) src_written_.push_back(c);
+        }
+
+        if (grid_mode == 2) {
+            // compare with the loop over all cells asking both sources
+            std::vector<float> ref(static_cast<size_t>(5) * N, 0.f);
+            fill_hydro_source_all_cells(ref.data(), tau_rk, arenaFieldsCurr,
+                                        with_main, with_jets);
+            long differ = 0, nonzero = 0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                if (ref[i] != 0.f) nonzero++;
+                if (!(ref[i] == qb[i])) {
+                    if (differ < 5 && src_check_.differ == 0) {
+                        fprintf(stderr, "[MUSIC-SOURCE-CHECK] tau = %.4f, "
+                                "alpha %zu, cell %zu: grid fill %.9g, "
+                                "cell by cell %.9g\n", tau_rk, i / N, i % N,
+                                qb[i], ref[i]);
+                    }
+                    differ++;
+                }
+            }
+            src_check_.fills++;
+            src_check_.cells  += nonzero;
+            src_check_.differ += differ;
+        }
+    }
+}
+
+void Advance::fill_hydro_source_all_cells(float* qb, double tau_rk,
+                                          Fields &arenaFieldsCurr,
+                                          bool with_main, bool with_jets) {
+    const int Nx    = arenaFieldsCurr.nX();
+    const int Ny    = arenaFieldsCurr.nY();
+    const int Neta  = arenaFieldsCurr.nEta();
+    const int N     = Nx * Ny * Neta;
+    const double tauRkFactor = (DATA.CoorType == 1) ? 1.0 : tau_rk;
+    const bool rhob_src = (DATA.turn_on_rhob == 1);
 
     // Dynamic, not static: the cost per cell varies by orders of magnitude
     // (cells near a string or droplet evaluate it, the rest skip it at once)

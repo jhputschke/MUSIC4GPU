@@ -123,6 +123,28 @@ class Advance {
     void       prefill_hydro_source_on_cpu(double tau, int rk_flag,
                                            Fields &arenaFieldsCurr,
                                            bool with_main, bool with_jets);
+    // The pre-pass's loop over every cell: writes tau_rk * j^alpha of the
+    // sources selected into out[alpha * Ncells + cell] (alpha 0..3, and 4
+    // with turn_on_rhob); out must be zero where nothing is written.
+    void       fill_hydro_source_all_cells(float* out, double tau_rk,
+                                           Fields &arenaFieldsCurr,
+                                           bool with_main, bool with_jets);
+    // Jet source through HydroSourceBase::get_hydro_energy_source_on_grid:
+    // the source hands over the few cells it reaches, so the pre-pass writes
+    // those instead of asking every cell (same values).  The buffer is then
+    // kept zero elsewhere by clearing only the cells the last fill wrote.
+    std::vector<double> src_x_, src_y_, src_eta_;   // cell centres
+    std::vector<int>    src_cells_;                 // (ix, iy, ieta) per cell
+    std::vector<double> src_j_;                     // j^mu per cell
+    std::vector<int>    src_written_;               // cells of the last fill
+    bool                src_buf_unknown_ = true;    // clear the whole buffer
+    // MUSIC_SOURCE_GRID_FILL=check: every such fill is compared with the
+    // loop over all cells; the run's totals are printed when this object is
+    // destroyed (when the next run is set up, or at the end of the job).
+    struct SourceFillCheck {
+        long fills = 0, cells = 0, differ = 0;
+        ~SourceFillCheck();
+    } src_check_;
 #endif
 
  public:
