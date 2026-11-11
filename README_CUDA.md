@@ -81,7 +81,7 @@ existing CPU code path (per-cell), so results stay correct — just slower.
 | T-dependent ζ/s | in `gpu_first_rk_step_w_full` | modes **0, 1, 2, 3, 7, 8, 9, 10** |
 | 2nd-order coupling terms (W·σ, W·W, π↔Π) | in `gpu_first_rk_step_w_full` | `include_second_order_terms == 1` |
 | QuestRevert regulator | in `gpu_first_rk_step_w_full` | active when `Initial_profile ∉ {0,1}` |
-| Hydro source terms jᵘ (energy + baryon) | `gpu_finalize_ideal` | source **evaluated on CPU** into `qi_source_buf`, integrated on GPU |
+| Hydro source terms jᵘ (energy + baryon) | `gpu_finalize_ideal` | source **evaluated on CPU** into `qi_source_buf`, integrated on GPU (see "Source terms" below) |
 | Boost-invariant (2D) and full 3+1D | all | |
 
 **Falls back to the CPU path (correct, not yet ported):**
@@ -114,6 +114,29 @@ empty or `0` enables it. Example:
 ```sh
 MUSIC_FORCE_CPU=1 ./MUSIChydro input_params
 ```
+
+### Source terms: filled on the CPU, the jet source only where it deposits
+
+The source models stay on the CPU: before each GPU substep with an active source,
+`Advance::prefill_hydro_source_on_cpu` writes tau j^mu of every cell into
+`qi_source_buf`, which `gpu_finalize_ideal` adds on the GPU. Substeps where no
+source can deposit skip the fill (`has_active_sources_current_tau`).
+
+The initial-state (string) source is asked at every cell. The jet source is too,
+unless it implements `HydroSourceBase::get_hydro_energy_source_on_grid`: it then
+returns the cells its droplets reach at that time, with their j^mu, and the fill
+writes only those and zeroes only what the previous fill wrote. X-SCAPE's
+`HydroSourceJETSCAPE` implements it (each droplet is evaluated on the cells inside
+its light cone; `LiquefierBase::get_source_on_grid`). The buffer, and so the
+evolution, is bit-identical to asking every cell: in a Pb+Pb Z+jet job (2.4e6
+cells, 25-110 droplets per event, 5 threads on the GB10) a jet-source fill went
+from 11-12.5 ms to 1.1 ms, i.e. 1.5-3.8 s less per jet event.
+
+`MUSIC_SOURCE_GRID_FILL` selects the path: unset or `1` uses the grid fill when
+the source has one, `0` asks every cell (the previous behaviour), `check` uses the
+grid fill and compares every fill with the loop over all cells, printing
+`[MUSIC-SOURCE-CHECK] ... N differ` per run (0 expected; the check costs as much
+as the old fill).
 
 ### Dilute regions: vacuum at rest, non-finite guard, debug switches
 
