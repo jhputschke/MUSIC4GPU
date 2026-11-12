@@ -227,6 +227,13 @@ void GPUGrid::release() {
         evo_pack_host   = nullptr;
     }
     evo_pack_floats = 0;
+    if (active_blk)     cudaFree(active_blk);
+    if (active_blk_new) cudaFree(active_blk_new);
+    if (active_blk_host) cudaFreeHost(active_blk_host);
+    active_blk = active_blk_new = active_blk_host = nullptr;
+    active_host_pending = false;
+    active_nblk = 0;
+    active_on   = false;
 
     allocated_ = false;
     snap_prev = snap_curr = snap_future = GPUSnapshot{};

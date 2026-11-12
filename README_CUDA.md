@@ -727,6 +727,86 @@ and freed small arrays, and every η slice of every check constructed a new
 13.1 → 9.2 ms (−30 %) and the whole freeze-out step 17.5 → 12.9 ms on the
 GB10 (OMP 4, 0–10 % Au+Au), the surfaces identical.
 
+## Phase 8 — Evolve only the region with matter (C3, opt-in, 2026-11-12)
+
+Every step kernel visited every cell, and two thirds of the 0–10 % Au+Au grid
+(~95 % of O+O's) is vacuum at every step.  With `active_region_eps` > 0
+[GeV/fm³] (README.md; X-SCAPE `<Hydro><MUSIC><active_region_eps>`; default 0,
+the whole grid as before) the seven step kernels run on 8 × 8 × 4 blocks (the
+tile of `gpu_make_w_source_tiled`) and get one flag per block.  A block whose
+flag is 0 returns before it reads or writes anything; its cells are *frozen*.
+
+- **The flags** (`gpu_active_mark`): a block is active if a cell within
+  `active_region_halo` (3) cells has e > `active_region_eps`, or a non-zero
+  source term this substep (strings at τ₀, droplets: the source cells are added
+  after every source fill and stay active until the next rebuild).  Rebuilt at
+  the first substep of a step every `active_region_dtau` (0.1 fm/c), from
+  snap_curr, without a host synchronization (the flags are copied to pinned
+  memory and counted at the next rebuild, for the log).
+- **Freezing** (`gpu_active_freeze`): the three snapshots rotate by pointer, so a
+  skipped cell would cycle through stale values.  When a block turns inactive
+  its cells' fields are copied from snap_curr into snap_prev and snap_future;
+  from then on all three agree and the rotations leave them alone.  Active
+  cells read frozen neighbours through the stencils as before.  Intermediate
+  buffers (`qi_out`, `dwmn`, θ, a, σ, …) are only read at their own cell.
+- **Resets:** after an upload from the host and after a checkpoint restore every
+  block is active until the next rebuild; a checkpoint save forces a rebuild at
+  the next step, so a run restored from the checkpoint (the jet leg) evolves
+  the same blocks as the run that took it (the background): their leading
+  frames stay identical.  The `active_region_*` values are in the checkpoint key.
+- **Switches:** `MUSIC_ACTIVE_REGION_ALL=1` keeps every block active (the
+  block shape, flags and freezing without skipping anything);
+  `MUSIC_ACTIVE_REGION_LOG=1` logs every rebuild.  Every run logs its mean
+  active share.  Metal and the CPU evolve the whole grid (a warning on Metal).
+
+**Not bit-identical**, through the vacuum: the whole grid evolves vacuum cells
+with fluxes at the 1e-12 level and the vacuum-at-rest reset, the active region
+keeps them frozen.  `MUSIC_ACTIVE_REGION_ALL=1` is bit-identical to 0 (every
+field of a 0–10 % Au+Au pair file, 8 events; only `source/flux` differs at
+1e-15, which it does between any two runs: an OpenMP reduction in X-SCAPE's
+`LiquefierBase`).
+
+**Validation** (GB10, 0–10 % Au+Au two-stage, `active_region_eps` 1e-5,
+`--native`, 4 jobs × 8 events, 8 backgrounds, 32 jet events, the late step on):
+- backgrounds: energy-weighted |Δe|/e above e_fo 6e-7–9e-7 (C4's float-rounding
+  level), single cells ≤ 1.4e-2, total fluid energy within 2e-5, freeze-out
+  surfaces within 8 elements per leg (7e-6, 40 legs);
+- jet legs: the same showers in all 32 events; the wake field δe = e_jet − e_bg
+  agrees cell by cell to 0.2 % (L2, median at τ = 8–10 fm/c; max 1.1 %); the
+  wake energy (fluid cells with e ≥ 1e-4) has no bias, (W_on − W_off)/deposit
+  = +0.0006 ± 0.0053, but scatters per event by 1.2 % (median), 5.8 % (90 %):
+  ~0.3–1 GeV per event in the dilute shell (e_bg 1e-3–0.24 GeV/fm³), not in
+  the hot wake (e_bg > e_fo agrees to 1e-3 GeV).  C4 scattered 0.6 % / 2 %,
+  D1 0.8 % / 3 % (js-contrib `REPORT_FINAL_OPTIM.md`).  Hadron-level checks on
+  more events are still to do.
+
+**Gain: the two time-step modes.** C3 cuts the work per step, the late step
+(D1, `late_delta_tau`) the number of steps; they multiply.  The share of the
+grid that holds matter grows as the fireball expands (Au+Au: 40 % of the
+blocks active before τ = 3 fm/c, 66 % after), so C3 saves the least on late
+steps — and those are the steps D1 thins out.  GPU kernel time of a 2-event
+Au+Au job (`nsys`, GB10):
+
+| Au+Au 0–10 %, 2 events | whole grid | active region | C3 factor |
+|---|---:|---:|---:|
+| constant step (`late_delta_tau` 0), 479 steps per background | 17.03 s | 12.59 s | ×0.74 |
+| late step 0.02 → 0.05 fm/c from 3 fm/c, 272 steps (production) | 8.73 s | 6.00 s | ×0.69 |
+
+- With a constant step C3 saves more GPU time (4.4 s against 2.7 s), but a
+  smaller fraction: three quarters of the steps are late, dense ones.  With the
+  late step the remaining steps lean to the early, sparse phase (step-weighted
+  active share 55 % against 60 %).  Both on: ×0.35 of neither.
+- The step kernels scale with the active blocks plus ~10 %: the 8 × 8 × 4 block
+  is a little slower per cell than the default 32 × 2 × 4.  `gpu_active_mark` and
+  `gpu_active_freeze` cost < 1 % of the kernel time.
+- **O+O** (±10.5 fm, 10 events, late step): ~30 % of the blocks active, kernel
+  time 7.20 → 3.40 s (×0.47), a MUSIC step 9.1 → 6.5 ms, the job 20.3 → 16.5 s.
+- **Why not the plan's ×0.35–0.45 for Au+Au:** 34 % of the cells hold
+  e > 1e-5 (31 % above 1e-4), but the 3-cell halo around a large, irregular
+  region and the block granularity make it ~50 % of the blocks (offline from
+  the stored frames: halo 1 gives 46 %, 4 × 4 × 2 blocks 2–3 points less).
+  A threshold of 1e-3 instead of 1e-5 changes it by only ~5 points.
+
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
 | Phase | Change | Per-step speedup | Key kernel-level result |

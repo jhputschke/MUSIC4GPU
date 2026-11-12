@@ -643,6 +643,21 @@ InitData read_in_parameters(std::string input_file) {
     tempinput = Util::StringFind4(input_file, "late_tau_switch");
     if (tempinput != "empty") istringstream(tempinput) >> templatetau;
     parameter_list.late_tau_switch = templatetau;
+    // active_region_eps [GeV/fm^3], active_region_halo [cells],
+    // active_region_dtau [fm/c]: C3, the GPU evolves only the region with
+    // matter (0, the default: the whole grid).  See Advance::try_gpu_advance.
+    double temp_ar_eps = 0.;
+    tempinput = Util::StringFind4(input_file, "active_region_eps");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_ar_eps;
+    parameter_list.active_region_eps = temp_ar_eps;
+    int temp_ar_halo = 3;
+    tempinput = Util::StringFind4(input_file, "active_region_halo");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_ar_halo;
+    parameter_list.active_region_halo = temp_ar_halo;
+    double temp_ar_dtau = 0.1;
+    tempinput = Util::StringFind4(input_file, "active_region_dtau");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_ar_dtau;
+    parameter_list.active_region_dtau = temp_ar_dtau;
     music_message << " DeltaTau = " << parameter_list.delta_tau << " fm";
     music_message.flush("info");
 
@@ -1052,6 +1067,12 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
         parameter_list.late_delta_tau = value;
     if (parameter_name == "late_tau_switch")
         parameter_list.late_tau_switch = value;
+    if (parameter_name == "active_region_eps")
+        parameter_list.active_region_eps = value;
+    if (parameter_name == "active_region_halo")
+        parameter_list.active_region_halo = static_cast<int>(value);
+    if (parameter_name == "active_region_dtau")
+        parameter_list.active_region_dtau = value;
 
     if (parameter_name == "dtau") {
         parameter_list.delta_tau = value;

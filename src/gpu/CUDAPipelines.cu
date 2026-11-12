@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
+#include <vector>
 #include "CUDAPipelines.h"
 #include "GPUGrid.h"
 #include "gpu_types.h"
@@ -41,6 +43,34 @@ static void compute_launch(const GPUGrid& gpu, int max_threads,
     grid  = dim3((gpu.Nx()   + bx - 1) / bx,
                  (gpu.Ny()   + by - 1) / by,
                  (gpu.Neta() + bz - 1) / bz);
+}
+
+// C3, the active region: the block of the step kernels when it is on.
+// 8 x 8 x bz (bz as in compute_launch), the tile of gpu_make_w_source_tiled,
+// so that every kernel's blocks are the blocks gpu_active_mark flags.
+static void active_block_dims(const GPUGrid& gpu, int& bx, int& by, int& bz,
+                              int& gx, int& gy, int& gz) {
+    bx = 8;
+    by = 8;
+    bz = (gpu.Neta() >= 4) ? 4 : (gpu.Neta() < 1 ? 1 : gpu.Neta());
+    gx = (gpu.Nx()   + bx - 1) / bx;
+    gy = (gpu.Ny()   + by - 1) / by;
+    gz = (gpu.Neta() + bz - 1) / bz;
+}
+
+// The launch of a step kernel: compute_launch's block, or with the active
+// region on, its 8 x 8 x bz block and the flags (null when it is off).
+static const unsigned char* step_launch(const GPUGrid& gpu, int max_threads,
+                                        dim3& block, dim3& grid) {
+    if (!gpu.active_on || !gpu.active_blk) {
+        compute_launch(gpu, max_threads, block, grid);
+        return nullptr;
+    }
+    int bx, by, bz, gx, gy, gz;
+    active_block_dims(gpu, bx, by, bz, gx, gy, gz);
+    block = dim3((unsigned)bx, (unsigned)by, (unsigned)bz);
+    grid  = dim3((unsigned)gx, (unsigned)gy, (unsigned)gz);
+    return gpu.active_blk;
 }
 
 static inline void check_launch(const char* name) {
@@ -523,7 +553,8 @@ void CUDAPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& param
     gpu_make_w_source_tiled<<<grid, block, shmem, stream>>>(
         gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
         gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,
-        gpu.dwmn, params);
+        gpu.dwmn, params,
+        (gpu.active_on && gpu.active_blk) ? gpu.active_blk : nullptr);
     check_launch("gpu_make_w_source_tiled");
 }
 
@@ -533,11 +564,11 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
+    const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
     gpu_make_delta_qi<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_dPde,
-        gpu.qi_out, params, gpu.eos_params);
+        gpu.qi_out, params, gpu.eos_params, ab);
     check_launch("gpu_make_delta_qi");
 }
 
@@ -547,14 +578,14 @@ void CUDAPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams&
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
+    const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
     gpu_finalize_ideal<<<grid, block, 0, stream>>>(
         gpu.qi_out, gpu.dwmn,
         gpu.snap_curr.epsilon, gpu.snap_curr.u,
         gpu.snap_prev.epsilon, gpu.snap_prev.rhob, gpu.snap_prev.u,
         gpu.snap_future.epsilon, gpu.snap_future.rhob, gpu.snap_future.u,
         gpu.eos_P, gpu.eos_dPde,
-        params, gpu.eos_params, gpu.qi_source_buf);
+        params, gpu.eos_params, gpu.qi_source_buf, ab);
     check_launch("gpu_finalize_ideal");
 }
 
@@ -564,9 +595,9 @@ void CUDAPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params) 
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
+    const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
     gpu_make_uwrhs<<<grid, block, 0, stream>>>(
-        gpu.snap_curr.Wmunu, gpu.snap_curr.u, gpu.uwrhs_out, params);
+        gpu.snap_curr.Wmunu, gpu.snap_curr.u, gpu.uwrhs_out, params, ab);
     check_launch("gpu_make_uwrhs");
 }
 
@@ -576,10 +607,10 @@ void CUDAPipelines::dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& params
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
+    const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
     gpu_make_du<<<grid, block, 0, stream>>>(
         gpu.snap_curr.u, gpu.snap_prev.u,
-        gpu.theta_buf, gpu.a_buf, gpu.sigma_buf, params);
+        gpu.theta_buf, gpu.a_buf, gpu.sigma_buf, params, ab);
     check_launch("gpu_make_du");
 }
 
@@ -589,9 +620,9 @@ void CUDAPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params) 
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
+    const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
     gpu_make_uprhs<<<grid, block, 0, stream>>>(
-        gpu.snap_curr.pi_b, gpu.snap_curr.u, gpu.uprhs_out, params);
+        gpu.snap_curr.pi_b, gpu.snap_curr.u, gpu.uprhs_out, params, ab);
     check_launch("gpu_make_uprhs");
 }
 
@@ -609,7 +640,7 @@ void CUDAPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     if (!ready_) return;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
-    compute_launch(gpu, max_block_threads_, block, grid);
+    const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
     gpu_first_rk_step_w_full<<<grid, block, 0, stream>>>(
         gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
         gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,
@@ -619,6 +650,92 @@ void CUDAPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
         gpu.snap_future.Wmunu, gpu.snap_future.pi_b,
         gpu.eos_P, gpu.eos_s, gpu.eos_T, gpu.eos_dPde,
         gpu.uprhs_out, params, gpu.eos_params,
-        gpu.snap_future.epsilon, gpu.snap_future.rhob);
+        gpu.snap_future.epsilon, gpu.snap_future.rhob, ab);
     check_launch("gpu_first_rk_step_w_full");
+}
+
+// ── C3: the active region (opt-in) ───────────────────────────────────────────
+
+static GPUSnapPtrs snap_ptrs(const GPUSnapshot& s) {
+    return GPUSnapPtrs{s.epsilon, s.rhob, s.u, s.Wmunu, s.pi_b};
+}
+
+bool CUDAPipelines::active_region_reset(GPUGrid& gpu) {
+    if (!ready_) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    int bx, by, bz, gx, gy, gz;
+    active_block_dims(gpu, bx, by, bz, gx, gy, gz);
+    const int nblk = gx * gy * gz;
+    if (gpu.active_nblk != nblk) {
+        if (gpu.active_blk)      cudaFree(gpu.active_blk);
+        if (gpu.active_blk_new)  cudaFree(gpu.active_blk_new);
+        if (gpu.active_blk_host) cudaFreeHost(gpu.active_blk_host);
+        gpu.active_blk = gpu.active_blk_new = gpu.active_blk_host = nullptr;
+        gpu.active_nblk = 0;
+        if (cudaMalloc(&gpu.active_blk, nblk) != cudaSuccess
+                || cudaMalloc(&gpu.active_blk_new, nblk) != cudaSuccess
+                || cudaHostAlloc(&gpu.active_blk_host, nblk, cudaHostAllocDefault)
+                       != cudaSuccess) {
+            fprintf(stderr, "[MUSIC-GPU] active region: allocation failed\n");
+            if (gpu.active_blk)     cudaFree(gpu.active_blk);
+            if (gpu.active_blk_new) cudaFree(gpu.active_blk_new);
+            gpu.active_blk = gpu.active_blk_new = gpu.active_blk_host = nullptr;
+            return false;
+        }
+        gpu.active_nblk = nblk;
+    }
+    gpu.active_host_pending = false;   // the copy of the old flags is stale
+    cudaMemsetAsync(gpu.active_blk, 1, nblk, stream);
+    return true;
+}
+
+void CUDAPipelines::active_region_rebuild(GPUGrid& gpu, float eps_act, int halo) {
+    if (!ready_ || !gpu.active_blk) return;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    int bx, by, bz, gx, gy, gz;
+    active_block_dims(gpu, bx, by, bz, gx, gy, gz);
+    const int nblk = gpu.active_nblk;
+    const int nc = gpu.Ncells();
+    const int block = 256;
+    const int grid = (nc + block - 1) / block;
+    cudaMemsetAsync(gpu.active_blk_new, 0, nblk, stream);
+    gpu_active_mark<<<grid, block, 0, stream>>>(
+        gpu.snap_curr.epsilon, nullptr, eps_act, halo,
+        gpu.Nx(), gpu.Ny(), gpu.Neta(), bx, by, bz, gx, gy,
+        gpu.active_blk_new);
+    check_launch("gpu_active_mark");
+    gpu_active_freeze<<<grid, block, 0, stream>>>(
+        gpu.active_blk, gpu.active_blk_new,
+        gpu.Nx(), gpu.Ny(), gpu.Neta(), bx, by, bz, gx, gy,
+        snap_ptrs(gpu.snap_curr), snap_ptrs(gpu.snap_prev),
+        snap_ptrs(gpu.snap_future));
+    check_launch("gpu_active_freeze");
+    std::swap(gpu.active_blk, gpu.active_blk_new);
+    // the new flags to pinned host memory, without waiting: counted by
+    // active_region_count once the stream has synchronized
+    cudaMemcpyAsync(gpu.active_blk_host, gpu.active_blk, nblk,
+                    cudaMemcpyDeviceToHost, stream);
+    gpu.active_host_pending = true;
+}
+
+int CUDAPipelines::active_region_count(GPUGrid& gpu) {
+    if (!gpu.active_host_pending || !gpu.active_blk_host) return -1;
+    gpu.active_host_pending = false;
+    int n = 0;
+    for (int i = 0; i < gpu.active_nblk; ++i) n += (gpu.active_blk_host[i] != 0);
+    return n;
+}
+
+void CUDAPipelines::active_region_add_sources(GPUGrid& gpu, int halo) {
+    if (!ready_ || !gpu.active_blk || !gpu.qi_source_buf) return;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    int bx, by, bz, gx, gy, gz;
+    active_block_dims(gpu, bx, by, bz, gx, gy, gz);
+    const int nc = gpu.Ncells();
+    const int block = 256;
+    gpu_active_mark<<<(nc + block - 1) / block, block, 0, stream>>>(
+        nullptr, gpu.qi_source_buf, 0.f, halo,
+        gpu.Nx(), gpu.Ny(), gpu.Neta(), bx, by, bz, gx, gy,
+        gpu.active_blk);
+    check_launch("gpu_active_mark (sources)");
 }

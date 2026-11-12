@@ -59,6 +59,18 @@ DFI float get_pi_b(const float* __restrict__ pi_b,
     return __ldg(&pi_b[c]);
 }
 
+// ── C3: the active region (opt-in, active_region_eps > 0) ─────────────────────
+//
+// With the active region on, the seven step kernels run on 8 x 8 x bz blocks
+// and get a flag per block (gpu_active_mark); a block whose flag is 0 holds
+// only frozen vacuum cells and returns before it reads or writes anything.
+// The check is uniform per block, so the shared-memory kernel can return
+// before its __syncthreads.  null flags (the default): every block runs.
+DFI bool gpu_block_inactive(const unsigned char* __restrict__ active_blk) {
+    return active_blk != nullptr
+        && active_blk[blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)] == 0;
+}
+
 // ── gpu_make_w_source ─────────────────────────────────────────────────────────
 
 __global__ void gpu_make_w_source(
@@ -215,8 +227,10 @@ __global__ void gpu_make_w_source_tiled(
     const float* __restrict__ pi_b_prev,
     const float* __restrict__ u_prev,
     float* __restrict__ dwmn_out,
-    MUSICGridParams params)
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     const int Nx     = params.Nx;
     const int Ny     = params.Ny;
     const int Neta   = params.Neta;
@@ -825,8 +839,10 @@ __global__ void gpu_make_delta_qi(
     const float* __restrict__ eos_dPde,
     float* __restrict__ qi_out,
     MUSICGridParams params,
-    GPUEosParams eos_p)
+    GPUEosParams eos_p,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     int ix   = blockIdx.x * blockDim.x + threadIdx.x;
     int iy   = blockIdx.y * blockDim.y + threadIdx.y;
     int ieta = blockIdx.z * blockDim.z + threadIdx.z;
@@ -953,8 +969,10 @@ __global__ void gpu_finalize_ideal(
     const float* __restrict__ eos_dPde,
     MUSICGridParams params,
     GPUEosParams eos_p,
-    const float* __restrict__ qi_source_in)
+    const float* __restrict__ qi_source_in,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     int ix   = blockIdx.x * blockDim.x + threadIdx.x;
     int iy   = blockIdx.y * blockDim.y + threadIdx.y;
     int ieta = blockIdx.z * blockDim.z + threadIdx.z;
@@ -1020,8 +1038,10 @@ __global__ void gpu_make_uwrhs(
     const float* __restrict__ Wmunu_curr,
     const float* __restrict__ u_curr,
     float* __restrict__ uwrhs_out,
-    MUSICGridParams params)
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     int ix   = blockIdx.x * blockDim.x + threadIdx.x;
     int iy   = blockIdx.y * blockDim.y + threadIdx.y;
     int ieta = blockIdx.z * blockDim.z + threadIdx.z;
@@ -1124,8 +1144,10 @@ __global__ void gpu_make_uprhs(
     const float* __restrict__ pi_b_curr,
     const float* __restrict__ u_curr,
     float* __restrict__ uprhs_out,
-    MUSICGridParams params)
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     int ix   = blockIdx.x * blockDim.x + threadIdx.x;
     int iy   = blockIdx.y * blockDim.y + threadIdx.y;
     int ieta = blockIdx.z * blockDim.z + threadIdx.z;
@@ -1225,8 +1247,10 @@ __global__ void gpu_make_du(
     float* __restrict__ theta_out,
     float* __restrict__ a_out,
     float* __restrict__ sigma_out,
-    MUSICGridParams params)
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     int ix   = blockIdx.x * blockDim.x + threadIdx.x;
     int iy   = blockIdx.y * blockDim.y + threadIdx.y;
     int ieta = blockIdx.z * blockDim.z + threadIdx.z;
@@ -1772,8 +1796,10 @@ __global__ void gpu_first_rk_step_w_full(
     MUSICGridParams params,
     GPUEosParams eos_p,
     const float* __restrict__ epsilon_future,
-    const float* __restrict__ rhob_future)
+    const float* __restrict__ rhob_future,
+    const unsigned char* __restrict__ active_blk)
 {
+    if (gpu_block_inactive(active_blk)) return;
     int ix   = blockIdx.x * blockDim.x + threadIdx.x;
     int iy   = blockIdx.y * blockDim.y + threadIdx.y;
     int ieta = blockIdx.z * blockDim.z + threadIdx.z;
@@ -2088,5 +2114,75 @@ __global__ void gpu_reduce_max_eps_rhob(
     if (tid == 0) {
         atomicMax(reinterpret_cast<int*>(out_eps),  __float_as_int(s_eps[0]));
         atomicMax(reinterpret_cast<int*>(out_rhob), __float_as_int(s_rhob[0]));
+    }
+}
+
+// ── C3: build the active region ───────────────────────────────────────────────
+//
+// gpu_active_mark: one thread per cell.  A cell is active if e > eps_act (when
+// epsilon is given; NaN counts as active) or if any of its 5 source
+// components is non-zero (when qi_source is given).  An active cell sets the
+// flag of every block (bx x by x bz cells, gx x gy blocks per eta layer) that
+// holds a cell within `halo` cells of it.  The stores race only with stores
+// of the same value.
+__global__ void gpu_active_mark(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ qi_source,
+    float eps_act, int halo,
+    int Nx, int Ny, int Neta,
+    int bx, int by, int bz, int gx, int gy,
+    unsigned char* __restrict__ active_blk)
+{
+    const int Ncells = Nx * Ny * Neta;
+    const int c = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= Ncells) return;
+    bool act = false;
+    if (epsilon) act = !(epsilon[c] <= eps_act);
+    if (!act && qi_source) {
+        for (int a = 0; a < 5; ++a) act |= (qi_source[a * Ncells + c] != 0.f);
+    }
+    if (!act) return;
+    const int ix   = c % Nx;
+    const int iy   = (c / Nx) % Ny;
+    const int ieta = c / (Nx * Ny);
+    const int x0 = max(ix - halo, 0) / bx,   x1 = min(ix + halo, Nx - 1) / bx;
+    const int y0 = max(iy - halo, 0) / by,   y1 = min(iy + halo, Ny - 1) / by;
+    const int z0 = max(ieta - halo, 0) / bz, z1 = min(ieta + halo, Neta - 1) / bz;
+    for (int z = z0; z <= z1; ++z)
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x)
+                active_blk[x + gx * (y + gy * z)] = 1;
+}
+
+// gpu_active_freeze: one thread per cell.  A cell whose block was active
+// (old_blk) and is not any more (new_blk) is frozen: snap_curr's fields are
+// copied into snap_prev and snap_future, so that the three buffers agree and
+// the pointer rotations of the RK steps leave the cell where it is.
+__global__ void gpu_active_freeze(
+    const unsigned char* __restrict__ old_blk,
+    const unsigned char* __restrict__ new_blk,
+    int Nx, int Ny, int Neta,
+    int bx, int by, int bz, int gx, int gy,
+    GPUSnapPtrs curr, GPUSnapPtrs prev, GPUSnapPtrs future)
+{
+    const int Ncells = Nx * Ny * Neta;
+    const int c = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= Ncells) return;
+    const int ix   = c % Nx;
+    const int iy   = (c / Nx) % Ny;
+    const int ieta = c / (Nx * Ny);
+    const int b = ix / bx + gx * (iy / by + gy * (ieta / bz));
+    if (!old_blk[b] || new_blk[b]) return;
+    const float e = curr.epsilon[c], r = curr.rhob[c], p = curr.pi_b[c];
+    prev.epsilon[c] = e;  future.epsilon[c] = e;
+    prev.rhob[c]    = r;  future.rhob[c]    = r;
+    prev.pi_b[c]    = p;  future.pi_b[c]    = p;
+    for (int m = 0; m < 4; ++m) {
+        const float v = curr.u[m * Ncells + c];
+        prev.u[m * Ncells + c] = v;  future.u[m * Ncells + c] = v;
+    }
+    for (int m = 0; m < 14; ++m) {
+        const float v = curr.Wmunu[m * Ncells + c];
+        prev.Wmunu[m * Ncells + c] = v;  future.Wmunu[m * Ncells + c] = v;
     }
 }

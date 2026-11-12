@@ -30,7 +30,8 @@ __global__ void gpu_make_w_source_tiled(
     const float* __restrict__ pi_b_prev,
     const float* __restrict__ u_prev,
     float* __restrict__ dwmn_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_delta_qi(
     const float* __restrict__ epsilon_curr,
@@ -40,7 +41,8 @@ __global__ void gpu_make_delta_qi(
     const float* __restrict__ eos_dPde,
     float* __restrict__ qi_out,
     MUSICGridParams params,
-    GPUEosParams eos_p);
+    GPUEosParams eos_p,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_finalize_ideal(
     const float* __restrict__ qi_buf,
@@ -57,19 +59,22 @@ __global__ void gpu_finalize_ideal(
     const float* __restrict__ eos_dPde,
     MUSICGridParams params,
     GPUEosParams eos_p,
-    const float* __restrict__ qi_source_in);
+    const float* __restrict__ qi_source_in,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_uwrhs(
     const float* __restrict__ Wmunu_curr,
     const float* __restrict__ u_curr,
     float* __restrict__ uwrhs_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_uprhs(
     const float* __restrict__ pi_b_curr,
     const float* __restrict__ u_curr,
     float* __restrict__ uprhs_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_du(
     const float* __restrict__ u_curr,
@@ -77,7 +82,8 @@ __global__ void gpu_make_du(
     float* __restrict__ theta_out,
     float* __restrict__ a_out,
     float* __restrict__ sigma_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_first_rk_step_w_full(
     const float* __restrict__ Wmunu_curr,
@@ -103,7 +109,8 @@ __global__ void gpu_first_rk_step_w_full(
     MUSICGridParams params,
     GPUEosParams eos_p,
     const float* __restrict__ epsilon_future,
-    const float* __restrict__ rhob_future);
+    const float* __restrict__ rhob_future,
+    const unsigned char* __restrict__ active_blk);
 
 // Block-parallel max-reduction over epsilon and rhob in snap_curr.
 // Each block reduces blockDim.x cells via shared memory; blocks collaborate
@@ -158,3 +165,29 @@ __global__ void gpu_pack_evolution_ideal(
 // Cell updates in which gpu_first_rk_step_w_full set a non-finite W^{mu nu} or
 // Pi to 0 since the last call; resets the count.  Synchronizes `stream`.
 unsigned int gpu_nonfinite_count_read_and_reset(void* stream);
+
+// The five field arrays of one GPUSnapshot, passed to a kernel by value.
+struct GPUSnapPtrs {
+    float* epsilon;
+    float* rhob;
+    float* u;
+    float* Wmunu;
+    float* pi_b;
+};
+
+// C3, the active region (see music_kernels.cu): flag the blocks within `halo`
+// cells of an active cell, and freeze the cells of blocks that turned inactive.
+__global__ void gpu_active_mark(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ qi_source,
+    float eps_act, int halo,
+    int Nx, int Ny, int Neta,
+    int bx, int by, int bz, int gx, int gy,
+    unsigned char* __restrict__ active_blk);
+
+__global__ void gpu_active_freeze(
+    const unsigned char* __restrict__ old_blk,
+    const unsigned char* __restrict__ new_blk,
+    int Nx, int Ny, int Neta,
+    int bx, int by, int bz, int gx, int gy,
+    GPUSnapPtrs curr, GPUSnapPtrs prev, GPUSnapPtrs future);

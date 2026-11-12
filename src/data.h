@@ -94,6 +94,14 @@ typedef struct init_data {
     //! facTau and the frame cadence are scaled with it (Evolve::EvolveIt)
     double late_delta_tau;
     double late_tau_switch;
+    //! C3, the active region (GPU, CUDA; opt-in): with active_region_eps > 0
+    //! [GeV/fm^3] the GPU evolves only the 8 x 8 x 4 blocks within
+    //! active_region_halo cells of a cell with e > active_region_eps or with
+    //! a source term; the other cells stay frozen.  The region is rebuilt every
+    //! active_region_dtau [fm/c].  0 (the default): the whole grid.
+    double active_region_eps;
+    int    active_region_halo;
+    double active_region_dtau;
     double dtaudxRatio;
 
     bool resetDtau;

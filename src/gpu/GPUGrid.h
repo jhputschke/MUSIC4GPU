@@ -182,6 +182,18 @@ public:
     float* evo_pack_host   = nullptr;
     size_t evo_pack_floats = 0;
 
+    // C3, the active region (opt-in, CUDA): one flag per 8 x 8 x bz block of
+    // the step kernels (device memory, active_nblk bytes; active_blk_new is
+    // the scratch of a rebuild).  Allocated by CUDAPipelines::
+    // active_region_reset, freed in release().  active_on: the step kernels
+    // skip the blocks whose flag is 0 (set by Advance per substep).
+    unsigned char* active_blk     = nullptr;
+    unsigned char* active_blk_new = nullptr;
+    unsigned char* active_blk_host = nullptr;  // pinned copy of the last rebuild
+    int            active_nblk    = 0;
+    bool           active_on      = false;
+    bool           active_host_pending = false;
+
     // Upload pre-sampled EOS tables (P, dP/de, s, T) to GPU shared memory.
     // P / dP/de are sampled at linearly-spaced e ∈ [e_min, e_max]; s and T
     // are sampled at log-spaced e ∈ [1e-6, e_max] (both are strongly

@@ -120,6 +120,13 @@ public:
     // Block until all pending GPU work is done.
     void wait();
 
+    // C3, the active region: CUDA only so far.  The reset fails, so Advance
+    // warns once and evolves the whole grid.
+    bool active_region_reset(GPUGrid&) { return false; }
+    void active_region_rebuild(GPUGrid&, float, int) {}
+    int  active_region_count(GPUGrid&) { return -1; }
+    void active_region_add_sources(GPUGrid&, int) {}
+
     // Batch mode: while a batch is open, all dispatch_* calls share a single
     // command buffer (one commit, one wait).  Saves N-1 command-buffer
     // allocations + commits per substep.  Outside a batch the dispatch_*

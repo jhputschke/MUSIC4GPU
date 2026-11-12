@@ -76,6 +76,21 @@ class Advance {
     // current step (set only when the curr sync was exactly one step ago,
     // else nullptr → sync prev).  Conservative: we never skip unless proven.
     long        gpu_step_count_   = 0;
+    // C3, the active region (DATA.active_region_eps > 0, CUDA): the flags on
+    // the GPU describe the current state (false after an upload from the
+    // host or a checkpoint restore: every block is active until the next
+    // rebuild), the tau of the next rebuild, and the statistics of this run
+    // (active_region_report).
+    bool        active_valid_     = false;
+    bool        active_failed_    = false;
+    double      active_next_tau_  = 0.;
+    long        active_rebuilds_  = 0;
+    double      active_frac_sum_  = 0.;
+    double      active_frac_min_  = 1.;
+    double      active_frac_max_  = 0.;
+    double      active_pending_tau_ = 0.;  // tau of the rebuild not counted yet
+    void        active_region_step(double tau, int rk_flag, bool uploaded);
+    void        active_region_tally(bool log);
     const void* curr_synced_buf_  = nullptr;
     long        curr_synced_step_ = -2;
     const void* prev_fresh_buf_   = nullptr;
@@ -215,6 +230,9 @@ class Advance {
     // Cell updates since the last call in which the GPU set a non-finite
     // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();
+    // C3: log the active region's share of the blocks over this run (if it
+    // was on) and reset the statistics; called at the end of a run.
+    void active_region_report();
 
     // Bring snap_curr/snap_prev back into the host arenas if the GPU has
     // been authoritative across the timestep boundary.  Multiple flavours
