@@ -120,12 +120,28 @@ public:
     // Block until all pending GPU work is done.
     void wait();
 
-    // C3, the active region: CUDA only so far.  The reset fails, so Advance
-    // warns once and evolves the whole grid.
-    bool active_region_reset(GPUGrid&) { return false; }
-    void active_region_rebuild(GPUGrid&, float, int) {}
-    int  active_region_count(GPUGrid&) { return -1; }
-    void active_region_add_sources(GPUGrid&, int) {}
+    // C3, the active region (opt-in; MUSIC's active_region_eps > 0), as
+    // CUDAPipelines.  With gpu.active_on the seven step kernels skip the
+    // 8 x 8 x 4 threadgroups whose flag in gpu.active_blk is 0: the cells there
+    // are frozen (the same values in snap_prev, snap_curr and snap_future).
+    // The flags live in shared MTLBuffers owned by the GPUGrid
+    // (gpu.active_mtl); the fills, the rebuild and the copy of its flags for
+    // active_region_count are encoded on the queue (in the open batch, if
+    // any), so the calls do not wait.
+    //   active_region_reset: allocate the flags if needed, every block active.
+    //       false if the metallib lacks the C3 kernels (Advance then warns
+    //       once and evolves the whole grid).
+    //   active_region_rebuild: flag the blocks within `halo` cells of a cell
+    //       of snap_curr with e > eps_act [1/fm^4], freeze the cells of the
+    //       blocks that were active and are not any more.
+    //   active_region_count: the number of active blocks of the last rebuild
+    //       (-1 if none is pending); waits for the queue.
+    //   active_region_add_sources: also flag the blocks within `halo` cells
+    //       of a cell with a non-zero qi_source_buf (after the source fill).
+    bool active_region_reset(GPUGrid& gpu);
+    void active_region_rebuild(GPUGrid& gpu, float eps_act, int halo);
+    int  active_region_count(GPUGrid& gpu);
+    void active_region_add_sources(GPUGrid& gpu, int halo);
 
     // Batch mode: while a batch is open, all dispatch_* calls share a single
     // command buffer (one commit, one wait).  Saves N-1 command-buffer
@@ -152,6 +168,8 @@ private:
     void*  pso_w_full_    = nullptr;  // id<MTLComputePipelineState>
     void*  pso_uprhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  pso_pack_evo_  = nullptr;  // id<MTLComputePipelineState> (Phase 2b)
+    void*  pso_active_mark_   = nullptr;  // id<MTLComputePipelineState> (C3)
+    void*  pso_active_freeze_ = nullptr;  // id<MTLComputePipelineState> (C3)
     void*  cmd_buf_       = nullptr;  // last id<MTLCommandBuffer>
     void*  batch_cb_      = nullptr;  // open batch id<MTLCommandBuffer>, or null
 
@@ -163,4 +181,17 @@ private:
     // one uint32 (atomic_uint in the kernel): see read_and_reset_nonfinite
     void*  nonfinite_buf_   = nullptr;  // id<MTLBuffer>
     size_t evo_pack_floats_ = 0;
+
+    // The command buffer for the next encoder: the open batch, or a new one
+    // (own = true) that close_cb commits and keeps in cmd_buf_ for wait().
+    // void* = id<MTLCommandBuffer>.
+    void* open_cb(bool& own);
+    void  close_cb(void* cb, bool own);
+    // C3: bind gpu.active_blk and the active_on flag at buffer(index) and
+    // buffer(index + 1) of a step kernel; void* = id<MTLComputeCommandEncoder>.
+    void  bind_active(void* enc, const GPUGrid& gpu, int index);
+    // C3: run gpu_active_mark on snap_curr (use_eps) or qi_source_buf
+    // (use_src) into `flags`, in command buffer `cb`.
+    void  encode_active_mark(void* cb, GPUGrid& gpu, unsigned char* flags,
+                             float eps_act, int halo, int use_eps, int use_src);
 };

@@ -757,7 +757,20 @@ flag is 0 returns before it reads or writes anything; its cells are *frozen*.
 - **Switches:** `MUSIC_ACTIVE_REGION_ALL=1` keeps every block active (the
   block shape, flags and freezing without skipping anything);
   `MUSIC_ACTIVE_REGION_LOG=1` logs every rebuild.  Every run logs its mean
-  active share.  Metal and the CPU evolve the whole grid (a warning on Metal).
+  active share.  The CPU path evolves the whole grid.
+
+**Metal** (port added 2026-11-12, **not yet run on a Mac**): the Metal step
+kernels already run on 8 × 8 × 4 threadgroups, so the threadgroup is the
+block; each of the seven gets the flags and an `active_on` word (two more
+buffer bindings; with the region off a dummy buffer and 0) and returns at
+once for an inactive threadgroup.  `gpu_active_mark` / `gpu_active_freeze`
+are ported one to one (`GPUActiveParams` in `gpu_types.h`); the flags are
+shared `MTLBuffer`s of the `GPUGrid` (`active_mtl`), and the fills, the
+rebuild and the copy of the flags for the count are encoded on the queue
+like the step kernels.  A metallib without the two kernels makes the reset
+fail: a warning, and the whole grid as before.  To validate on a Mac:
+`MUSIC_ACTIVE_REGION_ALL=1` must give output identical to
+`active_region_eps` 0, and 1e-5 should agree with 0 as on CUDA above.
 
 **Not bit-identical**, through the vacuum: the whole grid evolves vacuum cells
 with fluxes at the 1e-12 level and the vacuum-at-rest reset, the active region

@@ -76,7 +76,7 @@ class Advance {
     // current step (set only when the curr sync was exactly one step ago,
     // else nullptr → sync prev).  Conservative: we never skip unless proven.
     long        gpu_step_count_   = 0;
-    // C3, the active region (DATA.active_region_eps > 0, CUDA): the flags on
+    // C3, the active region (DATA.active_region_eps > 0, CUDA and Metal): the flags on
     // the GPU describe the current state (false after an upload from the
     // host or a checkpoint restore: every block is active until the next
     // rebuild), the tau of the next rebuild, and the statistics of this run

@@ -176,6 +176,15 @@ void GPUGrid::release() {
     eos_params = {};
     reduce_eps_out  = nullptr;
     reduce_rhob_out = nullptr;
+    // C3: the active-region flags (MetalPipelines::active_region_reset)
+    for (void*& h : active_mtl) {
+        if (h) CFRelease(h);
+        h = nullptr;
+    }
+    active_blk = active_blk_new = active_blk_host = nullptr;
+    active_host_pending = false;
+    active_nblk = 0;
+    active_on   = false;
 }
 
 // ── AoS → SoA (double → float) ───────────────────────────────────────────────

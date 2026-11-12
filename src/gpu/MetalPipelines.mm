@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <dlfcn.h>
 #include "MetalPipelines.h"
 #include "GPUGrid.h"
@@ -43,6 +44,8 @@ MetalPipelines& MetalPipelines::instance() {
 MetalPipelines::~MetalPipelines() {
     if (nonfinite_buf_) { CFRelease(nonfinite_buf_); }
     if (evo_pack_buf_) { CFRelease(evo_pack_buf_); }
+    if (pso_active_freeze_) { CFRelease(pso_active_freeze_); }
+    if (pso_active_mark_)   { CFRelease(pso_active_mark_); }
     if (pso_pack_evo_) { CFRelease(pso_pack_evo_); }
     if (pso_uprhs_)    { CFRelease(pso_uprhs_); }
     if (pso_w_full_)   { CFRelease(pso_w_full_); }
@@ -245,6 +248,18 @@ bool MetalPipelines::initialize(const char* metallib_path) {
         return false;
     }
     pso_pack_evo_ = (__bridge_retained void*)pso_pk;
+
+    // 12. C3, the active region (gpu_active_mark, gpu_active_freeze).
+    // Optional: without them (an older metallib) active_region_reset fails,
+    // and an active_region_eps > 0 run evolves the whole grid with a warning.
+    for (auto kv : {std::make_pair("gpu_active_mark",   &pso_active_mark_),
+                    std::make_pair("gpu_active_freeze", &pso_active_freeze_)}) {
+        id<MTLFunction> f = [lib newFunctionWithName:
+                                 [NSString stringWithUTF8String:kv.first]];
+        id<MTLComputePipelineState> ps =
+            f ? [dev newComputePipelineStateWithFunction:f error:&err] : nil;
+        if (ps) *kv.second = (__bridge_retained void*)ps;
+    }
 
     // Non-finite counter for gpu_first_rk_step_w_full (buffer 24): one uint32,
     // shared, so the host reads and resets it directly.
@@ -587,6 +602,9 @@ void MetalPipelines::dispatch_w_source(GPUGrid& gpu, const MUSICGridParams& para
     [enc setBytes:&params length:sizeof(params) atIndex:7];
 
     // 3-D thread grid: one thread per cell (ix, iy, ieta)
+    // C3: the active-region flags (buffer 8) and active_on (9)
+    bind_active((__bridge void*)enc, gpu, 8);
+
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
         (gpu.Nx()   + 7) / 8,
@@ -646,6 +664,9 @@ void MetalPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& para
     [enc setBytes:&params          length:sizeof(params)          atIndex:6];
     [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:7];
 
+    // C3: the active-region flags (buffer 8) and active_on (9)
+    bind_active((__bridge void*)enc, gpu, 8);
+
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
         (gpu.Nx()   + 7) / 8,
@@ -704,6 +725,9 @@ void MetalPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams
     [enc setBytes:&gpu.eos_params  length:sizeof(gpu.eos_params)  atIndex:13];
     [enc setBuffer:get_buf(gpu.qi_source_buf)       offset:0 atIndex:14];
 
+    // C3: the active-region flags (buffer 15) and active_on (16)
+    bind_active((__bridge void*)enc, gpu, 15);
+
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
         (gpu.Nx()   + 7) / 8,
@@ -749,6 +773,9 @@ void MetalPipelines::dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params)
     [enc setBuffer:get_buf(gpu.snap_curr.u)     offset:0 atIndex:1];
     [enc setBuffer:get_buf(gpu.uwrhs_out)       offset:0 atIndex:2];
     [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+    // C3: the active-region flags (buffer 4) and active_on (5)
+    bind_active((__bridge void*)enc, gpu, 4);
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
@@ -797,6 +824,9 @@ void MetalPipelines::dispatch_make_du(GPUGrid& gpu, const MUSICGridParams& param
     [enc setBuffer:get_buf(gpu.a_buf)       offset:0 atIndex:3];
     [enc setBuffer:get_buf(gpu.sigma_buf)   offset:0 atIndex:4];
     [enc setBytes:&params length:sizeof(params) atIndex:5];
+
+    // C3: the active-region flags (buffer 6) and active_on (7)
+    bind_active((__bridge void*)enc, gpu, 6);
 
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
@@ -867,6 +897,9 @@ void MetalPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     [enc setBuffer:get_buf(gpu.snap_future.rhob)    offset:0 atIndex:23];
     [enc setBuffer:(__bridge id<MTLBuffer>)nonfinite_buf_ offset:0 atIndex:24];
 
+    // C3: the active-region flags (buffer 25) and active_on (26)
+    bind_active((__bridge void*)enc, gpu, 25);
+
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
         (gpu.Nx()   + 7) / 8,
@@ -912,6 +945,9 @@ void MetalPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params)
     [enc setBuffer:get_buf(gpu.uprhs_out)      offset:0 atIndex:2];
     [enc setBytes:&params length:sizeof(params) atIndex:3];
 
+    // C3: the active-region flags (buffer 4) and active_on (5)
+    bind_active((__bridge void*)enc, gpu, 4);
+
     MTLSize threads_per_group = MTLSizeMake(8, 8, 4);
     MTLSize num_groups = MTLSizeMake(
         (gpu.Nx()   + 7) / 8,
@@ -926,4 +962,223 @@ void MetalPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params)
         if (cmd_buf_) CFRelease(cmd_buf_);
         cmd_buf_ = (__bridge_retained void*)cb;
     }
+}
+
+// ── command buffers ──────────────────────────────────────────────────────────
+
+// A new command buffer comes back retained (+1); close_cb commits it and hands
+// that reference to cmd_buf_, as the dispatch_* methods do.  The open batch's
+// buffer is owned by batch_cb_ and only borrowed here.
+void* MetalPipelines::open_cb(bool& own) {
+    own = (batch_cb_ == nullptr);
+    if (!own) return batch_cb_;
+    auto q = (__bridge id<MTLCommandQueue>)cmd_queue_;
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    return (__bridge_retained void*)cb;
+}
+
+void MetalPipelines::close_cb(void* cbp, bool own) {
+    if (!own) return;
+    auto cb = (__bridge id<MTLCommandBuffer>)cbp;
+    [cb commit];
+    if (cmd_buf_) CFRelease(cmd_buf_);
+    cmd_buf_ = cbp;   // the reference open_cb took
+}
+
+// ── C3: the active region (opt-in) ───────────────────────────────────────────
+//
+// Port of the CUDAPipelines methods.  The step kernels' threadgroups are
+// 8 x 8 x 4 cells on a ceil(N/8) x ceil(N/8) x ceil(Neta/4) grid (every
+// dispatch above), and the flags use the same blocks.  The flag buffers are
+// shared MTLBuffers of the GPUGrid, padded to a multiple of 4 bytes for the
+// blit fills and copies (macOS wants 4-byte multiples there).
+
+namespace {
+void active_dims(const GPUGrid& gpu, int& gx, int& gy, int& gz) {
+    gx = (gpu.Nx()   + 7) / 8;
+    gy = (gpu.Ny()   + 7) / 8;
+    gz = (gpu.Neta() + 3) / 4;
+}
+
+size_t active_bytes(int nblk) { return (static_cast<size_t>(nblk) + 3) & ~size_t(3); }
+
+// the MTLBuffer behind one of the GPUGrid's flag pointers
+id<MTLBuffer> active_buffer(const GPUGrid& gpu, const unsigned char* ptr) {
+    if (!ptr) return nil;
+    for (void* h : gpu.active_mtl) {
+        if (!h) continue;
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)h;
+        if (static_cast<const unsigned char*>([b contents]) == ptr) return b;
+    }
+    return nil;
+}
+
+GPUActiveParams active_params(const GPUGrid& gpu, float eps_act, int halo,
+                              int use_eps, int use_src) {
+    GPUActiveParams ap;
+    ap.eps_act = eps_act;
+    ap.halo    = halo;
+    ap.use_eps = use_eps;
+    ap.use_src = use_src;
+    ap.Nx = gpu.Nx();  ap.Ny = gpu.Ny();  ap.Neta = gpu.Neta();
+    ap.bx = 8;  ap.by = 8;  ap.bz = 4;
+    int gz;
+    active_dims(gpu, ap.gx, ap.gy, gz);
+    return ap;
+}
+
+void dispatch_cells(id<MTLComputeCommandEncoder> enc, const GPUGrid& gpu) {
+    const NSUInteger tgw = 256;
+    const NSUInteger nc  = static_cast<NSUInteger>(gpu.Ncells());
+    [enc dispatchThreadgroups:MTLSizeMake((nc + tgw - 1) / tgw, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tgw, 1, 1)];
+}
+}  // namespace
+
+void MetalPipelines::bind_active(void* encp, const GPUGrid& gpu, int index) {
+    auto enc = (__bridge id<MTLComputeCommandEncoder>)encp;
+    uint32_t on = 0u;
+    id<MTLBuffer> b = nil;
+    if (gpu.active_on && gpu.active_blk) {
+        b = active_buffer(gpu, gpu.active_blk);
+        if (b) on = 1u;
+    }
+    // active_on == 0: the kernel never reads the flags; any buffer will do
+    if (!b) b = (__bridge id<MTLBuffer>)nonfinite_buf_;
+    [enc setBuffer:b offset:0 atIndex:index];
+    [enc setBytes:&on length:sizeof(on) atIndex:index + 1];
+}
+
+bool MetalPipelines::active_region_reset(GPUGrid& gpu) {
+    if (!ready_ || !pso_active_mark_ || !pso_active_freeze_) return false;
+    int gx, gy, gz;
+    active_dims(gpu, gx, gy, gz);
+    const int nblk = gx * gy * gz;
+    const size_t bytes = active_bytes(nblk);
+    if (gpu.active_nblk != nblk) {
+        for (void*& h : gpu.active_mtl) {
+            if (h) CFRelease(h);   // a command buffer still using it retains it
+            h = nullptr;
+        }
+        gpu.active_blk = gpu.active_blk_new = gpu.active_blk_host = nullptr;
+        gpu.active_nblk = 0;
+        auto dev = (__bridge id<MTLDevice>)device_;
+        unsigned char** ptrs[3] = {&gpu.active_blk, &gpu.active_blk_new,
+                                   &gpu.active_blk_host};
+        for (int i = 0; i < 3; ++i) {
+            id<MTLBuffer> b = [dev newBufferWithLength:bytes
+                                               options:MTLResourceStorageModeShared];
+            if (!b) {
+                fprintf(stderr, "[MUSIC-GPU] active region: allocation failed\n");
+                for (void*& h : gpu.active_mtl) {
+                    if (h) CFRelease(h);
+                    h = nullptr;
+                }
+                gpu.active_blk = gpu.active_blk_new = gpu.active_blk_host = nullptr;
+                return false;
+            }
+            gpu.active_mtl[i] = (__bridge_retained void*)b;
+            *ptrs[i] = static_cast<unsigned char*>([b contents]);
+        }
+        gpu.active_nblk = nblk;
+    }
+    gpu.active_host_pending = false;   // the copy of the old flags is stale
+    bool own;
+    auto cb = (__bridge id<MTLCommandBuffer>)open_cb(own);
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit fillBuffer:active_buffer(gpu, gpu.active_blk)
+               range:NSMakeRange(0, bytes) value:1];
+    [blit endEncoding];
+    close_cb((__bridge void*)cb, own);
+    return true;
+}
+
+void MetalPipelines::encode_active_mark(void* cbp, GPUGrid& gpu,
+                                        unsigned char* flags, float eps_act,
+                                        int halo, int use_eps, int use_src) {
+    auto cb = (__bridge id<MTLCommandBuffer>)cbp;
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    const GPUActiveParams ap = active_params(gpu, eps_act, halo, use_eps, use_src);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso_active_mark_];
+    [enc setBuffer:buffer_for_ptr(handles, n_handles, gpu.snap_curr.epsilon)
+            offset:0 atIndex:0];
+    [enc setBuffer:buffer_for_ptr(handles, n_handles, gpu.qi_source_buf)
+            offset:0 atIndex:1];
+    [enc setBuffer:active_buffer(gpu, flags) offset:0 atIndex:2];
+    [enc setBytes:&ap length:sizeof(ap) atIndex:3];
+    dispatch_cells(enc, gpu);
+    [enc endEncoding];
+}
+
+void MetalPipelines::active_region_rebuild(GPUGrid& gpu, float eps_act, int halo) {
+    if (!ready_ || !gpu.active_blk || !pso_active_mark_ || !pso_active_freeze_) return;
+    const size_t bytes = active_bytes(gpu.active_nblk);
+    id<MTLBuffer> old_b = active_buffer(gpu, gpu.active_blk);
+    id<MTLBuffer> new_b = active_buffer(gpu, gpu.active_blk_new);
+    id<MTLBuffer> host_b = active_buffer(gpu, gpu.active_blk_host);
+    if (!old_b || !new_b || !host_b) return;
+
+    bool own;
+    void* cbp = open_cb(own);
+    auto cb = (__bridge id<MTLCommandBuffer>)cbp;
+
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit fillBuffer:new_b range:NSMakeRange(0, bytes) value:0];
+    [blit endEncoding];
+
+    encode_active_mark(cbp, gpu, gpu.active_blk_new, eps_act, halo, 1, 0);
+
+    int    n_handles = gpu.buf_handle_count();
+    void** handles   = gpu.buf_handle_ptr();
+    auto get_buf = [&](const float* ptr) -> id<MTLBuffer> {
+        return buffer_for_ptr(handles, n_handles, ptr);
+    };
+    const GPUActiveParams ap = active_params(gpu, eps_act, halo, 1, 0);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso_active_freeze_];
+    // Binding order — must match gpu_active_freeze in music_kernels.metal.
+    [enc setBuffer:old_b offset:0 atIndex:0];
+    [enc setBuffer:new_b offset:0 atIndex:1];
+    int i = 2;
+    for (const GPUSnapshot* sn : {&gpu.snap_curr, &gpu.snap_prev, &gpu.snap_future}) {
+        [enc setBuffer:get_buf(sn->epsilon) offset:0 atIndex:i++];
+        [enc setBuffer:get_buf(sn->rhob)    offset:0 atIndex:i++];
+        [enc setBuffer:get_buf(sn->u)       offset:0 atIndex:i++];
+        [enc setBuffer:get_buf(sn->Wmunu)   offset:0 atIndex:i++];
+        [enc setBuffer:get_buf(sn->pi_b)    offset:0 atIndex:i++];
+    }
+    [enc setBytes:&ap length:sizeof(ap) atIndex:17];
+    dispatch_cells(enc, gpu);
+    [enc endEncoding];
+
+    std::swap(gpu.active_blk, gpu.active_blk_new);
+
+    // the new flags into the host copy, before add_sources adds to them:
+    // counted by active_region_count
+    blit = [cb blitCommandEncoder];
+    [blit copyFromBuffer:new_b sourceOffset:0 toBuffer:host_b
+       destinationOffset:0 size:bytes];
+    [blit endEncoding];
+    gpu.active_host_pending = true;
+
+    close_cb(cbp, own);
+}
+
+int MetalPipelines::active_region_count(GPUGrid& gpu) {
+    if (!gpu.active_host_pending || !gpu.active_blk_host) return -1;
+    wait();   // the copy is on the queue
+    gpu.active_host_pending = false;
+    int n = 0;
+    for (int i = 0; i < gpu.active_nblk; ++i) n += (gpu.active_blk_host[i] != 0);
+    return n;
+}
+
+void MetalPipelines::active_region_add_sources(GPUGrid& gpu, int halo) {
+    if (!ready_ || !gpu.active_blk || !gpu.qi_source_buf || !pso_active_mark_) return;
+    bool own;
+    void* cbp = open_cb(own);
+    encode_active_mark(cbp, gpu, gpu.active_blk, 0.f, halo, 0, 1);
+    close_cb(cbp, own);
 }
