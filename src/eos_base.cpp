@@ -248,8 +248,11 @@ void EOS_base::getThermalVariables(
     thermalVec.push_back(rhos);
     thermalVec.push_back(get_muQ(epsilon, rhob, rhoq, rhos));
     thermalVec.push_back(rhoq);
-    double entropy = ((epsilon + p - thermalVec[7]*rhob - thermalVec[8]*rhoq
-                       - thermalVec[10]*rhos)/(thermalVec[6] + small_eps));
+    // s = (e + P - mu_B rho_B - mu_Q rho_Q - mu_S rho_S)/T, with mu_S in
+    // slot 8 and mu_Q in slot 10 (the two were swapped here, so the entropy
+    // was off whenever rho_Q or rho_S is non-zero; get_entropy() had it right)
+    double entropy = ((epsilon + p - thermalVec[7]*rhob - thermalVec[10]*rhoq
+                       - thermalVec[8]*rhos)/(thermalVec[6] + small_eps));
     entropy = std::max(small_eps, entropy);
     thermalVec.push_back(entropy);
     thermalVec.push_back(dpdrhoq);

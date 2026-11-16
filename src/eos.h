@@ -23,7 +23,10 @@ class EOS {
     // functions to call the function pointers
     double get_pressure(double e, double rhob,
                         double rhoq=0.0, double rhos=0.0) const {
-        return(eos_ptr->get_pressure(e, rhob));
+        // all four densities: the 4D EOS depends on rhoq and rhos (before,
+        // the pressure was taken at rhoq = rhos = 0, while T, mu and cs2
+        // were not; every other EOS ignores the two extra arguments)
+        return(eos_ptr->get_pressure(e, rhob, rhoq, rhos));
     }
 
     void get_pressure_with_gradients(double epsilon, double rhob, double rhoq,
@@ -47,7 +50,7 @@ class EOS {
     double get_entropy    (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->get_entropy(e, rhob, rhoq, rhos));}
     double get_cs2        (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->get_cs2(e, rhob, rhoq, rhos));}
     double get_dpde       (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->p_e_func(e, rhob, rhoq, rhos));}
-    double get_dpdrhob    (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->p_rho_func(e, rhob));}
+    double get_dpdrhob    (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->p_rho_func(e, rhob, rhoq, rhos));}
     double get_muB        (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->get_muB(e, rhob, rhoq, rhos));}
     double get_muS        (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->get_muS(e, rhob, rhoq, rhos));}
     double get_muQ        (double e, double rhob, double rhoq=0.0, double rhos=0.0) const {return(eos_ptr->get_muQ(e, rhob, rhoq, rhos));}
@@ -60,6 +63,9 @@ class EOS {
     }
 
     double get_eps_max() const {return(eos_ptr->get_eps_max());}
+    bool get_4D_table_info(EOS4DTableInfo &info) const {
+        return(eos_ptr->get_4D_table_info(info));
+    }
     void   check_eos()   const {return(eos_ptr->check_eos());}
 };
 

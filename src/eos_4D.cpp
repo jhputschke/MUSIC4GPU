@@ -574,3 +574,29 @@ double EOS_4D::get_muQ(double e, double rhob, double rhoq, double rhos) const {
     FourDLInterp(muq_vec, TildeVar, ResArr);  // 1/fm
     return(static_cast<double>(ResArr[0]));
 }
+
+
+bool EOS_4D::get_4D_table_info(EOS4DTableInfo &info) const {
+    if (pressure_vec.empty()) return false;
+    info.N_T = N_T;
+    info.N_mub = N_mub;
+    info.N_muq = N_muq;
+    info.N_mus = N_mus;
+    info.T0 = Ttilde0;
+    info.mub0 = mubtilde0;
+    info.muq0 = muqtilde0;
+    info.mus0 = mustilde0;
+    info.dT = dTtilde;
+    info.dmub = dmubtilde;
+    info.dmuq = dmuqtilde;
+    info.dmus = dmustilde;
+    info.one_over_alphaNf = OneoveralphaNf;
+    info.has_cs = file_for_cs_;
+    info.tables[0] = &pressure_vec;
+    info.tables[1] = &temp_vec;
+    info.tables[2] = &mub_vec;
+    info.tables[3] = &muq_vec;
+    info.tables[4] = &mus_vec;
+    info.tables[5] = &cs_vec;
+    return true;
+}

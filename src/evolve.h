@@ -108,6 +108,8 @@ class Evolve {
                            int frozen, double eps_max_cur,
                            Fields &arena_current, HydroinfoMUSIC &hydro_info);
 
+    void dump_state_at_step_if_requested(int tauIdx, Fields &prev,
+                                         Fields &curr);
  public:
     Evolve(const EOS &eos, InitData &DATA_in,
            std::shared_ptr<HydroSourceBase> hydro_source_ptr_in,

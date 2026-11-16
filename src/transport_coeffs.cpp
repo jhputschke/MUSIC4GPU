@@ -83,7 +83,11 @@ double TransportCoeffs::get_muB_dependence_shear_piecewise(
 
 double TransportCoeffs::get_muB_dependence_shear_profile(
                                                 const double muB_in_fm) const {
-    const double muB_in_GeV = muB_in_fm*hbarc;
+    // |mu_B|: the power of a negative mu_B was NaN, which get_eta_over_s
+    // clipped to eta/s = 0 (and the WW term's tau_pi/eta to infinity) in
+    // every cell with mu_B < 0, including float noise around mu_B = 0; the
+    // piecewise form (mode 7) uses |mu_B| as well
+    const double muB_in_GeV = std::abs(muB_in_fm)*hbarc;
     const double alpha = DATA.shear_muBDep_alpha;
     const double muB_slope = DATA.shear_muBDep_slope;
     const double muB_scale = DATA.shear_muBDep_scale;

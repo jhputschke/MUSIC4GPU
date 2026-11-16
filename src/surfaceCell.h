@@ -17,6 +17,8 @@ class SurfaceCell {
     float mu_S;                 //!< Net strangeness chemical potential [GeV]
     float shear_pi[10];         //!< Shear stress tensor [GeV/fm^3]
     float bulk_Pi;              //!< Bulk viscous pressure [GeV/fm^3]
+    float qmu[4];               //!< Net baryon diffusion current [1/fm^3]
+                                //!< (zero without baryon diffusion)
 
     SurfaceCell() = default;
     ~SurfaceCell(){};

@@ -89,6 +89,8 @@ class EOS_4D : public EOS_base {
     void check_eos() const {
         check_4D_eos();
     }
+
+    bool get_4D_table_info(EOS4DTableInfo &info) const;
 };
 
 #endif  // SRC_EOS_4D_H_

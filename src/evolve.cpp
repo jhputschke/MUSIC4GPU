@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cstdint>
 
 #include "evolve.h"
 #include "cornelius.h"
@@ -495,6 +496,48 @@ void Evolve::check_nonfinite_gpu(int it, double tau) {
 #else
     (void)it; (void)tau;
 #endif
+}
+
+// MUSIC_DUMP_STATE=<file>: the fluid at the end of the evolution, every
+// cell, for comparing runs (e.g. CPU against GPU): a header of 4 int32 (Nx,
+// Ny, Neta, number of fields), then per field the cells as float64 in
+// Fields order: e, rhob, rhoq, rhos, u[4], Wmunu[14], pi_b.
+static void dump_state_if_requested(Fields &f) {
+    const char* path = getenv("MUSIC_DUMP_STATE");
+    if (path == nullptr || path[0] == '\0') return;
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return;
+    std::vector<const std::vector<double>*> fields = {
+        &f.e_, &f.rhob_, &f.rhoq_, &f.rhos_};
+    for (int m = 0; m < 4; m++) fields.push_back(&f.u_[m]);
+    for (int m = 0; m < 14; m++) fields.push_back(&f.Wmunu_[m]);
+    fields.push_back(&f.piBulk_);
+    const int32_t hdr[4] = {f.nX(), f.nY(), f.nEta(),
+                            static_cast<int32_t>(fields.size())};
+    out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    for (const auto* v : fields) {
+        out.write(reinterpret_cast<const char*>(v->data()),
+                  v->size() * sizeof(double));
+    }
+}
+
+// MUSIC_DUMP_STATE_STEP=N (with MUSIC_DUMP_STATE=<file>): the state after
+// time step N of a time-stepped run instead, written to <file>.step<N>
+void Evolve::dump_state_at_step_if_requested(int tauIdx, Fields &prev,
+                                             Fields &curr) {
+    static const int step = [] {
+        const char* e = getenv("MUSIC_DUMP_STATE_STEP");
+        return (e && e[0] != '\0') ? atoi(e) : -1;
+    }();
+    if (step < 0 || tauIdx != step || !getenv("MUSIC_DUMP_STATE")) return;
+#ifdef MUSIC_USE_GPU
+    advance.sync_arena_from_gpu_readonly(prev, curr);
+#endif
+    const std::string path = std::string(getenv("MUSIC_DUMP_STATE"))
+                             + ".step" + std::to_string(step);
+    setenv("MUSIC_DUMP_STATE", path.c_str(), 1);
+    dump_state_if_requested(curr);
+    setenv("MUSIC_DUMP_STATE", path.substr(0, path.rfind(".step")).c_str(), 1);
 }
 
 int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
@@ -1052,6 +1095,7 @@ int Evolve::EvolveIt(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
     // from a known-clean state.
     advance.sync_arena_from_gpu(*fpPrev, *fpCurr);
 #endif
+    dump_state_if_requested(*fpCurr);
     if (!DATA.boost_invariant) {
         std::ofstream FOinfo;
         FOinfo.open("FO_nBvseta.dat");
@@ -1109,8 +1153,17 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 
     double source_tau_max = 0.0;
     int iFreezeStart = 0;
-    if (hydro_source_terms_ptr) {
-        source_tau_max = hydro_source_terms_ptr->get_source_tau_max();
+    // X-SCAPE hands its sources (jet droplets, and the hadronic liquefier of
+    // the SMASH initial state) over through the jet slot. When that is the
+    // only source of a time-stepped run, its end time is the run's source end
+    // time: otherwise the checks below start on the empty grid before the
+    // sources arrive (the SMASH-IC example aborted with "the maximum energy
+    // density increased by more than a factor of 2" when they did).
+    const auto &step_source = (hydro_source_terms_ptr
+                               ? hydro_source_terms_ptr
+                               : hydro_source_terms_from_jets_ptr_);
+    if (step_source) {
+        source_tau_max = step_source->get_source_tau_max();
         if (freezeout_lowtemp_flag == 1) {
             iFreezeStart = (static_cast<int>((source_tau_max - DATA.tau0)
                                              /DATA.delta_tau) + 2);
@@ -1234,7 +1287,12 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
 #ifdef MUSIC_USE_GPU
             }
 #endif
-            if (tau > source_tau_max && tauIdx > 0) {
+            // One step past the last source time, as EvolveIt() does: a source
+            // at source_tau_max is still deposited by the step that starts
+            // there (the liquefier deposits droplets with tau in
+            // [tau - dtau/2, tau + dtau/2), and the RK stage at tau + dtau),
+            // so that step may raise the maximum energy density legitimately.
+            if (tau > source_tau_max + DATA.delta_tau && tauIdx > 0) {
                 if (eps_max_cur < 0.) {
                     eps_max_cur = emax_loc;
                 } else {
@@ -1295,6 +1353,7 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         // all the evolution are at here !!!
         AdvanceRK(tau, fpPrev, fpCurr, fpNext);
         check_nonfinite_gpu(tauIdx, tau);
+        dump_state_at_step_if_requested(tauIdx, *fpPrev, *fpCurr);
 
         music_message << emoji::clock()
                       << " Done time step " << tauIdx
@@ -1326,6 +1385,7 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
     // with a fresh H2D upload.
     advance.sync_arena_from_gpu(*fpPrev, *fpCurr);
 #endif
+    dump_state_if_requested(*fpCurr);
     return frozenStatus;
 }
 
@@ -2075,6 +2135,10 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                         aFreezeCell.shear_pi[ii] = static_cast<float>(
                                                 fluid_center.Wmunu[ii]*hbarc);
                     }
+                    for (int ii = 0; ii < 4; ii++) {
+                        aFreezeCell.qmu[ii] = static_cast<float>(
+                                                fluid_center.Wmunu[10+ii]);
+                    }
                     surface_out.push_back(aFreezeCell);
                 } else if (surface_in_binary) {
                     const int FOsize = 36 + DATA.output_vorticity*(24 + 14);
@@ -2399,6 +2463,10 @@ void Evolve::FreezeOut_equal_tau_Surface_XY(double tau, int ieta,
                 aFreezeCell.shear_pi[7] = static_cast<float>(Wyy_center*hbarc);
                 aFreezeCell.shear_pi[8] = static_cast<float>(Wyeta_center*hbarc);
                 aFreezeCell.shear_pi[9] = static_cast<float>(Wetaeta_center*hbarc);
+                aFreezeCell.qmu[0] = static_cast<float>(qtau_center);
+                aFreezeCell.qmu[1] = static_cast<float>(qx_center);
+                aFreezeCell.qmu[2] = static_cast<float>(qy_center);
+                aFreezeCell.qmu[3] = static_cast<float>(qeta_center);
                 surfaceCellVec_.push_back(aFreezeCell);
             } else if (surface_in_binary) {
                 const int FOsize = 36 + DATA.output_vorticity*(24 + 14);
@@ -2781,6 +2849,10 @@ int Evolve::FindFreezeOutSurface_boostinvariant_Cornelius(
                             aFreezeCell.shear_pi[ii] = (
                                 static_cast<float>(
                                     fluid_center.Wmunu[ii]*hbarc));
+                        }
+                        for (int ii = 0; ii < 4; ii++) {
+                            aFreezeCell.qmu[ii] = static_cast<float>(
+                                                fluid_center.Wmunu[10+ii]);
                         }
                         surfaceCellVec_.push_back(aFreezeCell);
                     } else if (surface_in_binary) {

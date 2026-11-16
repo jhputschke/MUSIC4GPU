@@ -1135,6 +1135,11 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
     else
        parameter_list.alpha_max = 4;
 
+    if (parameter_name == "turn_on_baryon_diffusion")
+        parameter_list.turn_on_diff = static_cast<int>(value);
+    if (parameter_name == "kappa_coefficient")
+        parameter_list.kappa_coefficient = value;
+
     if (parameter_name == "Include_QS")
         parameter_list.turn_on_QS = static_cast<int>(value);
     if (parameter_list.turn_on_QS == 1) {

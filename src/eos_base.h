@@ -8,6 +8,20 @@
 #include <string>
 #include <vector>
 
+//! The tables of a four-dimensional EOS (NEOS-4D, EOS 20) as the GPU needs
+//! them: the grid in the tilde variables (1/fm) and the six value tables in
+//! EOS_4D's node order (see EOS_4D::index).
+struct EOS4DTableInfo {
+    int N_T = 0, N_mub = 0, N_muq = 0, N_mus = 0;
+    float T0 = 0.f, mub0 = 0.f, muq0 = 0.f, mus0 = 0.f;
+    float dT = 0.f, dmub = 0.f, dmuq = 0.f, dmus = 0.f;
+    double one_over_alphaNf = 0.;
+    bool has_cs = false;
+    // P [1/fm^4], T, mu_B, mu_Q, mu_S [1/fm], c_s [1]
+    const std::vector<float>* tables[6] = {nullptr, nullptr, nullptr,
+                                           nullptr, nullptr, nullptr};
+};
+
 class EOS_base {
  private:
     int whichEOS;
@@ -156,6 +170,11 @@ class EOS_base {
                                     p, dpde, dpdrhob, dpdrhoq, dpdrhos);
         cs2 = dpde + (dpdrhob*rhob + dpdrhos*rhos + dpdrhoq*rhoq)/(epsilon + p);
         cs2 = std::max(0.01, std::min(1./3., cs2));
+    }
+
+    //! the tables of a four-dimensional EOS, for the GPU; false otherwise
+    virtual bool get_4D_table_info(EOS4DTableInfo &info) const {
+        return false;
     }
 
     void check_eos_with_finite_muB() const;
