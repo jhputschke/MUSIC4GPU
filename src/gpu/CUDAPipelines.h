@@ -41,6 +41,9 @@ public:
     void dispatch_uwrhs(GPUGrid& gpu, const MUSICGridParams& params);
     void dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params);
     void dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams& params);
+    // net baryon diffusion with the 4D EOS: mu_B/T, its gradient, and the
+    // flux of u^a q^i (before dispatch_first_rk_step_w_full)
+    void dispatch_diffusion(GPUGrid& gpu, const MUSICGridParams& params);
 
     // Block until all pending GPU work on the compute stream is done.
     void wait();
@@ -67,6 +70,9 @@ public:
     // save_snapshots / restore_snapshots copy GPU -> state / state -> GPU and
     // synchronize, read_state copies a state to host memory.
     static size_t state_floats(const GPUGrid& gpu);
+    // fields per cell in a snapshot's state and in the freeze-out gather:
+    // e, rhob, u[4], Wmunu[14], pi_b, and rhoq, rhos when on the device
+    static int gather_fields(const GPUGrid& gpu);
     void* alloc_state(size_t floats);
     void  free_state(void* state);
     bool  save_snapshots(GPUGrid& gpu, void* state);
@@ -108,6 +114,12 @@ public:
     // called under a USE_CUDA guard in advance.cpp).
     void upload_snapshots_async(GPUGrid& gpu);
 
+    // NEOS-4D lookup on the device at n points (e, rhob, rhoq, rhos), host
+    // in/out; out gets 11 floats per point: P, T, muB, muQ, muS, cs2, dP/de,
+    // dP/drhob, dP/drhoq, dP/drhos, s. For the start-up self-test.
+    bool eos4d_eval(GPUGrid& gpu, const float* host_in, int n,
+                    float* host_out);
+
 private:
     CUDAPipelines() = default;
     ~CUDAPipelines();
@@ -140,5 +152,7 @@ private:
     float* gather_out_dev_    = nullptr;
     int*   gather_cells_host_ = nullptr;
     float* gather_out_host_   = nullptr;
+    int    max_block_threads_eos4d_ = 128;   // gpu_make_delta_qi_eos4d
     size_t gather_cap_        = 0;
+    int    gather_nf_         = 0;     // fields per cell the buffers hold
 };

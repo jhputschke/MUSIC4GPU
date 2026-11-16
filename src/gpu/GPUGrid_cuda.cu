@@ -102,7 +102,10 @@ bool GPUGrid::alloc_snapshot(GPUSnapshot& s, int Ncells) {
         s.u       = alloc_managed_buf(b4,  buf_handles_, n_handles_);
         s.Wmunu   = alloc_managed_buf(b14, buf_handles_, n_handles_);
         s.pi_b    = alloc_managed_buf(b1,  buf_handles_, n_handles_);
-        return s.epsilon && s.rhob && s.u && s.Wmunu && s.pi_b;
+        s.rhoq    = alloc_managed_buf(b1,  buf_handles_, n_handles_);
+        s.rhos    = alloc_managed_buf(b1,  buf_handles_, n_handles_);
+        return s.epsilon && s.rhob && s.u && s.Wmunu && s.pi_b
+            && s.rhoq && s.rhos;
     }
 
     // Discrete: device buffers + pinned host staging.
@@ -111,14 +114,19 @@ bool GPUGrid::alloc_snapshot(GPUSnapshot& s, int Ncells) {
     s.u       = alloc_device_buf(b4,  buf_handles_, n_handles_);
     s.Wmunu   = alloc_device_buf(b14, buf_handles_, n_handles_);
     s.pi_b    = alloc_device_buf(b1,  buf_handles_, n_handles_);
+    s.rhoq    = alloc_device_buf(b1,  buf_handles_, n_handles_);
+    s.rhos    = alloc_device_buf(b1,  buf_handles_, n_handles_);
     s.epsilon_stage = alloc_pinned_buf(b1);
     s.rhob_stage    = alloc_pinned_buf(b1);
     s.u_stage       = alloc_pinned_buf(b4);
     s.Wmunu_stage   = alloc_pinned_buf(b14);
     s.pi_b_stage    = alloc_pinned_buf(b1);
+    s.rhoq_stage    = alloc_pinned_buf(b1);
+    s.rhos_stage    = alloc_pinned_buf(b1);
     return s.epsilon && s.rhob && s.u && s.Wmunu && s.pi_b
+        && s.rhoq && s.rhos
         && s.epsilon_stage && s.rhob_stage && s.u_stage
-        && s.Wmunu_stage && s.pi_b_stage;
+        && s.Wmunu_stage && s.pi_b_stage && s.rhoq_stage && s.rhos_stage;
 }
 
 bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
@@ -136,10 +144,11 @@ bool GPUGrid::allocate(int Nx, int Ny, int Neta) {
 
     // Scratch / output buffers stay managed in both modes (see file header).
     dwmn      = alloc_managed_buf(5 * nc * sizeof(float), buf_handles_, n_handles_);
-    qi_out    = alloc_managed_buf(5 * nc * sizeof(float), buf_handles_, n_handles_);
+    // 7 components: e, T^{tau i}, and the B, Q, S densities (NEOS-4D)
+    qi_out    = alloc_managed_buf(7 * nc * sizeof(float), buf_handles_, n_handles_);
     uwrhs_out = alloc_managed_buf(5 * nc * sizeof(float), buf_handles_, n_handles_);
     uprhs_out = alloc_managed_buf(    nc * sizeof(float), buf_handles_, n_handles_);
-    qi_source_buf = alloc_managed_buf(5 * nc * sizeof(float), buf_handles_, n_handles_);
+    qi_source_buf = alloc_managed_buf(7 * nc * sizeof(float), buf_handles_, n_handles_);
     theta_buf = alloc_managed_buf(     nc * sizeof(float), buf_handles_, n_handles_);
     a_buf     = alloc_managed_buf( 4 * nc * sizeof(float), buf_handles_, n_handles_);
     sigma_buf = alloc_managed_buf(10 * nc * sizeof(float), buf_handles_, n_handles_);
@@ -195,6 +204,30 @@ bool GPUGrid::upload_eos(const float* P_data, const float* dPde_data,
     return true;
 }
 
+bool GPUGrid::alloc_diffusion_buffers() {
+    if (!allocated_) return false;
+    if (muBT_buf) return true;
+    const size_t nc = static_cast<size_t>(Ncells_);
+    muBT_buf  = alloc_managed_buf(2 * nc * sizeof(float), buf_handles_, n_handles_);
+    dmuBT_buf = alloc_managed_buf(5 * nc * sizeof(float), buf_handles_, n_handles_);
+    uwrhs_q   = alloc_managed_buf(3 * nc * sizeof(float), buf_handles_, n_handles_);
+    return muBT_buf && dmuBT_buf && uwrhs_q;
+}
+
+bool GPUGrid::upload_eos4d(const float* tab, size_t n_floats,
+                           const GPUEos4DParams& params) {
+    if (!allocated_ || !tab || n_floats == 0) return false;
+    // ~440 MB for NEOS-4D; read-only after this copy, managed in both modes
+    // like the 1D tables
+    eos4d_tab = alloc_managed_buf(n_floats * sizeof(float), buf_handles_,
+                                  n_handles_);
+    if (!eos4d_tab) return false;
+    std::memcpy(eos4d_tab, tab, n_floats * sizeof(float));
+    cuda_prefetch(eos4d_tab, n_floats * sizeof(float));
+    eos4d_params = params;
+    return true;
+}
+
 void GPUGrid::release() {
     // Pinned host staging (discrete path) frees with cudaFreeHost — handle it
     // before the cudaFree handle sweep and the snapshot reset.  All staging
@@ -207,6 +240,8 @@ void GPUGrid::release() {
         if (s->u_stage)       cudaFreeHost(s->u_stage);
         if (s->Wmunu_stage)   cudaFreeHost(s->Wmunu_stage);
         if (s->pi_b_stage)    cudaFreeHost(s->pi_b_stage);
+        if (s->rhoq_stage)    cudaFreeHost(s->rhoq_stage);
+        if (s->rhos_stage)    cudaFreeHost(s->rhos_stage);
     }
 
     for (int i = 0; i < n_handles_; ++i) {
@@ -229,6 +264,7 @@ void GPUGrid::release() {
     evo_pack_floats = 0;
 
     allocated_ = false;
+    with_qs    = false;
     snap_prev = snap_curr = snap_future = GPUSnapshot{};
     dwmn      = nullptr;
     qi_out    = nullptr;
@@ -243,6 +279,11 @@ void GPUGrid::release() {
     eos_s     = nullptr;
     eos_T     = nullptr;
     eos_params = {};
+    eos4d_tab    = nullptr;
+    eos4d_params = {};
+    muBT_buf  = nullptr;
+    dmuBT_buf = nullptr;
+    uwrhs_q   = nullptr;
     reduce_eps_out  = nullptr;
     reduce_rhob_out = nullptr;
 }
@@ -400,6 +441,17 @@ void GPUGrid::copy_to_gpu(const Fields& src, GPUSnapshot& dst) const {
         for (int m = 0; m < GPU_WMUNU_COMPS; ++m)
             d_W[m * Ncells + c] = static_cast<float>(src_Wmunu[m][c]);
     }
+    if (with_qs) {
+        float* d_rq = disc ? dst.rhoq_stage : dst.rhoq;
+        float* d_rs = disc ? dst.rhos_stage : dst.rhos;
+        const double* __restrict__ src_rq = src.rhoq_.data();
+        const double* __restrict__ src_rs = src.rhos_.data();
+        #pragma omp parallel for schedule(static)
+        for (int c = 0; c < Ncells; ++c) {
+            d_rq[c] = static_cast<float>(src_rq[c]);
+            d_rs[c] = static_cast<float>(src_rs[c]);
+        }
+    }
 }
 
 void GPUGrid::copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const {
@@ -460,7 +512,27 @@ void GPUGrid::copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const 
         dst_rhob[c] = static_cast<double>(s_rhob[c]);
         for (int m = 0; m < GPU_U_COMPS; ++m)
             dst_u[m][c] = static_cast<double>(s_u[m * Ncells + c]);
-        // rhoq_ / rhos_ intentionally left alone — see docs/PORT_GPU.md §4.1.
+    }
+    // rhoq_ / rhos_ only when they are on the device (docs/PORT_GPU.md §4.1)
+    if (with_qs) {
+        const float* s_rq = src.rhoq;
+        const float* s_rs = src.rhos;
+        if (!g_cuda_coherent) {
+            const size_t nc = static_cast<size_t>(Ncells_);
+            cudaMemcpy(src.rhoq_stage, src.rhoq, nc * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+            cudaMemcpy(src.rhos_stage, src.rhos, nc * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+            s_rq = src.rhoq_stage;
+            s_rs = src.rhos_stage;
+        }
+        double* __restrict__ dst_rq = dst.rhoq_.data();
+        double* __restrict__ dst_rs = dst.rhos_.data();
+        #pragma omp parallel for schedule(static)
+        for (int c = 0; c < Ncells; ++c) {
+            dst_rq[c] = static_cast<double>(s_rq[c]);
+            dst_rs[c] = static_cast<double>(s_rs[c]);
+        }
     }
 }
 

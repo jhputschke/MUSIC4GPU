@@ -9,7 +9,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <functional>
 #include <memory>
+#include <random>
 #include <vector>
 
 #include "util.h"
@@ -202,11 +205,214 @@ void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
         }
     }
 
+#if defined(USE_CUDA)
+    if (eos4d_on_gpu()) {
+        if (!upload_eos4d_tables()) {
+            music_message << "[MUSIC-GPU] NEOS-4D tables not on the device: "
+                             "EOS 20 stays on the CPU path.";
+            music_message.flush("warning");
+            eos4d_failed_ = true;
+            gpu_ready_ = false;
+            return;
+        }
+        if (const char* t = getenv("MUSIC_EOS4D_SELFTEST")) {
+            eos4d_selftest(std::max(1, atoi(t)));
+        }
+        // Q and S are evolved on the device
+        gpu_grid_.with_qs = (DATA.turn_on_QS == 1);
+        if (DATA.turn_on_diff == 1 && !gpu_grid_.alloc_diffusion_buffers()) {
+            music_message << "[MUSIC-GPU] diffusion buffers: allocation "
+                             "failed.";
+            music_message.flush("warning");
+            eos4d_failed_ = true;
+            gpu_ready_ = false;
+            return;
+        }
+    }
+#endif
+
     gpu_ready_ = true;
     music_message << "[MUSIC-GPU] GPU grid allocated ("
                   << Nx << "x" << Ny << "x" << Neta << " cells).";
     music_message.flush("info");
 }
+
+#if defined(USE_CUDA)
+bool Advance::upload_eos4d_tables() {
+    if (gpu_grid_.eos4d_tab) return true;
+    EOS4DTableInfo info;
+    if (!eos.get_4D_table_info(info) || !info.has_cs) return false;
+    const size_t nodes = static_cast<size_t>(info.N_T) * info.N_mub
+                         * info.N_muq * info.N_mus;
+    for (int k = 0; k < GPU_EOS4D_NVAL; k++) {
+        if (!info.tables[k] || info.tables[k]->size() < nodes) return false;
+    }
+    std::vector<float> tab(nodes * GPU_EOS4D_NVAL);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < nodes; i++) {
+        for (int k = 0; k < GPU_EOS4D_NVAL; k++) {
+            tab[i * GPU_EOS4D_NVAL + k] = (*info.tables[k])[i];
+        }
+    }
+    GPUEos4DParams p4;
+    p4.N_T   = info.N_T;    p4.N_mub = info.N_mub;
+    p4.N_muq = info.N_muq;  p4.N_mus = info.N_mus;
+    p4.T0    = info.T0;     p4.mub0  = info.mub0;
+    p4.muq0  = info.muq0;   p4.mus0  = info.mus0;
+    p4.dT    = info.dT;     p4.dmub  = info.dmub;
+    p4.dmuq  = info.dmuq;   p4.dmus  = info.dmus;
+    p4.T_max = info.T0 + (info.N_T - 1) * info.dT;
+    p4.one_over_alphaNf = static_cast<float>(info.one_over_alphaNf);
+    if (!gpu_grid_.upload_eos4d(tab.data(), tab.size(), p4)) return false;
+    music_message << "[MUSIC-GPU] NEOS-4D tables on the device ("
+                  << info.N_T << " x " << info.N_mub << " x " << info.N_muq
+                  << " x " << info.N_mus << " nodes, "
+                  << tab.size() * sizeof(float) / (1024. * 1024.) << " MB).";
+    music_message.flush("info");
+    return true;
+}
+
+// NEOS-4D interpolation of P in double (the same corners and weights as
+// EOS_4D::FourDLInterp, without float rounding): dP/de, dP/drho_B,Q,S at the
+// tilde variables tv, the exact derivatives of the multilinear interpolant.
+static void eos4d_dP_double(const EOS4DTableInfo &in, const double tv[4],
+                            double d_out[4]) {
+    const double x0[4] = {in.T0, in.mub0, in.muq0, in.mus0};
+    const double dx[4] = {in.dT, in.dmub, in.dmuq, in.dmus};
+    const int    nn[4] = {in.N_T, in.N_mub, in.N_muq, in.N_mus};
+    int i0[4];
+    double w1[4];
+    for (int d = 0; d < 4; d++) {
+        const double f = (tv[d] - x0[d]) / dx[d];
+        i0[d] = std::max(0, std::min(nn[d] - 2, static_cast<int>(f)));
+        w1[d] = std::max(0., std::min(1., f - i0[d]));
+    }
+    double Pc[16];
+    for (int c = 0; c < 16; c++) {
+        const int iT = i0[0] + (c & 1), iB = i0[1] + ((c >> 1) & 1);
+        const int iQ = i0[2] + ((c >> 2) & 1), iS = i0[3] + ((c >> 3) & 1);
+        const size_t node = ((static_cast<size_t>(iT) * in.N_mus + iS)
+                             * in.N_muq + iQ) * in.N_mub + iB;
+        Pc[c] = (*in.tables[0])[node];
+    }
+    double dP[4] = {0., 0., 0., 0.};
+    for (int d = 0; d < 4; d++) {
+        for (int c = 0; c < 16; c++) {
+            if ((c >> d) & 1) continue;
+            double o = 1.;
+            for (int dd = 0; dd < 4; dd++) {
+                if (dd != d) o *= ((c >> dd) & 1) ? w1[dd] : 1. - w1[dd];
+            }
+            dP[d] += o * (Pc[c | (1 << d)] - Pc[c]);
+        }
+    }
+    const double Tmax = in.T0 + (in.N_T - 1) * static_cast<double>(in.dT);
+    const double Tc = std::max<double>(in.T0, std::min(Tmax, tv[0]));
+    const double T1 = in.T0 + i0[0] * static_cast<double>(in.dT);
+    const double T2 = T1 + in.dT;
+    const double dXdT = 5. * dP[0] / (std::pow(T2, 5) - std::pow(T1, 5))
+                        * std::pow(Tc, 4);
+    const double dXdB = dP[1] / in.dmub, dXdQ = dP[2] / in.dmuq;
+    const double dXdS = dP[3] / in.dmus;
+    d_out[0] = 3. / (19. * M_PI * M_PI * Tc * Tc * Tc) * dXdT;
+    d_out[1] = (5. * dXdB - dXdQ + 2. * dXdS) / (Tc * Tc);
+    d_out[2] = (-dXdB + 2. * dXdQ - dXdS) / (Tc * Tc);
+    d_out[3] = (2. * dXdB - dXdQ + 2. * dXdS) / (Tc * Tc);
+}
+
+// The device lookup against the CPU EOS at n points spread over the table in
+// the tilde variables (and 10% beyond each edge, where both clamp): prints
+// the largest and the 99.9th-percentile relative difference per quantity.
+void Advance::eos4d_selftest(int n) {
+    const GPUEos4DParams &p = gpu_grid_.eos4d_params;
+    EOS4DTableInfo info;
+    if (!eos.get_4D_table_info(info)) return;
+    std::vector<double> exact(4 * static_cast<size_t>(n));
+    std::vector<float> in(4 * static_cast<size_t>(n));
+    std::vector<double> ref(GPU_EOS4D_TEST_NOUT * static_cast<size_t>(n));
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> uni(-0.1, 1.1);
+    const double alphaNf = 1. / p.one_over_alphaNf;
+    for (int i = 0; i < n; i++) {
+        const double Tt  = std::max(1e-3, p.T0 + uni(rng) * (p.N_T - 1) * p.dT);
+        const double mub = p.mub0 + uni(rng) * (p.N_mub - 1) * p.dmub;
+        const double muq = p.muq0 + uni(rng) * (p.N_muq - 1) * p.dmuq;
+        const double mus = p.mus0 + uni(rng) * (p.N_mus - 1) * p.dmus;
+        const double e  = 3. * alphaNf * Tt * Tt * Tt * Tt;
+        const double T2 = Tt * Tt;
+        // the inverse of the map (rhob, rhoq, rhos) -> mu~ T~^2
+        const double rb = (3. * mub - 3. * mus) / 9. * T2;
+        const double rq = (6. * muq + 3. * mus) / 9. * T2;
+        const double rs = (-3. * mub + 3. * muq + 9. * mus) / 9. * T2;
+        in[4*i] = e; in[4*i + 1] = rb; in[4*i + 2] = rq; in[4*i + 3] = rs;
+        // the CPU at the float inputs the device sees
+        const double ef = in[4*i], rbf = in[4*i + 1];
+        const double rqf = in[4*i + 2], rsf = in[4*i + 3];
+        double P, dPde, dPdrb, dPdrq, dPdrs, cs2;
+        eos.get_pressure_with_gradients_and_cs2(ef, rbf, rqf, rsf, P, dPde,
+                                                dPdrb, dPdrq, dPdrs, cs2);
+        double* r = &ref[GPU_EOS4D_TEST_NOUT * static_cast<size_t>(i)];
+        r[0] = P;
+        r[1] = eos.get_temperature(ef, rbf, rqf, rsf);
+        r[2] = eos.get_muB(ef, rbf, rqf, rsf);
+        r[3] = eos.get_muQ(ef, rbf, rqf, rsf);
+        r[4] = eos.get_muS(ef, rbf, rqf, rsf);
+        r[5] = cs2;
+        r[6] = dPde; r[7] = dPdrb; r[8] = dPdrq; r[9] = dPdrs;
+        r[10] = eos.get_entropy(ef, rbf, rqf, rsf);
+        // the derivatives also from the interpolant in double, at the tilde
+        // variables the CPU forms (float, from double densities)
+        const double Tt_sq = std::sqrt(ef / 3. * info.one_over_alphaNf);
+        const double tv[4] = {
+            static_cast<float>(std::sqrt(Tt_sq)),
+            static_cast<float>((5*rbf - rqf + 2*rsf) / Tt_sq),
+            static_cast<float>((-rbf + 2*rqf - rsf) / Tt_sq),
+            static_cast<float>((2*rbf - rqf + 2*rsf) / Tt_sq)};
+        eos4d_dP_double(info, tv, &exact[4 * static_cast<size_t>(i)]);
+    }
+    std::vector<float> out(GPU_EOS4D_TEST_NOUT * static_cast<size_t>(n));
+    if (!GPUPipelines::instance().eos4d_eval(gpu_grid_, in.data(), n,
+                                            out.data())) {
+        music_message << "[MUSIC-EOS4D-SELFTEST] device evaluation failed";
+        music_message.flush("warning");
+        return;
+    }
+    static const char* names[GPU_EOS4D_TEST_NOUT] = {
+        "P", "T", "muB", "muQ", "muS", "cs2", "dP/de", "dP/drhob",
+        "dP/drhoq", "dP/drhos", "s"};
+    // relative to the reference value, with a floor at 1e-3 of its mean
+    // size so that values crossing zero (mu, derivatives) do not blow up
+    auto report = [&](const char* name, const char* what,
+                      std::function<double(int)> a,
+                      std::function<double(int)> b) {
+        double scale = 0.;
+        for (int i = 0; i < n; i++) scale += std::abs(a(i));
+        scale = std::max(1e-30, scale / n);
+        std::vector<double> d(n);
+        for (int i = 0; i < n; i++) {
+            d[i] = std::abs(a(i) - b(i)) / std::max(std::abs(a(i)),
+                                                    1e-3 * scale);
+        }
+        std::sort(d.begin(), d.end());
+        fprintf(stderr, "[MUSIC-EOS4D-SELFTEST] %-9s %-12s max rel diff "
+                        "%.3e, 99.9%% %.3e, median %.3e (n = %d)\n",
+                name, what, d[n - 1],
+                d[std::min(n - 1, static_cast<int>(0.999 * n))], d[n / 2], n);
+    };
+    const size_t K = GPU_EOS4D_TEST_NOUT;
+    for (int k = 0; k < GPU_EOS4D_TEST_NOUT; k++) {
+        auto cpu = [&](int i) { return ref[K * i + k]; };
+        auto gpu = [&](int i) { return static_cast<double>(out[K * i + k]); };
+        report(names[k], "GPU vs CPU", cpu, gpu);
+        if (k >= 6 && k <= 9) {
+            auto ex = [&](int i) { return exact[4 * static_cast<size_t>(i)
+                                                + (k - 6)]; };
+            report(names[k], "GPU vs exact", ex, gpu);
+            report(names[k], "CPU vs exact", ex, cpu);
+        }
+    }
+}
+#endif
 
 void Advance::make_gpu_params(double tau, int rk_flag,
                               MUSICGridParams &p) const {
@@ -261,6 +467,23 @@ void Advance::make_gpu_params(double tau, int rk_flag,
     // Second-order transport-term flags
     p.include_second_order_terms = DATA.include_second_order_terms;
     p.init_profile_zero          = (DATA.Initial_profile == 0) ? 1 : 0;
+
+    // NEOS-4D with the charges on the device
+    p.eos4d   = (eos4d_on_gpu() && gpu_grid_.eos4d_tab) ? 1 : 0;
+    p.n_alpha = (p.eos4d && gpu_grid_.with_qs) ? 7 : 5;
+    p.has_qs_source = 0;   // set with the source pre-fill
+    p.muB_dep_shear_mode       = DATA.muB_dependent_shear_to_s;
+    p.shear_muBf0p2            = static_cast<float>(DATA.shear_muBf0p2);
+    p.shear_muBf0p4            = static_cast<float>(DATA.shear_muBf0p4);
+    p.shear_muBDep_alpha       = static_cast<float>(DATA.shear_muBDep_alpha);
+    p.shear_muBDep_slope       = static_cast<float>(DATA.shear_muBDep_slope);
+    p.shear_muBDep_scale       = static_cast<float>(DATA.shear_muBDep_scale);
+    p.bulk_asym10_max_muB0p2   = static_cast<float>(DATA.bulk_10_max_muB0p2);
+    p.bulk_asym10_max_muB0p4   = static_cast<float>(DATA.bulk_10_max_muB0p4);
+    p.bulk_asym10_Tpeak_muBcurv = static_cast<float>(DATA.bulk_10_Tpeak_muBcurv);
+    p.kappa_coefficient = static_cast<float>(DATA.kappa_coefficient);
+    p.delta_qq_coeff    = 1.0f;        // TransportCoeffs::get_delta_qq_coeff()
+    p.lambda_qq_coeff   = 3.f / 5.f;   // TransportCoeffs::get_lambda_qq_coeff()
 
     // Precompute geometric factors for the longitudinal flux term
     double de = DATA.delta_eta;
@@ -406,12 +629,19 @@ bool Advance::keep_state(void* &state) {
     return state && mp.keep_curr(gpu_grid_, state);
 }
 
+// fields per cell of a snapshot's state and of the freeze-out gather:
+// e, rhob, u[4], Wmunu[14], pi_b, and rhoq, rhos when they are on the device
+// (CUDAPipelines::gather_fields)
+static int snapshot_fields(const GPUGrid &g) {
+    return 3 + GPU_U_COMPS + GPU_WMUNU_COMPS + (g.with_qs ? 2 : 0);
+}
+
 bool Advance::gather_cells(const void* kept, const std::vector<int> &cells,
                            Fields &curr, Fields *kept_into) {
     if (!gpu_owns_state_ || !gpu_ready_ || (kept && !kept_into)) return false;
     bench::Timer _bt("advance.freezeout_gather");
     const size_t n = cells.size();
-    const int nf = 3 + GPU_U_COMPS + GPU_WMUNU_COMPS;
+    const int nf = snapshot_fields(gpu_grid_);   // 21, 23 with Q, S
     gather_curr_.resize(nf * n);
     gather_kept_.resize(kept ? nf * n : 0);
     if (!GPUPipelines::instance().gather_cells(
@@ -420,13 +650,16 @@ bool Advance::gather_cells(const void* kept, const std::vector<int> &cells,
         return false;
     }
     // field f of cell j at [f*n + j]: epsilon, rhob, u[4], Wmunu[14], pi_b
+    // (, rhoq, rhos)
     auto scatter = [&](const std::vector<float> &g, Fields &f) {
-        std::vector<double>* dst[21];
+        std::vector<double>* dst[23];
         dst[0] = &f.e_;
         dst[1] = &f.rhob_;
         for (int m = 0; m < GPU_U_COMPS; m++) dst[2 + m] = &f.u_[m];
         for (int m = 0; m < GPU_WMUNU_COMPS; m++) dst[6 + m] = &f.Wmunu_[m];
         dst[20] = &f.piBulk_;
+        dst[21] = &f.rhoq_;
+        dst[22] = &f.rhos_;
         for (int k = 0; k < nf; k++) {
             double* d = dst[k]->data();
             const float* src = g.data() + k*n;
@@ -447,14 +680,18 @@ bool Advance::copy_kept_to(const void* state, Fields &f) {
         return false;
     }
     // the snapshot's arrays in order: epsilon, rhob, u[4], Wmunu[14], pi_b
+    // (, rhoq, rhos)
     const size_t nc = static_cast<size_t>(gpu_grid_.Ncells());
-    std::vector<double>* dst[21];
+    const int nf = snapshot_fields(gpu_grid_);
+    std::vector<double>* dst[23];
     dst[0] = &f.e_;
     dst[1] = &f.rhob_;
     for (int m = 0; m < GPU_U_COMPS; m++) dst[2 + m] = &f.u_[m];
     for (int m = 0; m < GPU_WMUNU_COMPS; m++) dst[6 + m] = &f.Wmunu_[m];
     dst[20] = &f.piBulk_;
-    for (int k = 0; k < 21; k++) {
+    dst[21] = &f.rhoq_;
+    dst[22] = &f.rhos_;
+    for (int k = 0; k < nf; k++) {
         for (size_t c = 0; c < nc; c++) {
             (*dst[k])[c] = static_cast<double>(h[k*nc + c]);
         }
@@ -471,20 +708,42 @@ bool Advance::copy_kept_to(const void* state, Fields &f) {
 //
 // The check is configuration-only (DATA flags); per-cell state checks (rhoq /
 // rhos non-zero, finite-muB EOS effects) are done in gpu_charges_ok().
+// NEOS-4D (EOS 20) with B, Q, S on the device: CUDA only, on unless
+// MUSIC_GPU_EOS4D=0 or the tables could not be uploaded.
+bool Advance::eos4d_on_gpu() const {
+#if defined(USE_CUDA)
+    static const bool off = [] {
+        const char* e = getenv("MUSIC_GPU_EOS4D");
+        return e && e[0] == '0';
+    }();
+    return DATA.whichEOS == 20 && !off && !eos4d_failed_;
+#else
+    return false;
+#endif
+}
+
 bool Advance::gpu_features_supported() const {
+    const bool eos4d = eos4d_on_gpu();
     if (DATA.viscosity_flag != 1)         return false;
-    if (DATA.turn_on_diff)                return false;
-    if (DATA.muB_dependent_shear_to_s != 0) return false;
+    // baryon diffusion: with the 4D EOS (CUDA), without the vorticity terms
+    // and the 1+1D test profile, which the device port leaves out
+    if (DATA.turn_on_diff
+        && (!eos4d || DATA.include_vorticity_terms
+            || DATA.Initial_profile == 1)) return false;
+    // mu_B-dependent eta/s needs mu_B, which only the 4D lookup provides
+    if (DATA.muB_dependent_shear_to_s != 0 && !eos4d) return false;
     // Reject finite-muB EOS tables (GPU EOS is sampled at rhob=0).  EOS 91 is
     // a zero-muB hotQCD variant (same EOS_hotQCD class as EOS 9, flag_muB=false)
     // so it is GPU-safe and carved out of the threshold.  See docs/PORT_GPU.md §4.2
     // for why this stays a magic-number check rather than eos.get_flag_muB().
-    if (DATA.whichEOS > 9 && DATA.whichEOS != 91) return false;
-    // Hydro source terms: GPU snapshot only carries rhob, so QS (rhoq/rhos)
-    // source contributions can't be applied — fall back to CPU in that case.
-    // Pure energy + baryon sources are supported via prefill_hydro_source_on_cpu.
+    // EOS 20 (NEOS-4D) has its own device lookup.
+    if (DATA.whichEOS > 9 && DATA.whichEOS != 91 && !eos4d) return false;
+    // Hydro source terms: the 1D-EOS snapshot only carries rhob, so QS
+    // (rhoq/rhos) source contributions can't be applied — fall back to CPU in
+    // that case.  Pure energy + baryon sources are supported via
+    // prefill_hydro_source_on_cpu, and Q, S sources too with the 4D EOS.
     if ((flag_add_hydro_source || flag_add_hydro_source_from_jets_)
-        && DATA.turn_on_QS == 1) return false;
+        && DATA.turn_on_QS == 1 && !eos4d) return false;
     return true;
 }
 
@@ -530,8 +789,10 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
     const double tau_rk      = tau + rk_flag * DATA.delta_tau;
     const double tauRkFactor = (DATA.CoorType == 1) ? 1.0 : tau_rk;
 
-    // qi_source_buf layout: [alpha * Ncells + cell]; written for alpha 0..4.
+    // qi_source_buf layout: [alpha * Ncells + cell]; written for alpha 0..4,
+    // and 5, 6 (Q, S) when they are on the device.
     float* qb = gpu_grid_.qi_source_buf;
+    const int ncomp = gpu_grid_.with_qs ? 7 : 5;
 
     // Every cell queries tau_rk: let the sources precompute what depends on
     // it alone once, not per cell (results unchanged).
@@ -567,10 +828,10 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
     // cells (or at the first fill), else just the cells written.  Leaving
     // the rest untouched also keeps its pages on the GPU.
     if (loop_all || src_buf_unknown_) {
-        std::memset(qb, 0, static_cast<size_t>(5) * N * sizeof(float));
+        std::memset(qb, 0, static_cast<size_t>(ncomp) * N * sizeof(float));
     } else {
         for (const int c : src_written_) {
-            for (int ii = 0; ii < 5; ii++) qb[ii * N + c] = 0.f;
+            for (int ii = 0; ii < ncomp; ii++) qb[ii * N + c] = 0.f;
         }
     }
     src_written_.clear();
@@ -609,7 +870,7 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
 
         if (grid_mode == 2) {
             // compare with the loop over all cells asking both sources
-            std::vector<float> ref(static_cast<size_t>(5) * N, 0.f);
+            std::vector<float> ref(static_cast<size_t>(ncomp) * N, 0.f);
             fill_hydro_source_all_cells(ref.data(), tau_rk, arenaFieldsCurr,
                                         with_main, with_jets);
             long differ = 0, nonzero = 0;
@@ -641,6 +902,8 @@ void Advance::fill_hydro_source_all_cells(float* qb, double tau_rk,
     const int N     = Nx * Ny * Neta;
     const double tauRkFactor = (DATA.CoorType == 1) ? 1.0 : tau_rk;
     const bool rhob_src = (DATA.turn_on_rhob == 1);
+    // the Q and S sources, as Advance::FirstRKStepT adds them
+    const bool qs_src = (DATA.turn_on_QS == 1 && gpu_grid_.with_qs);
 
     // Dynamic, not static: the cost per cell varies by orders of magnitude
     // (cells near a string or droplet evaluate it, the rest skip it at once)
@@ -662,11 +925,18 @@ void Advance::fill_hydro_source_all_cells(float* qb, double tau_rk,
 
         EnergyFlowVec j_mu = {0};
         double j_rhob = 0.;
+        double j_rhoq = 0., j_rhos = 0.;
         if (with_main) {
             hydro_source_terms_ptr->get_hydro_energy_source(
                     tau_rk, x_local, y_local, eta_s_local, u_local, j_mu);
             if (rhob_src) {
                 j_rhob = hydro_source_terms_ptr->get_hydro_rhob_source(
+                        tau_rk, x_local, y_local, eta_s_local, u_local);
+            }
+            if (qs_src) {
+                j_rhoq = hydro_source_terms_ptr->get_hydro_rhoq_source(
+                        tau_rk, x_local, y_local, eta_s_local, u_local);
+                j_rhos = hydro_source_terms_ptr->get_hydro_rhos_source(
                         tau_rk, x_local, y_local, eta_s_local, u_local);
             }
         }
@@ -682,6 +952,12 @@ void Advance::fill_hydro_source_all_cells(float* qb, double tau_rk,
                 j_rhob += hydro_source_terms_from_jets_ptr_->get_hydro_rhob_source(
                         tau_rk, x_local, y_local, eta_s_local, u_local);
             }
+            if (qs_src) {
+                j_rhoq += hydro_source_terms_from_jets_ptr_->get_hydro_rhoq_source(
+                        tau_rk, x_local, y_local, eta_s_local, u_local);
+                j_rhos += hydro_source_terms_from_jets_ptr_->get_hydro_rhos_source(
+                        tau_rk, x_local, y_local, eta_s_local, u_local);
+            }
         }
         for (int ii = 0; ii < 4; ii++) {
             qb[ii * N + c] = static_cast<float>(tauRkFactor * j_mu[ii]);
@@ -689,10 +965,16 @@ void Advance::fill_hydro_source_all_cells(float* qb, double tau_rk,
         if (rhob_src) {
             qb[4 * N + c] = static_cast<float>(tauRkFactor * j_rhob);
         }
+        if (qs_src) {
+            qb[5 * N + c] = static_cast<float>(tauRkFactor * j_rhoq);
+            qb[6 * N + c] = static_cast<float>(tauRkFactor * j_rhos);
+        }
     }
 }
 
 bool Advance::gpu_charges_ok(const Fields &arena) {
+    // with the 4D EOS rhoq and rhos are evolved on the device
+    if (eos4d_on_gpu() && DATA.turn_on_QS == 1) return true;
     // First-call scan only — the result is cached for the rest of the run.
     // rhoq/rhos can only become non-zero through a multi-charge source term
     // (DATA.turn_on_QS == 1), which gpu_features_supported() rejects upstream.
@@ -839,9 +1121,11 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
                                     with_main, with_jets);
         p.has_hydro_source = 1;
         p.has_rhob_source  = (DATA.turn_on_rhob == 1) ? 1 : 0;
+        p.has_qs_source    = (DATA.turn_on_QS == 1 && gpu_grid_.with_qs) ? 1 : 0;
     } else {
         p.has_hydro_source = 0;
         p.has_rhob_source  = 0;
+        p.has_qs_source    = 0;
     }
 
     auto& mp = GPUPipelines::instance();
@@ -852,6 +1136,9 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
       if (p.turn_on_bulk == 1) mp.dispatch_uprhs(gpu_grid_, p);
       mp.dispatch_delta_qi(gpu_grid_, p);
       mp.dispatch_finalize_ideal(gpu_grid_, p);
+#if defined(USE_CUDA)
+      if (p.eos4d && p.turn_on_diff) mp.dispatch_diffusion(gpu_grid_, p);
+#endif
       mp.dispatch_first_rk_step_w_full(gpu_grid_, p);
     mp.end_batch();
     mp.wait();
@@ -983,6 +1270,8 @@ bool Advance::pack_evolution_ideal(fluidCell_ideal *out) {
     pp.delta_eta = static_cast<float>(DATA.delta_eta);
     pp.eta_size  = static_cast<float>(DATA.eta_size);
     pp.hbarc     = static_cast<float>(hbarc);
+    pp.eos4d     = (eos4d_on_gpu() && gpu_grid_.eos4d_tab) ? 1 : 0;
+    pp.with_qs   = gpu_grid_.with_qs ? 1 : 0;
 
     // The pipeline writes the packed records straight into `out` (which is laid
     // out as contiguous fluidCell_ideal == 8 floats per cell), so there is no

@@ -25,6 +25,10 @@ struct GPUSnapshot {
     float* u        = nullptr;   // [GPU_U_COMPS * Ncells]
     float* Wmunu    = nullptr;   // [GPU_WMUNU_COMPS * Ncells]
     float* pi_b     = nullptr;   // [Ncells]
+    // net electric charge and strangeness densities (CUDA only; used when
+    // GPUGrid::with_qs, i.e. NEOS-4D with Q and S on the device)
+    float* rhoq     = nullptr;   // [Ncells]
+    float* rhos     = nullptr;   // [Ncells]
 
     // Discrete-GPU only (CUDA): pinned host staging buffers.  When the device
     // does NOT have coherent host-memory access, the pointers above are plain
@@ -36,6 +40,8 @@ struct GPUSnapshot {
     float* u_stage       = nullptr;
     float* Wmunu_stage   = nullptr;
     float* pi_b_stage    = nullptr;
+    float* rhoq_stage    = nullptr;
+    float* rhos_stage    = nullptr;
 };
 
 // Manages three grid snapshots (prev / current / future) and an output
@@ -84,9 +90,9 @@ public:
     // The copies are therefore a per-component float-cast pass with no
     // AoS gather/scatter.
     //
-    // Limitation: GPUSnapshot only carries rhob.  Fields' rhoq_ / rhos_ are
-    // NOT uploaded; the caller is responsible for falling back to the CPU
-    // path when either is non-zero.  See docs/PORT_GPU.md §4.1.
+    // Fields' rhoq_ / rhos_ are copied only when with_qs is set (NEOS-4D
+    // with Q and S on the device, CUDA); otherwise the caller falls back to
+    // the CPU path when either is non-zero (docs/PORT_GPU.md §4.1).
     void copy_to_gpu(const Fields& src, GPUSnapshot& dst) const;
     void copy_primitives_to_cpu(const GPUSnapshot& src, Fields& dst) const;
     void copy_wmunu_to_cpu(const GPUSnapshot& src, Fields& dst) const;
@@ -121,6 +127,22 @@ public:
     // rotation rather than a fresh host pack.  Defined in GPUGrid_cuda.cu.
     void refresh_u_curr_stage();
 
+    // Net baryon diffusion with the 4D EOS (CUDA; allocated on demand by
+    // alloc_diffusion_buffers):
+    //   muBT_buf  [2 * Ncells]: mu_B/T of snap_curr, then of snap_prev
+    //   dmuBT_buf [5 * Ncells]: partial^mu (mu_B/T), mu = 0..3, and
+    //                           u^nu partial_nu (mu_B/T)
+    //   uwrhs_q   [3 * Ncells]: KT flux divergence of u^a q^i, i = x, y, eta,
+    //                           times delta_tau
+    float* muBT_buf  = nullptr;
+    float* dmuBT_buf = nullptr;
+    float* uwrhs_q   = nullptr;
+    bool alloc_diffusion_buffers();
+
+    // rhoq / rhos live on the device and are copied with the primitives
+    // (set by Advance when the 4D EOS evolves Q and S on the GPU)
+    bool with_qs = false;
+
     // The three snapshots (prev, current, future).
     GPUSnapshot snap_prev;
     GPUSnapshot snap_curr;
@@ -136,6 +158,14 @@ public:
     float*       eos_s    = nullptr;   // entropy table s(e) [GPU_EOS_N]
     float*       eos_T    = nullptr;   // temperature T(e)   [GPU_EOS_N]
     GPUEosParams eos_params = {};
+
+    // NEOS-4D (EOS 20): the six tables interleaved per node, uploaded once
+    // via upload_eos4d() (CUDA only; null otherwise, and the 4D EOS stays on
+    // the CPU path). See eos4d_device.cuh.
+    float*         eos4d_tab    = nullptr;
+    GPUEos4DParams eos4d_params = {};
+    bool upload_eos4d(const float* tab, size_t n_floats,
+                      const GPUEos4DParams& params);
 
     // Output buffer: qi_out[5 * Ncells] produced by gpu_make_delta_qi.
     float* qi_out = nullptr;
@@ -209,6 +239,6 @@ private:
     //   + dwmn + qi_out + uwrhs_out + theta_buf + a_buf + sigma_buf = 21
     //   + eos_P + eos_dPde = 23
     // Leave headroom for upcoming Phase-2 buffers (eos_T, eos_s, ...).
-    void* buf_handles_[32];
+    void* buf_handles_[64];
     int   n_handles_ = 0;
 };

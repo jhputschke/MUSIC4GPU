@@ -102,6 +102,26 @@ struct MUSICGridParams {
     //        tau_bulkPibulkPi_coeff == 0, so it's omitted on the GPU side.)
     int include_second_order_terms;
     int init_profile_zero;         // 1 if DATA.Initial_profile == 0
+
+    // NEOS-4D (EOS 20) with the charges on the device (CUDA only; 0 on Metal)
+    int   eos4d;                   // 1: P, T, mu, cs2 from the 4D lookup
+    int   n_alpha;                 // conserved components: 5 (B) or 7 (B, Q, S)
+    int   has_qs_source;           // qi_source_buf[5], [6] (Q, S) are filled
+    // mu_B dependence of eta/s (DATA.muB_dependent_shear_to_s) and of
+    // zeta/s mode 10; used with eos4d only
+    int   muB_dep_shear_mode;
+    float shear_muBf0p2;           // DATA.shear_muBf0p2   (mode 7)
+    float shear_muBf0p4;           // DATA.shear_muBf0p4   (mode 7)
+    float shear_muBDep_alpha;      // DATA.shear_muBDep_alpha (mode 10)
+    float shear_muBDep_slope;      // DATA.shear_muBDep_slope (mode 10)
+    float shear_muBDep_scale;      // DATA.shear_muBDep_scale (mode 10)
+    float bulk_asym10_max_muB0p2;  // DATA.bulk_10_max_muB0p2
+    float bulk_asym10_max_muB0p4;  // DATA.bulk_10_max_muB0p4
+    float bulk_asym10_Tpeak_muBcurv; // DATA.bulk_10_Tpeak_muBcurv (GeV^-1)
+    // net baryon diffusion (turn_on_diff, 4D EOS only; Diss::Make_uqSource)
+    float kappa_coefficient;       // DATA.kappa_coefficient (C_B)
+    float delta_qq_coeff;          // TransportCoeffs::get_delta_qq_coeff()
+    float lambda_qq_coeff;         // TransportCoeffs::get_lambda_qq_coeff()
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
@@ -129,6 +149,30 @@ struct GPUEosParams {
 // compact AoS buffer laid out exactly like host fluidCell_ideal (8 floats per
 // cell, in that field order).  e/p/T are scaled by hbarc to match the host
 // memory-output path; entropy is stored unscaled.
+// NEOS-4D (EOS 20) on the device: the grid of EOS_4D in the "tilde"
+// variables (T~, mu_B~, mu_Q~, mu_S~), all in 1/fm. The table itself is
+// GPUGrid::eos4d_tab, GPU_EOS4D_NVAL floats per node (see eos4d_device.cuh).
+#define GPU_EOS4D_NVAL 6
+// values per point of the device lookup self-test (CUDAPipelines::eos4d_eval)
+#define GPU_EOS4D_TEST_NOUT 11
+
+struct GPUEos4DParams {
+    int   N_T;
+    int   N_mub;
+    int   N_muq;
+    int   N_mus;
+    float T0;
+    float mub0;
+    float muq0;
+    float mus0;
+    float dT;
+    float dmub;
+    float dmuq;
+    float dmus;
+    float T_max;             // T0 + (N_T - 1) dT
+    float one_over_alphaNf;  // 1/alpha_Nf of the massless parton gas
+};
+
 struct GPUPackParams {
     int   Nx;
     int   Ny;
@@ -144,6 +188,8 @@ struct GPUPackParams {
     float delta_eta;
     float eta_size;
     float hbarc;           // Util::hbarc (GeV*fm), applied to e/p/T
+    int   eos4d;           // 1: P, s, T from the NEOS-4D lookup with the charges
+    int   with_qs;         // rhoq / rhos are on the device
 };
 
 // Wmunu 2D->1D index table (same as Util::map_2d_idx_to_1d)

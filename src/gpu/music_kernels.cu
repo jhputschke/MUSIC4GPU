@@ -20,6 +20,8 @@
 
 #define DFI __device__ __forceinline__
 
+#include "eos4d_device.cuh" // NEOS-4D (EOS 20) lookup
+
 // ── math shims (mirror MSL overloaded clamp; CUDA has no float clamp) ─────────
 DFI float clampf(float x, float lo, float hi) { return fminf(fmaxf(x, lo), hi); }
 DFI int   clampi(int   x, int   lo, int   hi) { return min(max(x, lo), hi);     }
@@ -423,7 +425,12 @@ __global__ void gpu_pack_evolution_ideal(
     const float* __restrict__ eos_T,
     float* __restrict__ out,
     GPUEosParams eos_p,
-    GPUPackParams pp)
+    GPUPackParams pp,
+    const float* __restrict__ rhob,
+    const float* __restrict__ rhoq,
+    const float* __restrict__ rhos,
+    const float* __restrict__ eos4d_tab,
+    GPUEos4DParams eos4d_p)
 {
     const int o     = blockIdx.x * blockDim.x + threadIdx.x;
     const int n_out = pp.nx_out * pp.ny_out * pp.neta_out;
@@ -445,9 +452,22 @@ __global__ void gpu_pack_evolution_ideal(
     const int c      = ix + pp.Nx * (iy + pp.Ny * ieta);
 
     const float e = epsilon[c];
-    const float p = gpu_log_interp(e, eos_P, eos_p);
-    const float s = gpu_log_interp(e, eos_s, eos_p);
-    const float T = gpu_log_interp(e, eos_T, eos_p);
+    float p, s, T;
+    if (pp.eos4d) {
+        const float rb = rhob[c];
+        const float rq = pp.with_qs ? rhoq[c] : 0.f;
+        const float rs = pp.with_qs ? rhos[c] : 0.f;
+        GPUEos4DState st;
+        gpu_eos4d_lookup(e, rb, rq, rs, eos4d_tab, eos4d_p,
+                         GPU_EOS4D_P | GPU_EOS4D_THERMO, st);
+        p = st.P;
+        s = gpu_eos4d_entropy(e, rb, rq, rs, st);
+        T = st.T;
+    } else {
+        p = gpu_log_interp(e, eos_P, eos_p);
+        s = gpu_log_interp(e, eos_s, eos_p);
+        T = gpu_log_interp(e, eos_T, eos_p);
+    }
 
     float eta = 0.f;
     if (!pp.boost_invariant)
@@ -813,6 +833,556 @@ DFI float gpu_get_TJb_reconst(ReconstResult r, int alpha, int direction,
         u_mu = r.u[alpha];
     }
     return ((r.e + P) * u_mu * u_nu + P * gfac) * tau_fac;
+}
+
+// ══ Ideal step with NEOS-4D and the charges B, Q, S (params.eos4d == 1) ══════
+//
+// The 1D-EOS code above is left as it is (its results stay bit-identical).
+// With the 4D EOS the conserved vector has params.n_alpha components: 5 with
+// baryon number, 7 with B, Q, S. The pressure depends on all three densities,
+// and the reconstruction solves for v with rho_i = J_i sqrt(1 - v^2) inside the
+// residual, as Reconst::ReconstIt_velocity_Newton does on the CPU; a revert
+// keeps the previous cell's charges (Reconst::revert_grid), a regulated cell
+// has none (Reconst::regulate_grid).
+
+#define GPU_NA_MAX 7
+
+struct Reconst4D {
+    float e;
+    float rho[3];   // B, Q, S [1/fm^3]
+    float u[4];
+    float P;        // P(e, rho) [1/fm^4], for the fluxes and the signal speed
+};
+
+DFI float gpu_eos4d_P(float e, const float rho[3],
+                      const float* __restrict__ tab, const GPUEos4DParams& p) {
+    GPUEos4DState st;
+    gpu_eos4d_lookup(e, rho[0], rho[1], rho[2], tab, p, GPU_EOS4D_P, st);
+    return st.P;
+}
+
+// f(v) = v - M/(T00 + P(e, rho)), e = T00 - v M, rho_i = J_i sqrt(1 - v^2)
+DFI void gpu_vel_fdf_4d(float v, float T00, float M, const float J[3],
+                        float& fv, float& dfdv,
+                        const float* __restrict__ tab, const GPUEos4DParams& p) {
+    const float eps = T00 - v * M;
+    const float sq  = sqrtf(fmaxf(0.f, 1.f - v * v));
+    GPUEos4DState st;
+    gpu_eos4d_lookup(eps, J[0]*sq, J[1]*sq, J[2]*sq, tab, p,
+                     GPU_EOS4D_P | GPU_EOS4D_DERIV, st);
+    const float t1 = T00 + st.P;
+    const float t2 = v / fmaxf(sq, 1.e-8f);
+    fv   = v - M / t1;
+    dfdv = 1.f - M / (t1 * t1) * (M * st.dPde
+                                  + t2 * (J[0]*st.dPdrhob + J[1]*st.dPdrhoq
+                                          + J[2]*st.dPdrhos));
+}
+
+// the bracketed Newton/bisection of gpu_solve_v, with the 4D residual
+__device__ float gpu_solve_v_4d(float T00, float M, const float J[3],
+                                const float* __restrict__ tab,
+                                const GPUEos4DParams& p) {
+    const float ABS_ERR = 1.e-7f;
+    float fv_l, dfdv_l, fv_h, dfdv_h;
+    float v_l = 0.f, v_h = 1.f;
+    gpu_vel_fdf_4d(v_l, T00, M, J, fv_l, dfdv_l, tab, p);
+    gpu_vel_fdf_4d(v_h, T00, M, J, fv_h, dfdv_h, tab, p);
+    if (fabsf(fv_l) < ABS_ERR) return v_l;
+    if (fabsf(fv_h) < ABS_ERR) return v_h;
+    if (fv_l * fv_h > 0.f) return -1.f;
+
+    float dv_prev = v_h - v_l;
+    float dv_curr = dv_prev;
+    float v_root  = (v_h + v_l) * 0.5f;
+    float fv, dfdv;
+    gpu_vel_fdf_4d(v_root, T00, M, J, fv, dfdv, tab, p);
+    for (int it = 0; it < 60; it++) {
+        const float v_old = v_root;
+        if (((v_root - v_h) * dfdv - fv) * ((v_root - v_l) * dfdv - fv) > 0.f
+            || fabsf(2.f * fv) > fabsf(dv_prev * dfdv)) {
+            dv_prev = dv_curr;
+            dv_curr = (v_h - v_l) * 0.5f;
+            v_root  = v_l + dv_curr;
+        } else {
+            dv_prev = dv_curr;
+            dv_curr = fv / dfdv;
+            v_root  = v_root - dv_curr;
+        }
+        gpu_vel_fdf_4d(v_root, T00, M, J, fv, dfdv, tab, p);
+        if (fv * fv_l < 0.f) { v_h = v_root; fv_h = fv; }
+        else                  { v_l = v_root; fv_l = fv; }
+        if (fabsf(dv_curr) < ABS_ERR || v_root == v_old) break;
+    }
+    return v_root;
+}
+
+// f(u0) = u0 - (T00 + P)/sqrt((T00 + P)^2 - K00), rho_i = J_i/u0
+DFI void gpu_u0_fdf_4d(float u0, float T00, float K00, float M,
+                       const float J[3], float& fu0, float& dfdu0,
+                       const float* __restrict__ tab,
+                       const GPUEos4DParams& p) {
+    const float ABS_ERR = 1.e-10f;
+    const float v       = sqrtf(fmaxf(0.f, 1.f - 1.f / (u0 * u0)));
+    const float epsilon = T00 - v * M;
+    const float dedu0   = -M / (u0 * u0 * u0 * v + ABS_ERR);
+    const float iu0     = 1.f / u0;
+    GPUEos4DState st;
+    gpu_eos4d_lookup(epsilon, J[0]*iu0, J[1]*iu0, J[2]*iu0, tab, p,
+                     GPU_EOS4D_P | GPU_EOS4D_DERIV, st);
+    const float drho = -iu0 * iu0;   // d rho_i/d u0 = -J_i/u0^2
+    const float temp1 = (T00 + st.P) * (T00 + st.P) - K00;
+    const float den1  = sqrtf(fmaxf(0.f, temp1));
+    const float temp  = (T00 + st.P) / fmaxf(den1, ABS_ERR);
+    fu0   = u0 - temp;
+    dfdu0 = 1.f + (dedu0 * st.dPde
+                   + drho * (J[0]*st.dPdrhob + J[1]*st.dPdrhoq
+                             + J[2]*st.dPdrhos))
+                  * K00 / fmaxf(temp1 * den1, ABS_ERR);
+}
+
+__device__ float gpu_solve_u0_4d(float u0_guess, float T00, float K00, float M,
+                                 const float J[3],
+                                 const float* __restrict__ tab,
+                                 const GPUEos4DParams& p) {
+    const float ABS_ERR = 1.e-7f;
+    float u0_l = fmaxf(1.f, 0.5f * u0_guess);
+    float u0_h = fminf(1.e4f, 1.5f * u0_guess);
+    if (u0_h < 1.f + ABS_ERR) u0_h = 2.f;
+    float fu0_l, dfdu0_l, fu0_h, dfdu0_h;
+    gpu_u0_fdf_4d(u0_l, T00, K00, M, J, fu0_l, dfdu0_l, tab, p);
+    gpu_u0_fdf_4d(u0_h, T00, K00, M, J, fu0_h, dfdu0_h, tab, p);
+    if (fabsf(fu0_l) < ABS_ERR) return u0_l;
+    if (fabsf(fu0_h) < ABS_ERR) return u0_h;
+    if (fu0_l * fu0_h > 0.f)  return u0_guess;
+
+    float du0_prev = u0_h - u0_l;
+    float du0_curr = du0_prev;
+    float u0_root  = (u0_h + u0_l) * 0.5f;
+    float fu0, dfdu0;
+    gpu_u0_fdf_4d(u0_root, T00, K00, M, J, fu0, dfdu0, tab, p);
+    for (int it = 0; it < 60; it++) {
+        const float u0_old = u0_root;
+        if (((u0_root - u0_h) * dfdu0 - fu0) * ((u0_root - u0_l) * dfdu0 - fu0) > 0.f
+            || fabsf(2.f * fu0) > fabsf(du0_prev * dfdu0)) {
+            du0_prev = du0_curr;
+            du0_curr = (u0_h - u0_l) * 0.5f;
+            u0_root  = u0_l + du0_curr;
+        } else {
+            du0_prev = du0_curr;
+            du0_curr = fu0 / dfdu0;
+            u0_root  = u0_root - du0_curr;
+        }
+        gpu_u0_fdf_4d(u0_root, T00, K00, M, J, fu0, dfdu0, tab, p);
+        if (fu0 * fu0_l < 0.f) { u0_h = u0_root; fu0_h = fu0; }
+        else                    { u0_l = u0_root; fu0_l = fu0; }
+        if (fabsf(du0_curr) < ABS_ERR || u0_root == u0_old) break;
+    }
+    return u0_root;
+}
+
+DFI void gpu_reconst4d_revert(Reconst4D& r, const float prev_u[4],
+                              float prev_e, const float prev_rho[3]) {
+    r.e = prev_e;
+    for (int i = 0; i < 3; i++) r.rho[i] = prev_rho[i];
+    for (int m = 0; m < 4; m++) r.u[m] = prev_u[m];
+    r.P = -1.f;   // recomputed by gpu_reconst4d
+}
+
+__device__ Reconst4D gpu_reconst4d_raw(float tau, const float tauq[GPU_NA_MAX],
+                                       int na, const float prev_u[4],
+                                       float prev_e, const float prev_rho[3],
+                                       const float* __restrict__ tab,
+                                       const GPUEos4DParams& p) {
+    const float ABS_ERR = 1.e-8f;
+    Reconst4D res;
+    float q[GPU_NA_MAX];
+    for (int i = 0; i < GPU_NA_MAX; i++) q[i] = (i < na) ? tauq[i] / tau : 0.f;
+
+    const float K00 = q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+    const float M   = sqrtf(K00);
+    const float T00 = q[0];
+    const float J[3] = {q[4], q[5], q[6]};
+
+    if (!isfinite(T00) || !isfinite(M)) {
+        gpu_reconst4d_revert(res, prev_u, prev_e, prev_rho);
+        return res;
+    }
+    if (T00 < ABS_ERR) {   // Reconst::regulate_grid
+        res.e = ABS_ERR;
+        res.rho[0] = res.rho[1] = res.rho[2] = 0.f;
+        res.u[0] = 1.f; res.u[1] = res.u[2] = res.u[3] = 0.f;
+        res.P = -1.f;
+        return res;
+    }
+    if (T00 < M) {
+        gpu_reconst4d_revert(res, prev_u, prev_e, prev_rho);
+        return res;
+    }
+
+    const float v_sol = gpu_solve_v_4d(T00, M, J, tab, p);
+    if (v_sol < 0.f) {
+        gpu_reconst4d_revert(res, prev_u, prev_e, prev_rho);
+        return res;
+    }
+
+    float u0      = 1.f / (sqrtf(fmaxf(0.f, 1.f - v_sol * v_sol)) + v_sol * ABS_ERR);
+    float epsilon = T00 - v_sol * M;
+    if (v_sol > 0.563624f && epsilon > 1e-6f) {
+        const float u0_sol = gpu_solve_u0_4d(u0, T00, K00, M, J, tab, p);
+        if (u0_sol >= 1.f) {
+            u0      = u0_sol;
+            epsilon = T00 - sqrtf(fmaxf(0.f, (1.f - 1.f / (u0 * u0)) * K00));
+        }
+    }
+    if (fabsf(u0 - prev_u[0]) / prev_u[0] > 100.f) {
+        gpu_reconst4d_revert(res, prev_u, prev_e, prev_rho);
+        return res;
+    }
+
+    res.e = epsilon;
+    for (int i = 0; i < 3; i++) res.rho[i] = J[i] / u0;
+    const float P = gpu_eos4d_P(epsilon, res.rho, tab, p);
+    const float vel_inv = u0 / (T00 + P);
+    res.u[0] = u0;
+    res.u[1] = q[1] * vel_inv;
+    res.u[2] = q[2] * vel_inv;
+    res.u[3] = q[3] * vel_inv;
+    const float u_sp_sq = res.u[1]*res.u[1] + res.u[2]*res.u[2] + res.u[3]*res.u[3];
+    if (fabsf(u0*u0 - u_sp_sq - 1.f) > ABS_ERR) {
+        const float scale = sqrtf(fmaxf(0.f, (u0*u0 - 1.f) / (u_sp_sq + ABS_ERR)));
+        res.u[1] *= scale;
+        res.u[2] *= scale;
+        res.u[3] *= scale;
+    }
+    res.P = P;
+    bool finite = isfinite(res.e);
+    for (int i = 0; i < 3; i++) finite = finite && isfinite(res.rho[i]);
+    if (!finite) gpu_reconst4d_revert(res, prev_u, prev_e, prev_rho);
+    return res;
+}
+
+__device__ Reconst4D gpu_reconst4d(float tau, const float tauq[GPU_NA_MAX],
+                                   int na, const float prev_u[4], float prev_e,
+                                   const float prev_rho[3],
+                                   const float* __restrict__ tab,
+                                   const GPUEos4DParams& p) {
+    Reconst4D r = gpu_reconst4d_raw(tau, tauq, na, prev_u, prev_e, prev_rho,
+                                    tab, p);
+    if (r.e < GPU_VACUUM_E && r.u[0] > GPU_VACUUM_U0_MAX) {   // see gpu_reconst
+        r.u[0] = 1.f;  r.u[1] = 0.f;  r.u[2] = 0.f;  r.u[3] = 0.f;
+    }
+    if (r.P < 0.f) r.P = gpu_eos4d_P(r.e, r.rho, tab, p);
+    return r;
+}
+
+// Advance::MaxSpeed with the 4D EOS (c_s^2 from its table)
+DFI float gpu_max_speed_4d(float tau, int direction, const Reconst4D& r,
+                           const float* __restrict__ tab,
+                           const GPUEos4DParams& p) {
+    const float gfac = (direction == 3) ? 1.f / tau : 1.f;
+    const float utau    = r.u[0];
+    const float ux      = fabsf(r.u[direction]);
+    const float utau2   = utau * utau;
+    const float ut2mux2 = utau2 - ux * ux;
+    GPUEos4DState st;
+    gpu_eos4d_lookup(r.e, r.rho[0], r.rho[1], r.rho[2], tab, p,
+                     GPU_EOS4D_P | GPU_EOS4D_DERIV | GPU_EOS4D_THERMO, st);
+    const float cs2    = st.cs2;
+    const float num_sq = (ut2mux2 - (ut2mux2 - 1.f) * cs2) * cs2;
+    float num;
+    if (num_sq >= 0.f) {
+        num = utau * ux * (1.f - cs2) + sqrtf(num_sq);
+    } else {
+        const float dPde = st.dPde;
+        const float h    = st.P + r.e;
+        num = (dPde < 0.001f)
+              ? sqrtf(fmaxf(0.f, -(h*dPde*h*(dPde*(-1.f + ut2mux2) - ut2mux2))))
+                - h*(-1.f + dPde)*utau*ux
+              : 1.f;
+    }
+    const float den = utau2 * (1.f - cs2) + cs2;
+    float f = num / fmaxf(den, 1.e-20f);
+    f = clampf(f, ux / utau, 1.f);
+    return f * gfac;
+}
+
+// T^{alpha direction} (alpha < 4) or N_i^{direction} (alpha = 4 + i), times
+// tau_fac, of a reconstructed state
+DFI float gpu_flux_4d(const Reconst4D& r, int alpha, int direction,
+                      float tau_fac) {
+    const float u_nu = r.u[direction];
+    if (alpha >= 4) return r.rho[alpha - 4] * u_nu * tau_fac;
+    float gfac = 0.f;
+    float u_mu;
+    if (alpha == direction) {
+        u_mu = u_nu;
+        gfac = (alpha == 0) ? -1.f : 1.f;
+    } else {
+        u_mu = r.u[alpha];
+    }
+    return ((r.e + r.P) * u_mu * u_nu + r.P * gfac) * tau_fac;
+}
+
+// tau T^{tau alpha} (alpha < 4) and tau N_i^tau of cell c, one EOS lookup
+DFI void gpu_cell_qi_4d(int c, int Ncells, int na, float tau,
+                        const float* __restrict__ eps,
+                        const float* __restrict__ rhob,
+                        const float* __restrict__ rhoq,
+                        const float* __restrict__ rhos,
+                        const float* __restrict__ u,
+                        const float* __restrict__ tab,
+                        const GPUEos4DParams& p, float out[GPU_NA_MAX]) {
+    const float e = __ldg(&eps[c]);
+    const float rho[3] = {__ldg(&rhob[c]),
+                          (na > 5) ? __ldg(&rhoq[c]) : 0.f,
+                          (na > 5) ? __ldg(&rhos[c]) : 0.f};
+    const float u0 = __ldg(&u[c]);
+    const float P = gpu_eos4d_P(e, rho, tab, p);
+    out[0] = tau * ((e + P) * u0 * u0 - P);
+    for (int a = 1; a < 4; a++) out[a] = tau * ((e + P) * __ldg(&u[a * Ncells + c]) * u0);
+    for (int i = 0; i < 3; i++) out[4 + i] = tau * rho[i] * u0;
+}
+
+// gpu_make_delta_qi for the 4D EOS
+__device__ void gpu_make_delta_qi_4d(
+    int ix, int iy, int ieta,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ u_curr,
+    float* __restrict__ qi_out,
+    const MUSICGridParams& params,
+    const float* __restrict__ tab,
+    const GPUEos4DParams& p4)
+{
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+    const int na     = params.n_alpha;
+    const float tau  = params.tau;
+    const float theta = params.minmod_theta;
+    const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const float e_c = epsilon_curr[c];
+    float u_c[4];
+    for (int m = 0; m < 4; m++) u_c[m] = u_curr[m * Ncells + c];
+    const float rho_c[3] = {rhob_curr[c],
+                            (na > 5) ? rhoq_curr[c] : 0.f,
+                            (na > 5) ? rhos_curr[c] : 0.f};
+
+    float qi[GPU_NA_MAX];
+    gpu_cell_qi_4d(c, Ncells, na, tau, epsilon_curr, rhob_curr, rhoq_curr,
+                   rhos_curr, u_curr, tab, p4, qi);
+
+    const float delta[4]   = {0.f, params.delta_x, params.delta_y, params.delta_eta};
+    const float tau_fac[4] = {0.f, tau, tau, 1.f};
+    float rhs[GPU_NA_MAX] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float T_eta_m[4] = {0.f, 0.f, 0.f, 0.f};
+    float T_eta_p[4] = {0.f, 0.f, 0.f, 0.f};
+    const int DX[3]   = {1, 0, 0};
+    const int DY[3]   = {0, 1, 0};
+    const int DETA[3] = {0, 0, 1};
+
+    for (int dir = 0; dir < 3; dir++) {
+        const int direction = dir + 1;
+        const int ip1 = clamped_cell(ix+  DX[dir], iy+  DY[dir], ieta+  DETA[dir], Nx, Ny, Neta);
+        const int ip2 = clamped_cell(ix+2*DX[dir], iy+2*DY[dir], ieta+2*DETA[dir], Nx, Ny, Neta);
+        const int im1 = clamped_cell(ix-  DX[dir], iy-  DY[dir], ieta-  DETA[dir], Nx, Ny, Neta);
+        const int im2 = clamped_cell(ix-2*DX[dir], iy-2*DY[dir], ieta-2*DETA[dir], Nx, Ny, Neta);
+        float gp1[GPU_NA_MAX], gp2[GPU_NA_MAX], gm1[GPU_NA_MAX], gm2[GPU_NA_MAX];
+        gpu_cell_qi_4d(ip1, Ncells, na, tau, epsilon_curr, rhob_curr, rhoq_curr, rhos_curr, u_curr, tab, p4, gp1);
+        gpu_cell_qi_4d(ip2, Ncells, na, tau, epsilon_curr, rhob_curr, rhoq_curr, rhos_curr, u_curr, tab, p4, gp2);
+        gpu_cell_qi_4d(im1, Ncells, na, tau, epsilon_curr, rhob_curr, rhoq_curr, rhos_curr, u_curr, tab, p4, gm1);
+        gpu_cell_qi_4d(im2, Ncells, na, tau, epsilon_curr, rhob_curr, rhoq_curr, rhos_curr, u_curr, tab, p4, gm2);
+
+        float qiphL[GPU_NA_MAX], qiphR[GPU_NA_MAX], qimhL[GPU_NA_MAX], qimhR[GPU_NA_MAX];
+        for (int a = 0; a < GPU_NA_MAX; a++) {
+            if (a >= na) { qiphL[a] = qiphR[a] = qimhL[a] = qimhR[a] = 0.f; continue; }
+            const float gc = qi[a];
+            const float fphL =  0.5f * gpu_minmod_dx(gp1[a], gc,     gm1[a], theta);
+            const float fphR = -0.5f * gpu_minmod_dx(gp2[a], gp1[a], gc,     theta);
+            const float fmhL =  0.5f * gpu_minmod_dx(gc,     gm1[a], gm2[a], theta);
+            const float fmhR = -fphL;
+            qiphL[a] = gc     + fphL;
+            qiphR[a] = gp1[a] + fphR;
+            qimhL[a] = gm1[a] + fmhL;
+            qimhR[a] = gc     + fmhR;
+        }
+
+        const Reconst4D r_phL = gpu_reconst4d(tau, qiphL, na, u_c, e_c, rho_c, tab, p4);
+        const Reconst4D r_phR = gpu_reconst4d(tau, qiphR, na, u_c, e_c, rho_c, tab, p4);
+        const Reconst4D r_mhL = gpu_reconst4d(tau, qimhL, na, u_c, e_c, rho_c, tab, p4);
+        const Reconst4D r_mhR = gpu_reconst4d(tau, qimhR, na, u_c, e_c, rho_c, tab, p4);
+
+        const float aiph = fmaxf(gpu_max_speed_4d(tau, direction, r_phL, tab, p4),
+                                 gpu_max_speed_4d(tau, direction, r_phR, tab, p4));
+        const float aimh = fmaxf(gpu_max_speed_4d(tau, direction, r_mhL, tab, p4),
+                                 gpu_max_speed_4d(tau, direction, r_mhR, tab, p4));
+        const float tf = tau_fac[direction];
+        const float dx = delta[direction];
+        for (int a = 0; a < na; a++) {
+            const float Fiph = 0.5f * ((gpu_flux_4d(r_phL, a, direction, tf)
+                                        + gpu_flux_4d(r_phR, a, direction, tf))
+                                       - aiph * (qiphR[a] - qiphL[a]));
+            const float Fimh = 0.5f * ((gpu_flux_4d(r_mhL, a, direction, tf)
+                                        + gpu_flux_4d(r_mhR, a, direction, tf))
+                                       - aimh * (qimhR[a] - qimhL[a]));
+            if (direction == 3 && (a == 0 || a == 3)) {
+                T_eta_m[a] = Fimh;
+                T_eta_p[a] = Fiph;
+            } else {
+                rhs[a] += (Fimh - Fiph) / dx * params.delta_tau;
+            }
+        }
+    }
+
+    const float cd = params.cosh_deta;
+    const float sd = params.sinh_deta;
+    rhs[0] += (  (T_eta_m[0] - T_eta_p[0]) * cd
+               - (T_eta_m[3] + T_eta_p[3]) * sd) * params.delta_tau;
+    rhs[3] += (  (T_eta_m[3] - T_eta_p[3]) * cd
+               - (T_eta_m[0] + T_eta_p[0]) * sd) * params.delta_tau;
+    for (int a = 0; a < na; a++)
+        qi_out[a * Ncells + c] = qi[a] + rhs[a];
+}
+
+// gpu_finalize_ideal for the 4D EOS
+__device__ void gpu_finalize_ideal_4d(
+    int c,
+    const float* __restrict__ qi_buf,
+    const float* __restrict__ dwmn_buf,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ rhob_prev,
+    const float* __restrict__ rhoq_prev,
+    const float* __restrict__ rhos_prev,
+    const float* __restrict__ u_prev,
+    float* __restrict__ e_future,
+    float* __restrict__ rhob_future,
+    float* __restrict__ rhoq_future,
+    float* __restrict__ rhos_future,
+    float* __restrict__ u_future,
+    const MUSICGridParams& params,
+    const float* __restrict__ qi_source_in,
+    const float* __restrict__ tab,
+    const GPUEos4DParams& p4)
+{
+    const int Ncells = params.Ncells;
+    const int na     = params.n_alpha;
+    const int   rkf      = params.rk_flag;
+    const float dt       = params.delta_tau;
+    const float tau_org  = params.tau_orig;
+    const float tau_next = tau_org + dt;
+    const float rk_norm  = 1.f / (1.f + (float)rkf);
+
+    const float u0p = u_prev[c];
+    const float e_p = epsilon_prev[c];
+    const float rho_p[3] = {rhob_prev[c],
+                            (na > 5) ? rhoq_prev[c] : 0.f,
+                            (na > 5) ? rhos_prev[c] : 0.f};
+    const float P_p = (rkf > 0) ? gpu_eos4d_P(e_p, rho_p, tab, p4) : 0.f;
+
+    float qi[GPU_NA_MAX];
+    for (int a = 0; a < GPU_NA_MAX; a++) {
+        if (a >= na) { qi[a] = 0.f; continue; }
+        // the viscous divergence has five components (q^mu is the baryon
+        // current's); Q and S have no diffusion current
+        float qv = qi_buf[a * Ncells + c];
+        if (a < 5) qv -= dwmn_buf[a * Ncells + c] * dt;
+        if (params.has_hydro_source && (a < 5 || params.has_qs_source))
+            qv += qi_source_in[a * Ncells + c] * dt;
+        if (rkf > 0) {
+            float prev_TJb0;
+            if (a >= 4) {
+                prev_TJb0 = rho_p[a - 4] * u0p;
+            } else if (a == 0) {
+                prev_TJb0 = (e_p + P_p) * u0p * u0p - P_p;
+            } else {
+                prev_TJb0 = (e_p + P_p) * u_prev[a * Ncells + c] * u0p;
+            }
+            qv += (float)rkf * tau_org * prev_TJb0;
+        }
+        qi[a] = qv * rk_norm;
+    }
+
+    float u_c[4];
+    for (int m = 0; m < 4; m++) u_c[m] = u_curr[m * Ncells + c];
+    const float rho_c[3] = {rhob_curr[c],
+                            (na > 5) ? rhoq_curr[c] : 0.f,
+                            (na > 5) ? rhos_curr[c] : 0.f};
+    const Reconst4D r = gpu_reconst4d(tau_next, qi, na, u_c, epsilon_curr[c],
+                                      rho_c, tab, p4);
+    e_future[c]    = r.e;
+    rhob_future[c] = r.rho[0];
+    if (na > 5) {
+        rhoq_future[c] = r.rho[1];
+        rhos_future[c] = r.rho[2];
+    }
+    for (int m = 0; m < 4; m++) u_future[m * Ncells + c] = r.u[m];
+}
+
+// The two ideal-step kernels of the 4D EOS. Separate from gpu_make_delta_qi
+// and gpu_finalize_ideal: with the 4D code inlined into those, the compiled
+// 1D path returned non-finite fluxes (seen on the GB10 with CUDA 13), and the
+// 1D kernels stay exactly as they were this way.
+__global__ void gpu_make_delta_qi_eos4d(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ u_curr,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    const float* __restrict__ eos4d_tab,
+    GPUEos4DParams eos4d_p)
+{
+    const int ix   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int iy   = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ieta = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+    gpu_make_delta_qi_4d(ix, iy, ieta, epsilon_curr, rhob_curr, rhoq_curr,
+                         rhos_curr, u_curr, qi_out, params, eos4d_tab, eos4d_p);
+}
+
+__global__ void gpu_finalize_ideal_eos4d(
+    const float* __restrict__ qi_buf,
+    const float* __restrict__ dwmn_buf,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ rhob_prev,
+    const float* __restrict__ rhoq_prev,
+    const float* __restrict__ rhos_prev,
+    const float* __restrict__ u_prev,
+    float* __restrict__ e_future,
+    float* __restrict__ rhob_future,
+    float* __restrict__ rhoq_future,
+    float* __restrict__ rhos_future,
+    float* __restrict__ u_future,
+    MUSICGridParams params,
+    const float* __restrict__ qi_source_in,
+    const float* __restrict__ eos4d_tab,
+    GPUEos4DParams eos4d_p)
+{
+    const int ix   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int iy   = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ieta = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+    const int c = cell_idx(ix, iy, ieta, params.Nx, params.Ny);
+    gpu_finalize_ideal_4d(c, qi_buf, dwmn_buf, epsilon_curr, rhob_curr,
+                          rhoq_curr, rhos_curr, u_curr, epsilon_prev,
+                          rhob_prev, rhoq_prev, rhos_prev, u_prev,
+                          e_future, rhob_future, rhoq_future, rhos_future,
+                          u_future, params, qi_source_in, eos4d_tab, eos4d_p);
 }
 
 // ── gpu_make_delta_qi kernel ──────────────────────────────────────────────────
@@ -1988,6 +2558,751 @@ __global__ void gpu_first_rk_step_w_full(
     pi_b_future[c] = pi_b_out;
 }
 
+DFI float gpu_zeta_over_s_muB(float T_in_fm, float muB_in_fm,
+                          const MUSICGridParams& params) {
+    float zoverS = 0.f;
+    switch (params.T_dep_bulk_mode) {
+        case 0:
+            zoverS = 0.f;
+            break;
+        case 1:
+            zoverS = gpu_zeta_over_s_default(T_in_fm);
+            break;
+        case 2:
+            zoverS = gpu_zeta_over_s_duke(T_in_fm,
+                                          params.bulk_duke_norm,
+                                          params.bulk_duke_width_GeV,
+                                          params.bulk_duke_peak_GeV);
+            break;
+        case 3:
+            zoverS = gpu_zeta_over_s_sims(T_in_fm,
+                                          params.bulk_sims_max,
+                                          params.bulk_sims_width_GeV,
+                                          params.bulk_sims_T_peak_GeV,
+                                          params.bulk_sims_lambda);
+            break;
+        case 7:
+            zoverS = gpu_zeta_over_s_bigbroadP(T_in_fm);
+            break;
+        case 8:
+            zoverS = gpu_zeta_over_s_asym_gaussian(
+                        T_in_fm, 0.13f, 0.01f, 0.12f, 0.160f);
+            break;
+        case 9:
+            zoverS = gpu_zeta_over_s_asym_gaussian(
+                        T_in_fm, 0.175f, 0.01f, 0.12f, 0.160f);
+            break;
+        case 10: {
+            // the peak height and position move with mu_B
+            // (TransportCoeffs::get_zeta_over_s); at mu_B = 0 they are
+            // bulk_10_max and bulk_10_Tpeak exactly
+            const float muB_GeV = muB_in_fm * GPU_HBARC;
+            float peak;
+            if (muB_GeV < 0.2f) {
+                peak = params.bulk_asym10_max
+                       + (params.bulk_asym10_max_muB0p2 - params.bulk_asym10_max)
+                         / 0.2f * muB_GeV;
+            } else if (muB_GeV < 0.4f) {
+                peak = params.bulk_asym10_max_muB0p2
+                       + (params.bulk_asym10_max_muB0p4
+                          - params.bulk_asym10_max_muB0p2)
+                         / 0.2f * (muB_GeV - 0.2f);
+            } else {
+                peak = params.bulk_asym10_max_muB0p4;
+            }
+            const float Tpeak = params.bulk_asym10_Tpeak
+                + params.bulk_asym10_Tpeak_muBcurv * muB_GeV * muB_GeV;
+            zoverS = gpu_zeta_over_s_asym_gaussian(
+                        T_in_fm, peak,
+                        params.bulk_asym10_width_low,
+                        params.bulk_asym10_width_high,
+                        Tpeak);
+            break;
+        }
+        default:
+            zoverS = 0.f;
+            break;
+    }
+    return fmaxf(0.f, zoverS);
+}
+
+// ── Make_uPiSource with precomputed thermodynamics (4D EOS) ─────────────────
+
+// the local thermodynamics the viscous sources need: from the 1D tables
+// (e only) or from the NEOS-4D lookup with the charges
+struct GPUThermo {
+    float P, T, s, cs2, muB;
+};
+
+DFI GPUThermo gpu_thermo_1d(float e, const float* __restrict__ P_tab,
+                            const float* __restrict__ s_tab,
+                            const float* __restrict__ T_tab,
+                            const float* __restrict__ dPde_tab,
+                            const GPUEosParams& ep) {
+    GPUThermo th;
+    th.P   = gpu_P(e, P_tab, ep);
+    th.T   = gpu_T_e(e, T_tab, ep);
+    th.s   = gpu_s(e, s_tab, ep);
+    th.cs2 = clampf(gpu_dPde(e, dPde_tab, ep), 0.01f, 0.333333f);
+    th.muB = 0.f;
+    return th;
+}
+
+DFI GPUThermo gpu_thermo_4d(float e, float rhob, float rhoq, float rhos,
+                            const float* __restrict__ tab,
+                            const GPUEos4DParams& p) {
+    GPUEos4DState st;
+    gpu_eos4d_lookup(e, rhob, rhoq, rhos, tab, p,
+                     GPU_EOS4D_P | GPU_EOS4D_THERMO, st);
+    GPUThermo th;
+    th.P   = st.P;
+    th.T   = st.T;
+    th.s   = gpu_eos4d_entropy(e, rhob, rhoq, rhos, st);
+    th.cs2 = st.cs2;
+    th.muB = st.muB;
+    return th;
+}
+
+DFI float gpu_uPi_source_th(float pi_b, float theta,
+                         float eps_src, float Wsigma_scalar,
+                         const GPUThermo& th,
+                         const MUSICGridParams& params,
+                         float delta_tau)
+{
+    float P_local  = th.P;
+    float T_local  = th.T;
+    float cs2      = th.cs2;
+
+    float zeta_s   = gpu_zeta_over_s_muB(T_local, th.muB, params);
+    float epsP     = fmaxf(eps_src + P_local, 1.e-20f);
+    float T_safe   = fmaxf(T_local, 1.e-20f);
+    float bulk_zeta = zeta_s * epsP / T_safe;
+
+    float csfactor = fmaxf(1.f/3.f - cs2, 1.e-20f);
+    float tau_Pi;
+    if (params.bulk_relaxation_type == 1) {
+        tau_Pi = bulk_zeta
+               / (params.bulk_relax_time_factor * csfactor)
+               / epsP;
+    } else {
+        tau_Pi = params.bulk_relax_time_factor
+               / (csfactor * csfactor)
+               / epsP * bulk_zeta;
+    }
+    tau_Pi = fminf(10.f, fmaxf(3.f * delta_tau, tau_Pi));
+
+    const float delta_PiPi = 2.f / 3.f;
+    float transport_coeff1 = delta_PiPi * tau_Pi;
+
+    float NS_term  = -bulk_zeta * theta;
+    float relax    = -pi_b - transport_coeff1 * theta * pi_b;
+
+    float coupling_to_shear = 0.f;
+    if (params.include_second_order_terms == 1) {
+        const float lambda_bulkPipi = 8.f / 5.f;
+        float transport_coeff1_s =
+                lambda_bulkPipi * (1.f/3.f - cs2) * tau_Pi;
+        coupling_to_shear = -Wsigma_scalar * transport_coeff1_s;
+    }
+
+    return (NS_term + relax + coupling_to_shear) / tau_Pi;
+}
+
+// eta/s(T, mu_B): gpu_eta_over_s times the mu_B factor of
+// TransportCoeffs::get_eta_over_s (modes 7 and 10), clipped at 0 as there;
+// used with the 4D EOS only, so the 1D path is unchanged
+DFI float gpu_eta_over_s_muB(float T_in_fm, float muB_in_fm,
+                             const MUSICGridParams& params) {
+    float eta_s = gpu_eta_over_s(T_in_fm, params);
+    if (params.muB_dep_shear_mode == 7) {
+        const float m = fabsf(muB_in_fm) * GPU_HBARC;
+        const float f0 = 1.f, f1 = params.shear_muBf0p2, f2 = params.shear_muBf0p4;
+        float f;
+        if (m < 0.2f)      f = f0 + (f1 - f0) / 0.2f * m;
+        else if (m < 0.4f) f = f1 + (f2 - f1) / 0.2f * (m - 0.2f);
+        else               f = f2;
+        eta_s *= f;
+    } else if (params.muB_dep_shear_mode == 10) {
+        // |mu_B|, as TransportCoeffs::get_muB_dependence_shear_profile
+        eta_s *= 1.f + params.shear_muBDep_slope
+                       * powf(fabsf(muB_in_fm) * GPU_HBARC
+                              / params.shear_muBDep_scale,
+                              params.shear_muBDep_alpha);
+    }
+    return fmaxf(0.f, eta_s);
+}
+
+// Algebraic Make_uWSource (port of Diss::Make_uWSource).
+DFI float gpu_uW_source_th(
+        int mu, int nu,
+        const float W4[4][4],
+        const float s4[4][4],
+        const float u[4],
+        float pi_b,
+        float theta, float eps_src,
+        float Wsigma_scalar, float Wsquare,
+        const GPUThermo& th,
+        const MUSICGridParams& params,
+        float delta_tau)
+{
+    float P       = th.P;
+    float entropy = th.s;
+    float T_local = th.T;
+    float shear_to_s_T = params.eos4d
+                         ? gpu_eta_over_s_muB(T_local, th.muB, params)
+                         : gpu_eta_over_s(T_local, params);
+    float shear   = shear_to_s_T * entropy;
+
+    float epsP = fmaxf(eps_src + P, 1.e-20f);
+    float tau_pi = params.shear_relax_time_factor * shear / epsP;
+    tau_pi = fminf(10.f, fmaxf(3.f * delta_tau, tau_pi));
+
+    const float dpi_pi = 4.f / 3.f;
+    float transport_coefficient2 = dpi_pi * tau_pi;
+
+    float W_mn      = W4[mu][nu];
+    float sigma_mn  = s4[mu][nu];
+
+    float NS_term = -2.f * shear * sigma_mn;
+    float relax   = -(1.f + transport_coefficient2 * theta) * W_mn;
+
+    float Wsigma_term = 0.f;
+    float WW_term     = 0.f;
+    if (params.include_second_order_terms == 1
+        && params.init_profile_zero == 0) {
+        const float phi7_45      = (9.f / 70.f) * (4.f / 5.f);
+        float transport_coeff_W  = phi7_45 * tau_pi / fmaxf(shear, 1.e-20f);
+        const float tau_pipi     = 10.f / 7.f;
+        float transport_coeff_Ws = tau_pipi * tau_pi;
+
+        float gmunu_uu  = ((mu == nu)
+                            ? ((mu == 0) ? -1.f : 1.f)
+                            : 0.f)
+                        + u[mu] * u[nu];
+
+        float t1_Ws = (
+              -W4[mu][0]*s4[nu][0] - W4[nu][0]*s4[mu][0]
+              +W4[mu][1]*s4[nu][1] + W4[nu][1]*s4[mu][1]
+              +W4[mu][2]*s4[nu][2] + W4[nu][2]*s4[mu][2]
+              +W4[mu][3]*s4[nu][3] + W4[nu][3]*s4[mu][3]
+              ) * 0.5f;
+        float t2_Ws = -(1.f/3.f) * gmunu_uu * Wsigma_scalar;
+        Wsigma_term = -transport_coeff_Ws * (t1_Ws + t2_Ws);
+
+        float t1_WW = -W4[mu][0]*W4[nu][0]
+                     + W4[mu][1]*W4[nu][1]
+                     + W4[mu][2]*W4[nu][2]
+                     + W4[mu][3]*W4[nu][3];
+        float t2_WW = -(1.f/3.f) * gmunu_uu * Wsquare;
+        WW_term = -transport_coeff_W * (t1_WW + t2_WW);
+    }
+
+    float Coupling_to_Bulk = 0.f;
+    if (params.include_second_order_terms == 1) {
+        const float lambda_pibulkPi = 6.f / 5.f;
+        float transport_coeff_b = lambda_pibulkPi * tau_pi;
+        Coupling_to_Bulk = -pi_b * sigma_mn * transport_coeff_b;
+    }
+
+    return (NS_term + relax + Wsigma_term + WW_term + Coupling_to_Bulk)
+           / tau_pi;
+}
+
+// ── gpu_first_rk_step_w_full with the 4D EOS ─────────────────────────────────
+//
+// gpu_first_rk_step_w_full and its source terms with T, s, P, cs2 and mu_B
+// from the NEOS-4D lookup at the cell's densities, and eta/s, zeta/s with
+// their mu_B dependence. A copy, so that the 1D-EOS kernel and its results
+// stay exactly as they were.
+
+__global__ void gpu_first_rk_step_w_full_eos4d(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ pi_b_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ u_prev,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ u_future,
+    const float* __restrict__ uwrhs_in,
+    const float* __restrict__ theta_in,
+    const float* __restrict__ a_in,
+    const float* __restrict__ sigma_in,
+    float* __restrict__ Wmunu_future,
+    float* __restrict__ pi_b_future,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_s,
+    const float* __restrict__ eos_T,
+    const float* __restrict__ eos_dPde,
+    const float* __restrict__ uprhs_in,
+    MUSICGridParams params,
+    GPUEosParams eos_p,
+    const float* __restrict__ epsilon_future,
+    const float* __restrict__ rhob_future,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhob_prev,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhoq_prev,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ rhos_prev,
+    const float* __restrict__ rhoq_future,
+    const float* __restrict__ rhos_future,
+    const float* __restrict__ eos4d_tab,
+    GPUEos4DParams eos4d_p,
+    const float* __restrict__ uwrhs_q_in,
+    const float* __restrict__ dmuBT_in)
+{
+    int ix   = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy   = blockIdx.y * blockDim.y + threadIdx.y;
+    int ieta = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+
+    const int   rkf       = params.rk_flag;
+    const float dt        = params.delta_tau;
+    const float tau_now   = params.tau;
+    const float rk_norm   = 1.f / (1.f + (float)rkf);
+
+    // nothing to evolve: W, Pi (and q) stay zero. Unlike the 1D kernel, bulk
+    // and diffusion are evolved without shear as well (as on the CPU).
+    if (params.turn_on_shear == 0 && params.turn_on_bulk == 0
+        && params.turn_on_diff == 0) {
+        for (int m = 0; m < 14; m++)
+            Wmunu_future[m * Ncells + c] = 0.f;
+        pi_b_future[c] = 0.f;
+        return;
+    }
+
+    float u_c[4], u_p[4], u_f[4];
+    for (int m = 0; m < 4; m++) {
+        u_c[m] = u_curr  [m * Ncells + c];
+        u_p[m] = u_prev  [m * Ncells + c];
+        u_f[m] = u_future[m * Ncells + c];
+    }
+
+    float Wc[14], Wp_cell[14];
+    for (int m = 0; m < 14; m++) {
+        Wc[m]      = Wmunu_curr[m * Ncells + c];
+        Wp_cell[m] = Wmunu_prev[m * Ncells + c];
+    }
+
+    float W4[4][4];
+    W4[0][0]=Wc[0]; W4[0][1]=Wc[1]; W4[0][2]=Wc[2]; W4[0][3]=Wc[3];
+    W4[1][0]=Wc[1]; W4[1][1]=Wc[4]; W4[1][2]=Wc[5]; W4[1][3]=Wc[6];
+    W4[2][0]=Wc[2]; W4[2][1]=Wc[5]; W4[2][2]=Wc[7]; W4[2][3]=Wc[8];
+    W4[3][0]=Wc[3]; W4[3][1]=Wc[6]; W4[3][2]=Wc[8]; W4[3][3]=Wc[9];
+
+    float theta = theta_in[c];
+    float a_loc[4];
+    for (int m = 0; m < 4; m++) a_loc[m] = a_in[m * Ncells + c];
+
+    float sigma_vec[10];
+    for (int m = 0; m < 10; m++) sigma_vec[m] = sigma_in[m * Ncells + c];
+
+    float s4[4][4];
+    s4[0][0]=sigma_vec[0]; s4[0][1]=sigma_vec[1]; s4[0][2]=sigma_vec[2]; s4[0][3]=sigma_vec[3];
+    s4[1][0]=sigma_vec[1]; s4[1][1]=sigma_vec[4]; s4[1][2]=sigma_vec[5]; s4[1][3]=sigma_vec[6];
+    s4[2][0]=sigma_vec[2]; s4[2][1]=sigma_vec[5]; s4[2][2]=sigma_vec[7]; s4[2][3]=sigma_vec[8];
+    s4[3][0]=sigma_vec[3]; s4[3][1]=sigma_vec[6]; s4[3][2]=sigma_vec[8]; s4[3][3]=sigma_vec[9];
+
+    float eps_src = (rkf == 0) ? epsilon_curr[c] : epsilon_prev[c];
+
+    // the thermodynamics of the source cell (Advance::FirstRKStepW: the
+    // current cell at rk 0, the previous one at rk 1), once per cell
+    GPUThermo th;
+    if (params.eos4d) {
+        const bool q = (params.n_alpha > 5);
+        const float rb = (rkf == 0) ? rhob_curr[c] : rhob_prev[c];
+        const float rq = q ? ((rkf == 0) ? rhoq_curr[c] : rhoq_prev[c]) : 0.f;
+        const float rs = q ? ((rkf == 0) ? rhos_curr[c] : rhos_prev[c]) : 0.f;
+        th = gpu_thermo_4d(eps_src, rb, rq, rs, eos4d_tab, eos4d_p);
+    } else {
+        th = gpu_thermo_1d(eps_src, eos_P, eos_s, eos_T, eos_dPde, eos_p);
+    }
+
+    float pi_c_curr = pi_b_curr[c];
+
+    float Wsigma_scalar = 0.f;
+    float Wsquare       = 0.f;
+    if (params.include_second_order_terms == 1) {
+        Wsigma_scalar =
+              W4[0][0]*s4[0][0] + W4[1][1]*s4[1][1]
+            + W4[2][2]*s4[2][2] + W4[3][3]*s4[3][3]
+            - 2.f * (W4[0][1]*s4[0][1] + W4[0][2]*s4[0][2] + W4[0][3]*s4[0][3])
+            + 2.f * (W4[1][2]*s4[1][2] + W4[1][3]*s4[1][3] + W4[2][3]*s4[2][3]);
+        Wsquare =
+              W4[0][0]*W4[0][0] + W4[1][1]*W4[1][1]
+            + W4[2][2]*W4[2][2] + W4[3][3]*W4[3][3]
+            - 2.f * (W4[0][1]*W4[0][1] + W4[0][2]*W4[0][2] + W4[0][3]*W4[0][3])
+            + 2.f * (W4[1][2]*W4[1][2] + W4[1][3]*W4[1][3] + W4[2][3]*W4[2][3]);
+    }
+
+    float Wf[14];
+    for (int m = 0; m < 14; m++) Wf[m] = 0.f;
+
+    const int MU_LIST[5] = {1, 1, 1, 2, 2};
+    const int NU_LIST[5] = {1, 2, 3, 2, 3};
+
+    for (int k = 0; k < 5; k++) {
+        int mu  = MU_LIST[k];
+        int nu  = NU_LIST[k];
+        int id  = WMUNU_IDX[mu][nu];
+
+        float uwrhs_flux = uwrhs_in[k * Ncells + c];
+
+        float SW = gpu_uW_source_th(
+                       mu, nu, W4, s4, u_c, pi_c_curr,
+                       theta, eps_src,
+                       Wsigma_scalar, Wsquare,
+                       th, params, dt);
+
+        float w_rhs_geom = gpu_uWRHS_geom(W4, u_c, a_loc, mu, nu,
+                                          theta, tau_now, dt);
+        float w_rhs = uwrhs_flux + w_rhs_geom;
+
+        float tempf =
+              (1.f - (float)rkf) * (Wc[id] * u_c[0])
+            +        (float)rkf  * (Wp_cell[id] * u_p[0]);
+        tempf += SW * dt;
+        tempf += w_rhs;
+        tempf += (float)rkf * (Wc[id] * u_c[0]);
+        tempf *= rk_norm;
+
+        Wf[id] = (params.turn_on_shear == 1) ? tempf / u_f[0] : 0.f;
+    }
+
+    Wf[9] = ( 2.f * (  u_f[1]*u_f[2]*Wf[5]
+                     + u_f[1]*u_f[3]*Wf[6]
+                     + u_f[2]*u_f[3]*Wf[8])
+              - (u_f[0]*u_f[0] - u_f[1]*u_f[1]) * Wf[4]
+              - (u_f[0]*u_f[0] - u_f[2]*u_f[2]) * Wf[7])
+            / fmaxf(u_f[0]*u_f[0] - u_f[3]*u_f[3], 1.e-10f);
+
+    for (int mu = 1; mu < 4; mu++) {
+        float s = 0.f;
+        for (int nu = 1; nu < 4; nu++)
+            s += Wf[WMUNU_IDX[mu][nu]] * u_f[nu];
+        Wf[mu] = s / u_f[0];
+    }
+    {
+        float s = 0.f;
+        for (int nu = 1; nu < 4; nu++) s += Wf[nu] * u_f[nu];
+        Wf[0] = s / u_f[0];
+    }
+
+    for (int m = 10; m < 14; m++) Wf[m] = 0.f;
+    if (params.turn_on_diff == 1) {
+        // Diss::Make_uqSource and the q part of Advance::FirstRKStepW, with
+        // the thermodynamics of the source cell (th) and its rho_B
+        const float small_eps = 1.e-16f;
+        const float rhob_src = (rkf == 0) ? rhob_curr[c] : rhob_prev[c];
+        const float T = th.T;
+        float tau_rho = params.kappa_coefficient / fmaxf(T, small_eps);
+        tau_rho = fminf(10.f, fmaxf(3.f * dt, tau_rho));
+        const float alpha_mu = th.muB / fmaxf(T, small_eps);
+        const float den = 3.f * T * tanhf(alpha_mu);
+        const float denorm_safe = copysignf(fmaxf(fabsf(den), small_eps), den);
+        const float kappa = params.kappa_coefficient
+            * (rhob_src / denorm_safe
+               - rhob_src * rhob_src / fmaxf(eps_src + th.P, small_eps));
+        float qc[4], qp[4];
+        for (int i = 0; i < 4; i++) {
+            qc[i] = Wc[10 + i];
+            qp[i] = Wp_cell[10 + i];
+        }
+        float dmu[4];
+        for (int n = 0; n < 4; n++) dmu[n] = dmuBT_in[n * Ncells + c];
+        const float a4 = dmuBT_in[4 * Ncells + c];
+        const float tc  = params.delta_qq_coeff  * tau_rho;
+        const float tc2 = params.lambda_qq_coeff * tau_rho;
+        float q_dot_a = 0.f;   // q^i g_ii a^i
+        for (int i = 0; i < 4; i++)
+            q_dot_a += qc[i] * ((i == 0) ? -1.f : 1.f) * a_loc[i];
+        for (int nu = 1; nu < 4; nu++) {
+            const float NS = kappa * (dmu[nu] + u_c[nu] * a4);
+            const float NL1 = -tc * qc[nu] * theta;
+            float qs = 0.f;   // q^i sigma_i^nu
+            for (int i = 0; i < 4; i++)
+                qs += qc[i] * s4[i][nu] * ((i == 0) ? -1.f : 1.f);
+            const float NL2 = -tc2 * qs;
+            float src = (-qc[nu] - NS + NL1 + NL2) / tau_rho;
+            src += (theta - u_c[0] / tau_now) * qc[nu];
+            // the Milne terms: (g^{nu tau} + u^nu u^tau) u^eta q^eta/tau
+            //                - (g^{nu eta} + u^nu u^eta) u^eta q^tau/tau
+            const float g_nu3 = (nu == 3) ? 1.f : 0.f;
+            src += (u_c[nu] * u_c[0]) * u_c[3] * qc[3] / tau_now
+                   - (g_nu3 + u_c[nu] * u_c[3]) * u_c[3] * qc[0] / tau_now;
+            src += u_c[nu] * q_dot_a;
+
+            float t = (1.f - (float)rkf) * (qc[nu] * u_c[0])
+                    +        (float)rkf  * (qp[nu] * u_p[0]);
+            t += src * dt;
+            t += uwrhs_q_in[(nu - 1) * Ncells + c];
+            t += (float)rkf * (qc[nu] * u_c[0]);
+            t *= rk_norm;
+            Wf[10 + nu] = t / u_f[0];
+        }
+        // q^tau from transversality
+        Wf[10] = (Wf[11] * u_f[1] + Wf[12] * u_f[2] + Wf[13] * u_f[3]) / u_f[0];
+    }
+
+    float pi_b_out;
+    if (params.turn_on_bulk == 1) {
+        float pi_c = pi_b_curr[c];
+        float pi_p = pi_b_prev[c];
+
+        float p_rhs = uprhs_in[c]
+                    + (-(u_c[0] * pi_c) / tau_now + theta * pi_c) * dt;
+
+        float SPi = gpu_uPi_source_th(pi_c, theta, eps_src, Wsigma_scalar,
+                                   th, params, dt);
+
+        float tempf =
+              (1.f - (float)rkf) * (pi_c * u_c[0])
+            +        (float)rkf  * (pi_p * u_p[0]);
+        tempf += SPi * dt;
+        tempf += p_rhs;
+        tempf += (float)rkf * (pi_c * u_c[0]);
+        tempf *= rk_norm;
+        pi_b_out = tempf / u_f[0];
+    } else {
+        pi_b_out = 0.f;
+    }
+
+    if (params.do_quest_revert == 1) {
+        const float eps_scale     = 0.1f;
+        const float xi            = 0.05f;
+        const float rho_shear_max = 0.1f;
+        const float rho_bulk_max  = 0.1f;
+
+        float e_local = epsilon_future[c];
+        float sig_e   = 1.f / (expf(-(e_local - eps_scale) / xi) + 1.f);
+        float sig_off = 1.f / (expf(eps_scale / xi)              + 1.f);
+        float factor  = 10.f * params.quest_revert_strength
+                            * (sig_e - sig_off);
+
+        float pi00 = Wf[0], pi01 = Wf[1], pi02 = Wf[2], pi03 = Wf[3];
+        float pi11 = Wf[4], pi12 = Wf[5], pi13 = Wf[6];
+        float pi22 = Wf[7], pi23 = Wf[8];
+        float pi33 = Wf[9];
+        float pisize =
+              pi00*pi00 + pi11*pi11 + pi22*pi22 + pi33*pi33
+            - 2.f * (pi01*pi01 + pi02*pi02 + pi03*pi03)
+            + 2.f * (pi12*pi12 + pi13*pi13 + pi23*pi23);
+
+        float bulksize = 3.f * pi_b_out * pi_b_out;
+
+        float p_local;
+        if (params.eos4d) {
+            const bool q = (params.n_alpha > 5);
+            const float rho_f[3] = {rhob_future[c],
+                                    q ? rhoq_future[c] : 0.f,
+                                    q ? rhos_future[c] : 0.f};
+            p_local = gpu_eos4d_P(e_local, rho_f, eos4d_tab, eos4d_p);
+        } else {
+            p_local = gpu_P(e_local, eos_P, eos_p);
+        }
+        float eq_size  = e_local * e_local + 3.f * p_local * p_local;
+        eq_size        = fmaxf(eq_size, 1.e-30f);
+
+        float rho_shear = sqrtf(fmaxf(pisize, 0.f) / eq_size) / factor;
+        float rho_bulk  = sqrtf(fmaxf(bulksize, 0.f) / eq_size) / factor;
+
+        if (isnan(rho_shear)) {
+            for (int m = 0; m < 10; m++) Wf[m] = 0.f;
+        } else if (rho_shear > rho_shear_max) {
+            float scale = rho_shear_max / rho_shear;
+            for (int m = 0; m < 10; m++) Wf[m] *= scale;
+        }
+        if (rho_bulk > rho_bulk_max) {
+            pi_b_out *= rho_bulk_max / rho_bulk;
+        }
+        if (params.turn_on_diff == 1) {
+            // Advance::QuestRevert_qmu (energy and rho_B of the new state)
+            float q_size = -Wf[10]*Wf[10] + Wf[11]*Wf[11]
+                           + Wf[12]*Wf[12] + Wf[13]*Wf[13];
+            if (q_size < 0.f) {
+                for (int m = 10; m < 14; m++) Wf[m] = 0.f;
+            }
+            const float rhob_f = rhob_future[c];
+            const float rho_q = sqrtf(q_size / (rhob_f * rhob_f)) / factor;
+            const float rho_q_max = 0.1f;
+            if (rho_q > rho_q_max) {
+                const float scale = rho_q_max / rho_q;
+                for (int m = 10; m < 14; m++) Wf[m] *= scale;
+            }
+        }
+
+        (void)rhob_future;
+    }
+
+    // Non-finite guard.  An overflow in a very dilute cell (e.g. a spurious u^0
+    // jump at the edge of the medium) can leave W^{mu nu} or Pi at inf/NaN, and
+    // the regulator above cannot remove it (inf * 0 = NaN, and NaN > x is
+    // false).  It would then spread through the flux stencil, and
+    // gpu_reconstruct reverts every cell it reaches, so the whole grid stops
+    // evolving while MUSIC runs on to its maximum time.  Set such a tensor to 0
+    // and count the cell update (gpu_nonfinite_count_read_and_reset).  Only
+    // non-finite values trigger it, so normal runs are unchanged.
+    bool bad_w = false;
+    for (int m = 0; m < 14; m++) bad_w |= !isfinite(Wf[m]);
+    const bool bad_pi = !isfinite(pi_b_out);
+    if (bad_w) for (int m = 0; m < 14; m++) Wf[m] = 0.f;
+    if (bad_pi) pi_b_out = 0.f;
+    if (bad_w || bad_pi) atomicAdd(&d_nonfinite_count, 1u);
+
+    for (int m = 0; m < 14; m++)
+        Wmunu_future[m * Ncells + c] = Wf[m];
+    pi_b_future[c] = pi_b_out;
+}
+
+// ── Net baryon diffusion with the 4D EOS (turn_on_diff) ─────────────────────
+//
+// mu_B/T of the current and the previous step (one lookup per cell each),
+// its gradient partial^mu (mu_B/T) and its derivative along u, as
+// U_derivative::MakeDSpatial / MakeDTau / calculate_Du_supmu do for
+// dUsup[4][mu]; and the KT flux of u^a q^i (Diss::Make_uWRHS, components 11
+// to 13). The q update itself is in gpu_first_rk_step_w_full_eos4d.
+
+__global__ void gpu_muBT_eos4d(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ rhob_prev,
+    const float* __restrict__ rhoq_prev,
+    const float* __restrict__ rhos_prev,
+    float* __restrict__ muBT_out,
+    MUSICGridParams params,
+    const float* __restrict__ eos4d_tab,
+    GPUEos4DParams eos4d_p)
+{
+    const int c = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= params.Ncells) return;
+    const bool q = (params.n_alpha > 5);
+    GPUEos4DState st;
+    gpu_eos4d_lookup(epsilon_curr[c], rhob_curr[c],
+                     q ? rhoq_curr[c] : 0.f, q ? rhos_curr[c] : 0.f,
+                     eos4d_tab, eos4d_p, GPU_EOS4D_P | GPU_EOS4D_THERMO, st);
+    muBT_out[c] = st.muB / st.T;
+    gpu_eos4d_lookup(epsilon_prev[c], rhob_prev[c],
+                     q ? rhoq_prev[c] : 0.f, q ? rhos_prev[c] : 0.f,
+                     eos4d_tab, eos4d_p, GPU_EOS4D_P | GPU_EOS4D_THERMO, st);
+    muBT_out[params.Ncells + c] = st.muB / st.T;
+}
+
+__global__ void gpu_make_dmuBT(
+    const float* __restrict__ muBT,
+    const float* __restrict__ u_curr,
+    float* __restrict__ dmuBT_out,
+    MUSICGridParams params)
+{
+    const int ix   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int iy   = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ieta = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+    const int Nx = params.Nx, Ny = params.Ny, Neta = params.Neta;
+    const int Ncells = params.Ncells;
+    const int c = cell_idx(ix, iy, ieta, Nx, Ny);
+    const float delta[4] = {0.f, params.delta_x, params.delta_y,
+                            params.delta_eta * params.tau};
+    const int DX[3] = {1, 0, 0}, DY[3] = {0, 1, 0}, DETA[3] = {0, 0, 1};
+
+    float d[4];
+    const float f = muBT[c];
+    for (int dir = 0; dir < 3; dir++) {
+        const int ip1 = clamped_cell(ix + DX[dir], iy + DY[dir],
+                                     ieta + DETA[dir], Nx, Ny, Neta);
+        const int im1 = clamped_cell(ix - DX[dir], iy - DY[dir],
+                                     ieta - DETA[dir], Nx, Ny, Neta);
+        d[dir + 1] = gpu_minmod_dx(muBT[ip1], f, muBT[im1],
+                                   params.minmod_theta) / delta[dir + 1];
+    }
+    // backward difference in tau, g^{00} = -1
+    d[0] = -(f - muBT[Ncells + c]) / params.delta_tau;
+    float a4 = 0.f;
+    for (int n = 0; n < 4; n++) {
+        const float tfac = (n == 0) ? -1.f : 1.f;
+        a4 += tfac * u_curr[n * Ncells + c] * d[n];
+        dmuBT_out[n * Ncells + c] = d[n];
+    }
+    dmuBT_out[4 * Ncells + c] = a4;
+}
+
+// gpu_make_uwrhs for the spatial components of q^mu (Wmunu 11, 12, 13)
+__global__ void gpu_make_uwrhs_q(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ u_curr,
+    float* __restrict__ uwrhs_q_out,
+    MUSICGridParams params)
+{
+    int ix   = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy   = blockIdx.y * blockDim.y + threadIdx.y;
+    int ieta = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+
+    const int Nx     = params.Nx;
+    const int Ny     = params.Ny;
+    const int Neta   = params.Neta;
+    const int Ncells = params.Ncells;
+    const int c      = cell_idx(ix, iy, ieta, Nx, Ny);
+    const float delta[4] = {0.f, params.delta_x, params.delta_y,
+                            params.delta_eta * params.tau};
+    const float theta_l   = params.minmod_theta;
+    const int DX[3] = {1, 0, 0}, DY[3] = {0, 1, 0}, DETA[3] = {0, 0, 1};
+
+    for (int k = 0; k < 3; k++) {
+        const int idx_1d = 11 + k;
+        float flux = 0.f;
+        for (int dir = 0; dir < 3; dir++) {
+            const int direction = dir + 1;
+            const int ip1 = clamped_cell(ix +   DX[dir], iy +   DY[dir], ieta +   DETA[dir], Nx, Ny, Neta);
+            const int ip2 = clamped_cell(ix + 2*DX[dir], iy + 2*DY[dir], ieta + 2*DETA[dir], Nx, Ny, Neta);
+            const int im1 = clamped_cell(ix -   DX[dir], iy -   DY[dir], ieta -   DETA[dir], Nx, Ny, Neta);
+            const int im2 = clamped_cell(ix - 2*DX[dir], iy - 2*DY[dir], ieta - 2*DETA[dir], Nx, Ny, Neta);
+            const int cs[5] = {c, ip1, ip2, im1, im2};
+            float W[5], ud[5], u0[5];
+            for (int j = 0; j < 5; j++) {
+                W[j]  = Wmunu_curr[idx_1d * Ncells + cs[j]];
+                ud[j] = u_curr[direction * Ncells + cs[j]];
+                u0[j] = u_curr[cs[j]];
+            }
+            const float f_c  = W[0]*ud[0], g_c  = W[0]*u0[0];
+            const float f_p1 = W[1]*ud[1], g_p1 = W[1]*u0[1];
+            const float f_p2 = W[2]*ud[2], g_p2 = W[2]*u0[2];
+            const float f_m1 = W[3]*ud[3], g_m1 = W[3]*u0[3];
+            const float f_m2 = W[4]*ud[4], g_m2 = W[4]*u0[4];
+
+            const float uWphR = f_p1 - 0.5f * gpu_minmod_dx(f_p2, f_p1, f_c, theta_l);
+            const float temp  = 0.5f * gpu_minmod_dx(f_p1, f_c, f_m1, theta_l);
+            const float uWphL = f_c + temp;
+            const float uWmhR = f_c - temp;
+            const float uWmhL = f_m1 + 0.5f * gpu_minmod_dx(f_c, f_m1, f_m2, theta_l);
+            const float WphR  = g_p1 - 0.5f * gpu_minmod_dx(g_p2, g_p1, g_c, theta_l);
+            const float temp2 = 0.5f * gpu_minmod_dx(g_p1, g_c, g_m1, theta_l);
+            const float WphL  = g_c + temp2;
+            const float WmhR  = g_c - temp2;
+            const float WmhL  = g_m1 + 0.5f * gpu_minmod_dx(g_c, g_m1, g_m2, theta_l);
+
+            const float a   = fabsf(ud[0]) / u0[0];
+            const float ap1 = fabsf(ud[1]) / u0[1];
+            const float am1 = fabsf(ud[3]) / u0[3];
+            float ax = fmaxf(a, ap1);
+            const float HWph = ((uWphR + uWphL) - ax * (WphR - WphL)) * 0.5f;
+            ax = fmaxf(a, am1);
+            const float HWmh = ((uWmhR + uWmhL) - ax * (WmhR - WmhL)) * 0.5f;
+            flux += -((HWph - HWmh) / delta[direction]);
+        }
+        uwrhs_q_out[k * Ncells + c] = flux * params.delta_tau;
+    }
+}
+
 // ── Max-reduction over epsilon and rhob ───────────────────────────────────────
 //
 // Uses dynamic shared memory (2 * blockDim.x floats).
@@ -2036,7 +3351,10 @@ __global__ void gpu_gather_cells(
     const float* __restrict__ pi_b,
     const float* __restrict__ kept,
     const int* __restrict__ cells, int n, int Ncells,
-    float* __restrict__ out)
+    float* __restrict__ out,
+    const float* __restrict__ rhoq,
+    const float* __restrict__ rhos,
+    int nf)
 {
     const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (j >= n) return;
@@ -2048,8 +3366,12 @@ __global__ void gpu_gather_cells(
     for (int k = 0; k < 4; ++k)  out[(2 + k)*m + j] = u[k*nc + c];
     for (int k = 0; k < 14; ++k) out[(6 + k)*m + j] = Wmunu[k*nc + c];
     out[20*m + j]  = pi_b[c];
+    if (nf > 21) {   // the charges, when they are on the device
+        out[21*m + j] = rhoq[c];
+        out[22*m + j] = rhos[c];
+    }
     if (kept) {
-        for (int f = 0; f < 21; ++f) out[(21 + f)*m + j] = kept[f*nc + c];
+        for (int f = 0; f < nf; ++f) out[(nf + f)*m + j] = kept[f*nc + c];
     }
 }
 
@@ -2089,4 +3411,25 @@ __global__ void gpu_reduce_max_eps_rhob(
         atomicMax(reinterpret_cast<int*>(out_eps),  __float_as_int(s_eps[0]));
         atomicMax(reinterpret_cast<int*>(out_rhob), __float_as_int(s_rhob[0]));
     }
+}
+
+// ── NEOS-4D lookup at given points (self-test, MUSIC_EOS4D_SELFTEST) ────────
+// in[4*i + k] = (e, rhob, rhoq, rhos)_i; out[GPU_EOS4D_TEST_NOUT*i + k] =
+// (P, T, muB, muQ, muS, cs2, dPde, dPdrhob, dPdrhoq, dPdrhos, s)_i
+
+__global__ void gpu_eos4d_eval(const float* __restrict__ in, int n,
+                               const float* __restrict__ tab,
+                               GPUEos4DParams p, float* __restrict__ out)
+{
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    const float e = in[4*i], rb = in[4*i + 1], rq = in[4*i + 2], rs = in[4*i + 3];
+    GPUEos4DState st;
+    gpu_eos4d_lookup(e, rb, rq, rs, tab, p,
+                     GPU_EOS4D_P | GPU_EOS4D_DERIV | GPU_EOS4D_THERMO, st);
+    float* o = out + static_cast<size_t>(GPU_EOS4D_TEST_NOUT) * i;
+    o[0] = st.P;    o[1] = st.T;       o[2] = st.muB;     o[3] = st.muQ;
+    o[4] = st.muS;  o[5] = st.cs2;     o[6] = st.dPde;    o[7] = st.dPdrhob;
+    o[8] = st.dPdrhoq; o[9] = st.dPdrhos;
+    o[10] = gpu_eos4d_entropy(e, rb, rq, rs, st);
 }

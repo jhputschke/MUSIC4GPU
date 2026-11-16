@@ -205,6 +205,12 @@ bool CUDAPipelines::initialize(const char* /*unused*/) {
         if (max_block_threads_ < 64)  max_block_threads_ = 64;
     }
     fprintf(stderr, "[MUSIC-GPU] max threads/block = %d\n", max_block_threads_);
+    // the same for the flux kernel of the 4D EOS (more registers)
+    if (cudaOccupancyMaxPotentialBlockSize(&min_grid, &opt_block,
+                                           gpu_make_delta_qi_eos4d, 0, 0)
+            == cudaSuccess && opt_block > 0) {
+        max_block_threads_eos4d_ = std::max(64, std::min(256, opt_block));
+    }
 
     ready_ = true;
     return true;
@@ -251,12 +257,45 @@ void CUDAPipelines::upload_snapshots_async(GPUGrid& gpu) {
         h2d(s->u,       s->u_stage,        4 * nc * sizeof(float));
         h2d(s->Wmunu,   s->Wmunu_stage,   14 * nc * sizeof(float));
         h2d(s->pi_b,    s->pi_b_stage,         nc * sizeof(float));
+        if (gpu.with_qs) {
+            h2d(s->rhoq, s->rhoq_stage, nc * sizeof(float));
+            h2d(s->rhos, s->rhos_stage, nc * sizeof(float));
+        }
     }
     if (copy_event_) {
         cudaEventRecord(static_cast<cudaEvent_t>(copy_event_), cs);
         cudaStreamWaitEvent(static_cast<cudaStream_t>(compute_stream_),
                             static_cast<cudaEvent_t>(copy_event_), 0);
     }
+}
+
+// ── eos4d_eval (self-test) ───────────────────────────────────────────────────
+
+bool CUDAPipelines::eos4d_eval(GPUGrid& gpu, const float* host_in, int n,
+                               float* host_out) {
+    if (!ready_ || !gpu.eos4d_tab || n <= 0) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    float* d_in = nullptr;
+    float* d_out = nullptr;
+    const size_t in_bytes  = 4 * static_cast<size_t>(n) * sizeof(float);
+    const size_t out_bytes = GPU_EOS4D_TEST_NOUT * static_cast<size_t>(n)
+                             * sizeof(float);
+    bool ok = cudaMalloc(&d_in, in_bytes) == cudaSuccess
+              && cudaMalloc(&d_out, out_bytes) == cudaSuccess
+              && cudaMemcpyAsync(d_in, host_in, in_bytes,
+                                 cudaMemcpyHostToDevice, stream) == cudaSuccess;
+    if (ok) {
+        const int block = 256;
+        gpu_eos4d_eval<<<(n + block - 1) / block, block, 0, stream>>>(
+            d_in, n, gpu.eos4d_tab, gpu.eos4d_params, d_out);
+        check_launch("gpu_eos4d_eval");
+        ok = cudaMemcpyAsync(host_out, d_out, out_bytes,
+                             cudaMemcpyDeviceToHost, stream) == cudaSuccess
+             && cudaStreamSynchronize(stream) == cudaSuccess;
+    }
+    if (d_in) cudaFree(d_in);
+    if (d_out) cudaFree(d_out);
+    return ok;
 }
 
 // ── reduce_max ───────────────────────────────────────────────────────────────
@@ -304,19 +343,27 @@ double CUDAPipelines::reduce_max_edge(GPUGrid& gpu, int fac_x, int fac_y) {
 
 namespace {
 // the snapshot's arrays in state order, with their lengths in floats
+// (the charges rhoq, rhos last, and only when they are on the device)
 template <class Snap, class F>
-void for_each_snapshot_array(Snap& s, size_t nc, F f) {
+void for_each_snapshot_array(Snap& s, size_t nc, bool with_qs, F f) {
     f(s.epsilon, nc);
     f(s.rhob,    nc);
     f(s.u,       GPU_U_COMPS * nc);
     f(s.Wmunu,   GPU_WMUNU_COMPS * nc);
     f(s.pi_b,    nc);
+    if (with_qs) {
+        f(s.rhoq, nc);
+        f(s.rhos, nc);
+    }
 }
 }  // namespace
 
+int CUDAPipelines::gather_fields(const GPUGrid& gpu) {
+    return 3 + GPU_U_COMPS + GPU_WMUNU_COMPS + (gpu.with_qs ? 2 : 0);
+}
+
 size_t CUDAPipelines::state_floats(const GPUGrid& gpu) {
-    return 2 * static_cast<size_t>(gpu.Ncells())
-             * (3 + GPU_U_COMPS + GPU_WMUNU_COMPS);
+    return 2 * static_cast<size_t>(gpu.Ncells()) * gather_fields(gpu);
 }
 
 void* CUDAPipelines::alloc_state(size_t floats) {
@@ -336,7 +383,7 @@ bool CUDAPipelines::save_snapshots(GPUGrid& gpu, void* state) {
     float* dst = static_cast<float*>(state);
     bool ok = true;
     for (GPUSnapshot* s : {&gpu.snap_prev, &gpu.snap_curr}) {
-        for_each_snapshot_array(*s, nc, [&](float* a, size_t n) {
+        for_each_snapshot_array(*s, nc, gpu.with_qs, [&](float* a, size_t n) {
             ok = ok && cudaMemcpyAsync(dst, a, n * sizeof(float),
                                        cudaMemcpyDefault, stream) == cudaSuccess;
             dst += n;
@@ -352,7 +399,7 @@ bool CUDAPipelines::restore_snapshots(GPUGrid& gpu, const void* state) {
     const float* src = static_cast<const float*>(state);
     bool ok = true;
     for (GPUSnapshot* s : {&gpu.snap_prev, &gpu.snap_curr}) {
-        for_each_snapshot_array(*s, nc, [&](float* a, size_t n) {
+        for_each_snapshot_array(*s, nc, gpu.with_qs, [&](float* a, size_t n) {
             ok = ok && cudaMemcpyAsync(a, src, n * sizeof(float),
                                        cudaMemcpyDefault, stream) == cudaSuccess;
             src += n;
@@ -381,7 +428,7 @@ bool CUDAPipelines::keep_curr(GPUGrid& gpu, void* state) {
     bool ok = true;
     // ordered after the kernels that wrote snap_curr and before those that
     // overwrite it (the same stream), so no synchronization here
-    for_each_snapshot_array(gpu.snap_curr, nc, [&](float* a, size_t n) {
+    for_each_snapshot_array(gpu.snap_curr, nc, gpu.with_qs, [&](float* a, size_t n) {
         ok = ok && cudaMemcpyAsync(dst, a, n * sizeof(float),
                                    cudaMemcpyDefault, stream) == cudaSuccess;
         dst += n;
@@ -395,9 +442,9 @@ bool CUDAPipelines::gather_cells(GPUGrid& gpu, const void* kept,
     if (!ready_ || n < 0 || (kept && !host_kept)) return false;
     if (n == 0) return true;
     auto stream = static_cast<cudaStream_t>(compute_stream_);
-    const int nf = 3 + GPU_U_COMPS + GPU_WMUNU_COMPS;          // 21
+    const int nf = gather_fields(gpu);                       // 21 or 23
     const size_t need = static_cast<size_t>(n);
-    if (gather_cap_ < need) {
+    if (gather_cap_ < need || gather_nf_ != nf) {
         if (gather_cells_dev_)  cudaFree(gather_cells_dev_);
         if (gather_out_dev_)    cudaFree(gather_out_dev_);
         if (gather_cells_host_) cudaFreeHost(gather_cells_host_);
@@ -418,6 +465,7 @@ bool CUDAPipelines::gather_cells(GPUGrid& gpu, const void* kept,
             return false;
         }
         gather_cap_ = cap;
+        gather_nf_  = nf;
     }
     std::memcpy(gather_cells_host_, cells, need * sizeof(int));
     if (cudaMemcpyAsync(gather_cells_dev_, gather_cells_host_,
@@ -428,7 +476,7 @@ bool CUDAPipelines::gather_cells(GPUGrid& gpu, const void* kept,
     gpu_gather_cells<<<(n + block - 1) / block, block, 0, stream>>>(
         s.epsilon, s.rhob, s.u, s.Wmunu, s.pi_b,
         static_cast<const float*>(kept), gather_cells_dev_, n, gpu.Ncells(),
-        gather_out_dev_);
+        gather_out_dev_, s.rhoq, s.rhos, nf);
     check_launch("gpu_gather_cells");
     const size_t out_floats = (kept ? 2 : 1) * nf * need;
     if (cudaMemcpyAsync(gather_out_host_, gather_out_dev_,
@@ -487,7 +535,9 @@ bool CUDAPipelines::pack_evolution_ideal(GPUGrid& gpu, const GPUPackParams& pp,
     gpu_pack_evolution_ideal<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_s, gpu.eos_T,
-        gpu.evo_pack_out, gpu.eos_params, pp);
+        gpu.evo_pack_out, gpu.eos_params, pp,
+        gpu.snap_curr.rhob, gpu.snap_curr.rhoq, gpu.snap_curr.rhos,
+        gpu.eos4d_tab, gpu.eos4d_params);
     check_launch("gpu_pack_evolution_ideal");
 
     const float* src = gpu.evo_pack_out;
@@ -534,6 +584,15 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     compute_launch(gpu, max_block_threads_, block, grid);
+    if (params.eos4d) {
+        compute_launch(gpu, max_block_threads_eos4d_, block, grid);
+        gpu_make_delta_qi_eos4d<<<grid, block, 0, stream>>>(
+            gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.rhoq,
+            gpu.snap_curr.rhos, gpu.snap_curr.u, gpu.qi_out, params,
+            gpu.eos4d_tab, gpu.eos4d_params);
+        check_launch("gpu_make_delta_qi_eos4d");
+        return;
+    }
     gpu_make_delta_qi<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_dPde,
@@ -548,6 +607,19 @@ void CUDAPipelines::dispatch_finalize_ideal(GPUGrid& gpu, const MUSICGridParams&
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     compute_launch(gpu, max_block_threads_, block, grid);
+    if (params.eos4d) {
+        gpu_finalize_ideal_eos4d<<<grid, block, 0, stream>>>(
+            gpu.qi_out, gpu.dwmn,
+            gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.rhoq,
+            gpu.snap_curr.rhos, gpu.snap_curr.u,
+            gpu.snap_prev.epsilon, gpu.snap_prev.rhob, gpu.snap_prev.rhoq,
+            gpu.snap_prev.rhos, gpu.snap_prev.u,
+            gpu.snap_future.epsilon, gpu.snap_future.rhob,
+            gpu.snap_future.rhoq, gpu.snap_future.rhos, gpu.snap_future.u,
+            params, gpu.qi_source_buf, gpu.eos4d_tab, gpu.eos4d_params);
+        check_launch("gpu_finalize_ideal_eos4d");
+        return;
+    }
     gpu_finalize_ideal<<<grid, block, 0, stream>>>(
         gpu.qi_out, gpu.dwmn,
         gpu.snap_curr.epsilon, gpu.snap_curr.u,
@@ -595,6 +667,28 @@ void CUDAPipelines::dispatch_uprhs(GPUGrid& gpu, const MUSICGridParams& params) 
     check_launch("gpu_make_uprhs");
 }
 
+// ── dispatch_diffusion (4D EOS, turn_on_diff) ────────────────────────────────
+
+void CUDAPipelines::dispatch_diffusion(GPUGrid& gpu, const MUSICGridParams& params) {
+    if (!ready_ || !gpu.muBT_buf) return;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const int block1 = 256;
+    gpu_muBT_eos4d<<<(gpu.Ncells() + block1 - 1) / block1, block1, 0, stream>>>(
+        gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.rhoq,
+        gpu.snap_curr.rhos, gpu.snap_prev.epsilon, gpu.snap_prev.rhob,
+        gpu.snap_prev.rhoq, gpu.snap_prev.rhos, gpu.muBT_buf, params,
+        gpu.eos4d_tab, gpu.eos4d_params);
+    check_launch("gpu_muBT_eos4d");
+    dim3 block, grid;
+    compute_launch(gpu, max_block_threads_, block, grid);
+    gpu_make_dmuBT<<<grid, block, 0, stream>>>(
+        gpu.muBT_buf, gpu.snap_curr.u, gpu.dmuBT_buf, params);
+    check_launch("gpu_make_dmuBT");
+    gpu_make_uwrhs_q<<<grid, block, 0, stream>>>(
+        gpu.snap_curr.Wmunu, gpu.snap_curr.u, gpu.uwrhs_q, params);
+    check_launch("gpu_make_uwrhs_q");
+}
+
 // ── read_and_reset_nonfinite ─────────────────────────────────────────────────
 
 unsigned int CUDAPipelines::read_and_reset_nonfinite() {
@@ -610,6 +704,26 @@ void CUDAPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     compute_launch(gpu, max_block_threads_, block, grid);
+    if (params.eos4d) {
+        gpu_first_rk_step_w_full_eos4d<<<grid, block, 0, stream>>>(
+            gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
+            gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,
+            gpu.snap_curr.epsilon, gpu.snap_prev.epsilon,
+            gpu.snap_future.u,
+            gpu.uwrhs_out, gpu.theta_buf, gpu.a_buf, gpu.sigma_buf,
+            gpu.snap_future.Wmunu, gpu.snap_future.pi_b,
+            gpu.eos_P, gpu.eos_s, gpu.eos_T, gpu.eos_dPde,
+            gpu.uprhs_out, params, gpu.eos_params,
+            gpu.snap_future.epsilon, gpu.snap_future.rhob,
+            gpu.snap_curr.rhob, gpu.snap_prev.rhob,
+            gpu.snap_curr.rhoq, gpu.snap_prev.rhoq,
+            gpu.snap_curr.rhos, gpu.snap_prev.rhos,
+            gpu.snap_future.rhoq, gpu.snap_future.rhos,
+            gpu.eos4d_tab, gpu.eos4d_params,
+            gpu.uwrhs_q, gpu.dmuBT_buf);
+        check_launch("gpu_first_rk_step_w_full_eos4d");
+        return;
+    }
     gpu_first_rk_step_w_full<<<grid, block, 0, stream>>>(
         gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
         gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,

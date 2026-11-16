@@ -82,6 +82,11 @@ what was kept and why.
 
 ### 4.1 Multi-charge densities (`rhoq`, `rhos`) — CPU only
 
+**Update (November 2026):** with EOS 20 (NEOS-4D) a CUDA build now evolves
+`rhoq` and `rhos` on the device, together with the B, Q, S source terms and
+baryon diffusion; see [BQS_GPU.md](BQS_GPU.md). The text below still holds
+for every other EOS and for Metal.
+
 User-confirmed: typical XSCAPE heavy-ion runs do **not** use net `rhoq` or
 `rhos`. The GPU kernels (`music_kernels.metal`, `music_kernels.cu`) and
 `GPUSnapshot` only carry `rhob`. Plan:
@@ -98,6 +103,10 @@ User-confirmed: typical XSCAPE heavy-ion runs do **not** use net `rhoq` or
   `gpu_make_delta_qi` kernel.
 
 ### 4.2 Finite-muB EOS — CPU only
+
+**Update (November 2026):** EOS 20 (NEOS-4D) has its own device lookup in CUDA
+builds ([BQS_GPU.md](BQS_GPU.md)); `gpu_features_supported` lets it through
+via `Advance::eos4d_on_gpu()`. The other finite-muB EOSes still fall back.
 
 The GPU EOS table (`eos_P`, `eos_dPde`, `eos_s`, `eos_T`) is sampled at
 `rhob = 0`. EOSes with `whichEOS > 9` typically include finite-muB

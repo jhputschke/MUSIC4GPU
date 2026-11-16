@@ -83,6 +83,12 @@ class Advance {
     // from any caller — Fields-based AdvanceIt today, SCGrid-based EvolveIt
     // in the standalone path if/when that is re-introduced.
     void       init_metal_if_needed(int Nx, int Ny, int Neta);
+#if defined(USE_CUDA)
+    // NEOS-4D (EOS 20) on the device: upload the tables (once), and compare
+    // the device lookup with the CPU EOS at n random points
+    bool       upload_eos4d_tables();
+    void       eos4d_selftest(int n);
+#endif
     void       make_gpu_params(double tau, int rk_flag,
                                MUSICGridParams &p) const;
 
@@ -101,6 +107,9 @@ class Advance {
     // Per-substep scanning would cost O(Ncells) extra serial work and
     // significantly hurt throughput at production grid sizes.
     bool       gpu_charges_ok(const Fields &arena);
+    // NEOS-4D (EOS 20) with B, Q, S on the device (CUDA): see advance.cpp
+    bool       eos4d_on_gpu() const;
+    bool       eos4d_failed_ = false;
     bool       charges_checked_ = false;
     bool       charges_ok_cache_ = false;
 
