@@ -125,6 +125,20 @@ class HydroSourceBase {
         return(false);
     }
 
+    //! Optional: as get_hydro_energy_source_on_grid(), and the charge
+    //! sources too: rho holds rho_B, rho_Q, rho_S of each cell of cells
+    //! (three entries per cell, exactly get_hydro_rhob/rhoq/rhos_source()),
+    //! or nothing when they are zero everywhere. Still only for a source that
+    //! does not depend on u_mu. The default is the energy-only version.
+    virtual bool get_hydro_sources_on_grid(
+        const double tau, const std::vector<double> &x,
+        const std::vector<double> &y, const std::vector<double> &eta_s,
+        std::vector<int> &cells, std::vector<double> &j_mu,
+        std::vector<double> &rho) const {
+        rho.clear();
+        return(get_hydro_energy_source_on_grid(tau, x, y, eta_s, cells, j_mu));
+    }
+
     //! The hydro's time step changed to dtau at tau (late_delta_tau).
     //! A source whose deposition depends on the step (its window, its
     //! normalization, its pruning) follows it here; the default ignores it.

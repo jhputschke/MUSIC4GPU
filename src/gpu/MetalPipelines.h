@@ -90,6 +90,7 @@ public:
     void  free_state(void* state);
     bool  save_snapshots(GPUGrid& gpu, void* state);
     bool  restore_snapshots(GPUGrid& gpu, const void* state);
+    bool  copy_curr_to_prev(GPUGrid& gpu);   // see CUDAPipelines
     bool  read_state(const void* state, float* host, size_t floats);
 
     // The freeze-out search (evolve.cpp), as CUDAPipelines::keep_curr and

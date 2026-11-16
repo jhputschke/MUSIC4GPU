@@ -63,6 +63,62 @@ through the existing `gpu_make_w_source`, which already loops over component 4.
 `MUSIC_GPU_EOS4D` not 0, tables uploaded). `GPUGrid::with_qs` adds ρ_Q, ρ_S to
 the uploads, copies, checkpoints and the freeze-out gather.
 
+**Regulator.** The 4D kernel's QuestRevert treats a negative π^{μν}π_{μν} as
+`Advance::QuestRevert` does (NaN there, W set to 0); the 1D kernel clamps it to
+0, which leaves W unregulated. At the dilute edge of a SMASH initial state
+there are cells with u^0 of 100 and more: W's components are then ~(u^0)² its
+rest-frame size, the float invariant drowns in their cancellation, and with the
+clamp W grew to 10³² and the next freeze-out search stopped the run
+(Cornelius: "cannot construct polygon"; with several threads it hung instead).
+
+## X-SCAPE's step-by-step entry (`EvolveOneTimeStep`)
+
+X-SCAPE's `BulkDynamicsManager` (the SMASH-IC chain) advances MUSIC one clock
+tick (two steps) per call. Three changes, all in `Evolve::EvolveOneTimeStep`:
+
+- **The state stays on the GPU between calls.** Each call used to end with a
+  full D2H and the next to start with an H2D (≈ 50 ms per call); X-SCAPE reads
+  nothing of the arena between calls. It now comes to the host once, when the
+  run ends (all cells frozen out).
+- **The real previous step.** The upload made every call a cold start,
+  `snap_prev := snap_curr`: the ∂_τ terms of every second step were zero. The
+  next call now starts from the real previous step, as `EvolveIt` and the CPU
+  do. After the SMASH deposition this changed the shear stress by 25 % (sum of
+  W^{ττ} at τ = 0.52 fm: CPU −3.82·10⁴, cold start −2.90·10⁴, now −3.77·10⁴).
+- **Freeze-out as in `EvolveIt`**: e to the host, the cells next to the surface
+  gathered from the GPU, the previous checked step kept on the GPU (was two
+  full host copies of the grid and a full sync per check). Same surface.
+
+Sources: `HydroSourceBase::get_hydro_sources_on_grid` (energy and ρ_B, ρ_Q,
+ρ_S of the cells a source reaches; the default is the energy-only
+`get_hydro_energy_source_on_grid`). X-SCAPE's hadronic liquefier implements it
+(each droplet visits the cells of its box, bit for bit the cell-by-cell values:
+`MUSIC_SOURCE_GRID_FILL=c` compares, 0 differ in 4.8·10⁶ entries); the
+pre-fill went from 1.4 s to 9 ms per deposition step.
+
+| Environment | Effect |
+|---|---|
+| `MUSIC_SYNC_EACH_CALL=1` | sync to the host after every call (and cold starts), as before |
+| `MUSIC_XSCAPE_PREV_EQ_CURR=1` | keep the state on the GPU but start each call cold, as before: bit-identical to the old results |
+| `MUSIC_FREEZEOUT_GATHER=0` | full copies for the freeze-out search |
+| `MUSIC_SOURCE_GRID_FILL=0` / `c` | per-cell source fill / both, compared |
+
+**Au+Au, √s_NN = 19.6 GeV, b = 6–8 fm, seed 42 (GB10)**, final state against
+the CPU (`MUSIC_FORCE_CPU`, the same event), cells with e > 0.05 fm⁻⁴:
+
+| | before | now |
+|---|---|---|
+| max cell difference, e / ρ_B | 6.1 % / 9.7 % | 2.9 % / 4.6 % |
+| max cell difference, W^{ττ} / Π | 67 % / 18 % | 16 % / 7 % |
+| Σ W^{ττ} (CPU −780) | −1027 | −738 |
+| Σ Π (CPU −51.1) | −57.8 | −54.4 |
+| wall time of the event | 1:21 | 1:01 |
+
+With `MUSIC_XSCAPE_PREV_EQ_CURR=1` and the old regulator the hadrons are
+bit-identical to the old ones (checked); both the regulator (in the dilute,
+fast cells where the invariant comes out negative) and the real previous step
+change every run.
+
 ## Switches
 
 | Environment | Effect |
@@ -71,6 +127,7 @@ the uploads, copies, checkpoints and the freeze-out gather.
 | `MUSIC_EOS4D_SELFTEST=N` | at GPU start-up, compare the device lookup with the CPU EOS at N points |
 | `MUSIC_DUMP_STATE=<file>` | write every cell's e, ρ_B, ρ_Q, ρ_S, u, W, Π (float64) at the end of the run |
 | `MUSIC_DUMP_STATE_STEP=N` | with the above: after time step N of a time-stepped run, to `<file>.stepN` |
+| `MUSIC_PROFILE=1` | timer breakdown (`bench::dump`) at the end of the run |
 
 ## Validation (GB10)
 

@@ -77,6 +77,9 @@ public:
     void  free_state(void* state);
     bool  save_snapshots(GPUGrid& gpu, void* state);
     bool  restore_snapshots(GPUGrid& gpu, const void* state);
+    // snap_prev := snap_curr on the device (the cold start of a step that
+    // begins from the host arena, without the round trip through the host)
+    bool  copy_curr_to_prev(GPUGrid& gpu);
     bool  read_state(const void* state, float* host, size_t floats);
 
     // The freeze-out search (evolve.cpp): keep_curr copies snap_curr into

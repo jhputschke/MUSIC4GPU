@@ -65,6 +65,9 @@ class Advance {
     // snap_curr/snap_prev are already current (maintained by swap_curr_future +
     // lockstep rotations).  Set on the first complete full-GPU step.
     bool       gpu_owns_state_ = false;
+    // set by keep_state_for_next_call(): the next step starts as a step
+    // from the host arena did (snap_prev := snap_curr), on the device
+    bool       cold_prev_pending_ = false;
     // Cross-step prev residency.  Under inter-step residency, MUSIC's RK
     // rotation makes this step's fpPrev the *same host buffer* that was
     // fpCurr last step (new fpPrev == old fpCurr), and its contents still
@@ -145,6 +148,7 @@ class Advance {
     std::vector<double> src_x_, src_y_, src_eta_;   // cell centres
     std::vector<int>    src_cells_;                 // (ix, iy, ieta) per cell
     std::vector<double> src_j_;                     // j^mu per cell
+    std::vector<double> src_rho_;                   // rho_B, Q, S per cell (or none)
     std::vector<int>    src_written_;               // cells of the last fill
     bool                src_buf_unknown_ = true;    // clear the whole buffer
     // MUSIC_SOURCE_GRID_FILL=check: every such fill is compared with the
@@ -182,6 +186,14 @@ class Advance {
     // True when the GPU holds the authoritative evolving state across timestep
     // boundaries (H2D upload at rk0 is skipped).
     bool gpu_owns_state() const { return gpu_owns_state_; }
+    // X-SCAPE's step-by-step entry (Evolve::EvolveOneTimeStep) between two
+    // calls: keep the state on the GPU instead of syncing it to the host and
+    // uploading it again. With same_as_upload the next step starts as it did
+    // after the upload (snap_prev := snap_curr, its d/dtau terms zero),
+    // bit for bit; without, it uses the real previous step.
+    void keep_state_for_next_call(bool same_as_upload) {
+        cold_prev_pending_ = same_as_upload && gpu_owns_state_;
+    }
 
     // GPU max-reduction over snap_curr.epsilon / .rhob.  Returns results in
     // 1/fm^4 units (same as Cell_small::epsilon).  Synchronizes before return.

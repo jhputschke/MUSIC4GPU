@@ -181,8 +181,8 @@ int MUSIC::run_hydro() {
 
 //! this is a prepare function to run hydro for one time step
 void MUSIC::prepare_run_hydro_one_time_step() {
-    freezeoutFieldPrev_.resizeFields(DATA.nx, DATA.ny, DATA.neta);
-    freezeoutFieldCurr_.resizeFields(DATA.nx, DATA.ny, DATA.neta);
+    // freezeoutFieldPrev_, freezeoutFieldCurr_: no longer used (the
+    // freeze-out steps live in Evolve, as for EvolveIt)
 
     evolve_ptr_= std::make_shared<Evolve> (eos, DATA, hydro_source_terms_ptr,
                                            hydro_source_terms_from_jet_ptr_);

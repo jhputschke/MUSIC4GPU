@@ -73,6 +73,9 @@ class Evolve {
     double checkpoint_tau_ = 0.;
     bool   late_switched_       = false;  //!< late_delta_tau applied
     double tau_last_check_      = -1.;    //!< tau of the last freeze-out check
+    //! the freeze-out steps of the step-by-step entry (EvolveOneTimeStep),
+    //! kept from one call to the next
+    FreezeoutSteps fo_step_;
     //! Cornelius' tau spacing for the first check after the step switch
     //! (-1: to be measured at that check; 0: facTau * delta_tau)
     double dtau_check_override_ = 0.;

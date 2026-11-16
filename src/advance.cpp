@@ -793,32 +793,38 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
     // and 5, 6 (Q, S) when they are on the device.
     float* qb = gpu_grid_.qi_source_buf;
     const int ncomp = gpu_grid_.with_qs ? 7 : 5;
+    // which charge sources the loop over all cells writes
+    const bool rhob_src = (DATA.turn_on_rhob == 1);
+    const bool qs_src = (DATA.turn_on_QS == 1 && gpu_grid_.with_qs);
 
     // Every cell queries tau_rk: let the sources precompute what depends on
     // it alone once, not per cell (results unchanged).
     if (with_main) hydro_source_terms_ptr->prepare_for_query_tau(tau_rk);
     if (with_jets) hydro_source_terms_from_jets_ptr_->prepare_for_query_tau(tau_rk);
 
+    // the cell centres, for the grid fill and the loop over all cells alike
+    // (computed once: the compiler may fuse -size/2 + i*d into an FMA in one
+    // loop and not in another, and a source in double sees the last bit)
+    if (static_cast<int>(src_x_.size()) != Nx
+        || static_cast<int>(src_y_.size()) != Ny
+        || static_cast<int>(src_eta_.size()) != Neta) {
+        src_x_.resize(Nx);
+        src_y_.resize(Ny);
+        src_eta_.resize(Neta);
+        for (int ix = 0; ix < Nx; ++ix)
+            src_x_[ix] = -DATA.x_size/2. + ix * DATA.delta_x;
+        for (int iy = 0; iy < Ny; ++iy)
+            src_y_[iy] = -DATA.y_size/2. + iy * DATA.delta_y;
+        for (int ieta = 0; ieta < Neta; ++ieta)
+            src_eta_[ieta] = -DATA.eta_size/2. + ieta * DATA.delta_eta;
+    }
+
     const int grid_mode = source_grid_fill_mode();
     bool jets_on_grid = false;
     if (with_jets && grid_mode != 0) {
-        if (static_cast<int>(src_x_.size()) != Nx
-            || static_cast<int>(src_y_.size()) != Ny
-            || static_cast<int>(src_eta_.size()) != Neta) {
-            // the cell centres, as the loop over all cells computes them
-            src_x_.resize(Nx);
-            src_y_.resize(Ny);
-            src_eta_.resize(Neta);
-            for (int ix = 0; ix < Nx; ++ix)
-                src_x_[ix] = -DATA.x_size/2. + ix * DATA.delta_x;
-            for (int iy = 0; iy < Ny; ++iy)
-                src_y_[iy] = -DATA.y_size/2. + iy * DATA.delta_y;
-            for (int ieta = 0; ieta < Neta; ++ieta)
-                src_eta_[ieta] = -DATA.eta_size/2. + ieta * DATA.delta_eta;
-        }
         jets_on_grid =
-            hydro_source_terms_from_jets_ptr_->get_hydro_energy_source_on_grid(
-                tau_rk, src_x_, src_y_, src_eta_, src_cells_, src_j_);
+            hydro_source_terms_from_jets_ptr_->get_hydro_sources_on_grid(
+                tau_rk, src_x_, src_y_, src_eta_, src_cells_, src_j_, src_rho_);
     }
     // what is left for the loop over all cells
     const bool loop_jets = with_jets && !jets_on_grid;
@@ -864,6 +870,37 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
             for (int ii = 0; ii < 4; ii++) {
                 j_mu[ii] += src_j_[4*k + ii];
                 qb[ii * N + c] = static_cast<float>(tauRkFactor * j_mu[ii]);
+            }
+            if (!src_rho_.empty()) {
+                // the charge sources, summed as fill_hydro_source_all_cells
+                FlowVec u_local;
+                if (with_main) {
+                    for (int ii = 0; ii < 4; ii++)
+                        u_local[ii] = arenaFieldsCurr.u_[ii][c];
+                }
+                const double x_c = src_x_[ix], y_c = src_y_[iy];
+                const double eta_c = src_eta_[ieta];
+                if (rhob_src) {
+                    double j_rhob = 0.;
+                    if (with_main)
+                        j_rhob = hydro_source_terms_ptr->get_hydro_rhob_source(
+                                tau_rk, x_c, y_c, eta_c, u_local);
+                    j_rhob += src_rho_[3*k];
+                    qb[4 * N + c] = static_cast<float>(tauRkFactor * j_rhob);
+                }
+                if (qs_src) {
+                    double j_rhoq = 0., j_rhos = 0.;
+                    if (with_main) {
+                        j_rhoq = hydro_source_terms_ptr->get_hydro_rhoq_source(
+                                tau_rk, x_c, y_c, eta_c, u_local);
+                        j_rhos = hydro_source_terms_ptr->get_hydro_rhos_source(
+                                tau_rk, x_c, y_c, eta_c, u_local);
+                    }
+                    j_rhoq += src_rho_[3*k + 1];
+                    j_rhos += src_rho_[3*k + 2];
+                    qb[5 * N + c] = static_cast<float>(tauRkFactor * j_rhoq);
+                    qb[6 * N + c] = static_cast<float>(tauRkFactor * j_rhos);
+                }
             }
             if (!loop_all) src_written_.push_back(c);
         }
@@ -915,9 +952,9 @@ void Advance::fill_hydro_source_all_cells(float* qb, double tau_rk,
     for (int ix   = 0; ix   < Nx;   ++ix  )
     for (int iy   = 0; iy   < Ny;   ++iy  ) {
         const int c = arenaFieldsCurr.getFieldIdx(ix, iy, ieta);
-        const double x_local     = -DATA.x_size  /2. + ix   * DATA.delta_x;
-        const double y_local     = -DATA.y_size  /2. + iy   * DATA.delta_y;
-        const double eta_s_local = -DATA.eta_size/2. + ieta * DATA.delta_eta;
+        const double x_local     = src_x_[ix];
+        const double y_local     = src_y_[iy];
+        const double eta_s_local = src_eta_[ieta];
 
         FlowVec u_local;
         for (int ii = 0; ii < 4; ii++)
@@ -1095,6 +1132,11 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
         // See docs/PORT_GPU_CUDA.md.
         GPUPipelines::instance().upload_snapshots_async(gpu_grid_);
 #endif
+    }
+    if (cold_prev_pending_) {
+        cold_prev_pending_ = false;
+        if (gpu_owns_state_ && rk_flag == 0)
+            GPUPipelines::instance().copy_curr_to_prev(gpu_grid_);
     }
 
     MUSICGridParams p;
@@ -1311,11 +1353,18 @@ void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
                         const int rk_flag) {
     // Jet source: only when attached and holding droplets.  Without droplets
     // (background leg, hydro-only runs) nothing below changes, bit for bit.
+    // On the CPU path also only when it can deposit in this step (as the GPU
+    // pre-fill asks): X-SCAPE's hadronic liquefier (SMASH initial state)
+    // holds its droplets for the whole run but deposits them in the first
+    // steps only; every cell asked it at every step for exact zeros.
     flag_add_hydro_source_from_jets_ = (
         hydro_source_terms_from_jets_ptr_ != nullptr
         && hydro_source_terms_from_jets_ptr_->get_number_of_sources() > 0);
+    const bool jets_active_cpu = flag_add_hydro_source_from_jets_
+        && hydro_source_terms_from_jets_ptr_->has_active_sources_current_tau();
 
 #ifdef MUSIC_USE_GPU
+    // (try_gpu_advance asks has_active_sources_current_tau() itself)
     // Try the full-GPU path first.  If it returns true the substep is done;
     // otherwise (unsupported config, GPU init failed, etc.) fall through to
     // the CPU triple loop below.  See docs/PORT_GPU.md §5 Phase 2.
@@ -1324,6 +1373,8 @@ void Advance::AdvanceIt(const double tau, Fields &arenaFieldsPrev,
         return;
     }
 #endif
+
+    flag_add_hydro_source_from_jets_ = jets_active_cpu;
 
     const int grid_neta = arenaFieldsCurr.nEta();
     const int grid_nx   = arenaFieldsCurr.nX();

@@ -1,3 +1,4 @@
+#include <vector>
 // CUDA implementation of CUDAPipelines.
 // Selects the GPU, creates a compute stream, and launches the seven hydro
 // kernels.  Mirrors MetalPipelines.mm one-to-one so the host dispatch logic in
@@ -406,6 +407,24 @@ bool CUDAPipelines::restore_snapshots(GPUGrid& gpu, const void* state) {
         });
     }
     return ok && cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
+bool CUDAPipelines::copy_curr_to_prev(GPUGrid& gpu) {
+    if (!ready_) return false;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    std::vector<float*> src, dst;
+    std::vector<size_t> len;
+    for_each_snapshot_array(gpu.snap_curr, nc, gpu.with_qs,
+                            [&](float* a, size_t n) { src.push_back(a); len.push_back(n); });
+    for_each_snapshot_array(gpu.snap_prev, nc, gpu.with_qs,
+                            [&](float* a, size_t) { dst.push_back(a); });
+    bool ok = true;
+    for (size_t i = 0; i < src.size(); ++i) {
+        ok = ok && cudaMemcpyAsync(dst[i], src[i], len[i] * sizeof(float),
+                                   cudaMemcpyDefault, stream) == cudaSuccess;
+    }
+    return ok;
 }
 
 bool CUDAPipelines::read_state(const void* state, float* host, size_t floats) {

@@ -1,3 +1,4 @@
+#include <vector>
 // Objective-C++ implementation of MetalPipelines.
 // Loads the Metal shader library, creates compute pipeline states, and
 // dispatches the gpu_make_w_source kernel.
@@ -334,6 +335,21 @@ bool MetalPipelines::save_snapshots(GPUGrid& gpu, void* state) {
             dst += n;
         });
     }
+    return true;
+}
+
+bool MetalPipelines::copy_curr_to_prev(GPUGrid& gpu) {
+    if (!ready_) return false;
+    wait();
+    const size_t nc = static_cast<size_t>(gpu.Ncells());
+    std::vector<float*> src, dst;
+    std::vector<size_t> len;
+    for_each_snapshot_array(gpu.snap_curr, nc,
+                            [&](float* a, size_t n) { src.push_back(a); len.push_back(n); });
+    for_each_snapshot_array(gpu.snap_prev, nc,
+                            [&](float* a, size_t) { dst.push_back(a); });
+    for (size_t i = 0; i < src.size(); ++i)
+        std::memcpy(dst[i], src[i], len[i] * sizeof(float));
     return true;
 }
 

@@ -1174,6 +1174,24 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
     Fields* fpCurr = &arenaFieldsCurr;
     Fields* fpNext = &arenaFieldsNext;
 
+    // the steps the freeze-out search compares (freezeoutFieldPrev and
+    // freezeoutFieldCurr are no longer used)
+    (void)freezeoutFieldPrev;
+    (void)freezeoutFieldCurr;
+    if (DATA.freeze_out_surface != 0
+            && fo_step_.curr[0].nX() != arenaFieldsCurr.nX()) {
+        for (int k = 0; k < 2; k++) {
+            fo_step_.curr[k].resizeFields(arenaFieldsCurr.nX(),
+                                          arenaFieldsCurr.nY(),
+                                          arenaFieldsCurr.nEta());
+            if (DATA.output_vorticity == 1) {
+                fo_step_.prev[k].resizeFields(arenaFieldsCurr.nX(),
+                                              arenaFieldsCurr.nY(),
+                                              arenaFieldsCurr.nEta());
+            }
+        }
+    }
+
     int frozenStatus = 0;
     for (int it = 0; it < 2; it++) {
         int tauIdx = 2*itau + it;
@@ -1192,11 +1210,11 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         if (tauIdx == iFreezeStart && DATA.freeze_out_surface == 0) {
             emax_last_check_ = max_energy_density_raw(*fpCurr);
         } else if (tauIdx == iFreezeStart) {
-#ifdef MUSIC_USE_GPU
-            advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
-            store_previous_step_for_freezeout(*fpPrev, freezeoutFieldPrev);
-            store_previous_step_for_freezeout(*fpCurr, freezeoutFieldCurr);
+            // as EvolveIt: with the state on the GPU only e comes to the host,
+            // the rest stays in a GPU copy until the next check gathers the
+            // cells next to the surface (no full-grid copies; the surface is
+            // the same, cell for cell)
+            freezeout_store_step(fo_step_, *fpPrev, *fpCurr);
         }
 
         if (tauIdx % Nskip_timestep == 0) {
@@ -1327,22 +1345,8 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
             }
             // avoid freeze-out at the first time step
             if ((tauIdx - iFreezeStart) % DATA.facTau == 0 && tauIdx > iFreezeStart) {
-#ifdef MUSIC_USE_GPU
-                // Sync the host arenas only on the steps where the surface
-                // is actually evaluated (every facTau steps), not every step.
-                advance.sync_arena_from_gpu_readonly(*fpPrev, *fpCurr);
-#endif
                 bench::Timer _bt_fo("evolve.freezeout_surface");
-                if (!DATA.boost_invariant) {
-                    frozen = FindFreezeOutSurface_Cornelius(
-                                tau, *fpPrev, *fpCurr,
-                                freezeoutFieldPrev, freezeoutFieldCurr);
-                } else {
-                    frozen = FindFreezeOutSurface_boostinvariant_Cornelius(
-                                tau, *fpCurr, freezeoutFieldCurr);
-                }
-                store_previous_step_for_freezeout(*fpPrev, freezeoutFieldPrev);
-                store_previous_step_for_freezeout(*fpCurr, freezeoutFieldCurr);
+                frozen = freezeout_check(fo_step_, tau, *fpPrev, *fpCurr);
             }
         }
         frozenStatus = frozen;
@@ -1377,15 +1381,41 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
             }
         }
     }
+    // X-SCAPE's step-by-step entry returns to the framework after every call
+    // (one call per clock tick: two steps), which reads nothing of the arena
+    // between calls (the surface leaves as SurfaceCells, the medium through
+    // the evolution store, both filled inside the step). The state therefore
+    // stays on the GPU between calls and comes to the host once, at the end;
+    // a D2H here and the next call's H2D cost about 50 ms per call otherwise
+    // (Au+Au 150x150x140 with B, Q, S: 9 s of an 80 s event). The arena
+    // pointers are back on the same Fields after the two steps (each step
+    // swaps prev and curr), so the GPU snapshots stay aligned.
+    //
+    // The next call starts from the real previous step, as EvolveIt and the
+    // CPU do. Before (a sync here and an upload at the next call) every call
+    // started cold, with snap_prev := snap_curr: the d/dtau terms of every
+    // second step were zero (25 % less shear stress right after the SMASH
+    // deposition). MUSIC_XSCAPE_PREV_EQ_CURR=1 repeats that on the device,
+    // for comparisons; MUSIC_SYNC_EACH_CALL=1 the sync itself.
+    static const bool sync_each_call = [] {
+        const char *v = std::getenv("MUSIC_SYNC_EACH_CALL");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    static const bool prev_eq_curr = [] {
+        const char *v = std::getenv("MUSIC_XSCAPE_PREV_EQ_CURR");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    if (frozenStatus != 0 || sync_each_call) {
 #ifdef MUSIC_USE_GPU
-    // End-of-call sync: XSCAPE step-by-step entry returns control to
-    // JETSCAPE, which may inspect or mutate the Fields between calls
-    // (open question §7.2).  Bring everything back to CPU and clear
-    // gpu_owns_state_ so the next EvolveOneTimeStep / AdvanceRK starts
-    // with a fresh H2D upload.
-    advance.sync_arena_from_gpu(*fpPrev, *fpCurr);
+        advance.sync_arena_from_gpu(*fpPrev, *fpCurr);
 #endif
-    dump_state_if_requested(*fpCurr);
+        dump_state_if_requested(*fpCurr);
+        bench::dump();   // no-op unless MUSIC_PROFILE=1
+    } else {
+#ifdef MUSIC_USE_GPU
+        advance.keep_state_for_next_call(prev_eq_curr);
+#endif
+    }
     return frozenStatus;
 }
 
