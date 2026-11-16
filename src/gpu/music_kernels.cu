@@ -3110,7 +3110,13 @@ __global__ void gpu_first_rk_step_w_full_eos4d(
         float eq_size  = e_local * e_local + 3.f * p_local * p_local;
         eq_size        = fmaxf(eq_size, 1.e-30f);
 
-        float rho_shear = sqrtf(fmaxf(pisize, 0.f) / eq_size) / factor;
+        // As Advance::QuestRevert: a negative pi^{mu nu} pi_{mu nu} gives NaN
+        // there and sets W to 0. (The 1D kernel clamps it to 0 instead, which
+        // leaves W unregulated: in a fast cell, u^0 ~ 100 and more at the
+        // dilute edge of a SMASH initial state, W's components are ~ u0^2 its
+        // rest-frame size, the float invariant drowns in their cancellation
+        // and came out <= 0, and W grew without bound, to 1e32.)
+        float rho_shear = sqrtf(pisize / eq_size) / factor;
         float rho_bulk  = sqrtf(fmaxf(bulksize, 0.f) / eq_size) / factor;
 
         if (isnan(rho_shear)) {
