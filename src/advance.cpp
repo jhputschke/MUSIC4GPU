@@ -472,6 +472,9 @@ bool Advance::copy_kept_to(const void* state, Fields &f) {
 // The check is configuration-only (DATA flags); per-cell state checks (rhoq /
 // rhos non-zero, finite-muB EOS effects) are done in gpu_charges_ok().
 bool Advance::gpu_features_supported() const {
+    // The kernels implement Milne coordinates only (tau factors and the
+    // geometric terms are built in); CoorType 1 (Cartesian) runs on the CPU.
+    if (DATA.CoorType != 0)               return false;
     if (DATA.viscosity_flag != 1)         return false;
     if (DATA.turn_on_diff)                return false;
     if (DATA.muB_dependent_shear_to_s != 0) return false;
