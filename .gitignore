@@ -19,3 +19,5 @@ MUSIChydro
 *.metallib
 music_input*
 MUSIC4GPU.code-workspace
+# NEOS-4D tables (EOS/download_Neos4D.sh)
+EOS/neos4D
