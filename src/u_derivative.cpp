@@ -324,14 +324,20 @@ void U_derivative::calculate_thermal_shear_tensor(
         double sigma_thermal[4][4];
         for (int mu = 0; mu < 4; mu++) {
             for (int nu = mu; nu < 4; nu++) {
-                sigma_thermal[mu][nu] = (
-                    0.5*(dUsup_local[nu][mu] + dUsup_local[mu][nu])
-                    - u_local[3]/(2.*tau*T_local)*(
-                          DATA.gmunu[mu][0]*DATA.gmunu[nu][3]
-                        + DATA.gmunu[mu][3]*DATA.gmunu[nu][0])
-                    + u_local[0]/(tau*T_local)*(
-                          DATA.gmunu[mu][3]*DATA.gmunu[nu][3])
-                );
+                sigma_thermal[mu][nu] =
+                    0.5*(dUsup_local[nu][mu] + dUsup_local[mu][nu]);
+                if (DATA.CoorType == 0) {
+                    // Milne: the Christoffel terms
+                    // (two steps: the same additions, in the same order,
+                    // as the single expression before)
+                    sigma_thermal[mu][nu] -= (
+                        u_local[3]/(2.*tau*T_local)*(
+                              DATA.gmunu[mu][0]*DATA.gmunu[nu][3]
+                            + DATA.gmunu[mu][3]*DATA.gmunu[nu][0]));
+                    sigma_thermal[mu][nu] += (
+                        u_local[0]/(tau*T_local)*(
+                              DATA.gmunu[mu][3]*DATA.gmunu[nu][3]));
+                }
             }
         }
 
@@ -375,13 +381,14 @@ void U_derivative::calculate_T_vorticity(
     double omega_thermal[4][4];
     for (int mu = 0; mu < 4; mu++) {
         for (int nu = mu + 1; nu < 4; nu++) {
-            omega_thermal[mu][nu] = (
-                - 0.5*(dUsup_local[nu][mu] - dUsup_local[mu][nu])
-                - u_local[3]*T_local/(2.*tau)*(
-                      DATA.gmunu[mu][0]*DATA.gmunu[nu][3]
-                    - DATA.gmunu[mu][3]*DATA.gmunu[nu][0])
-            );
+            omega_thermal[mu][nu] =
+                - 0.5*(dUsup_local[nu][mu] - dUsup_local[mu][nu]);
             if (DATA.CoorType == 0) {
+                // Milne: the Christoffel terms
+                omega_thermal[mu][nu] -= (
+                    u_local[3]*T_local/(2.*tau)*(
+                          DATA.gmunu[mu][0]*DATA.gmunu[nu][3]
+                        - DATA.gmunu[mu][3]*DATA.gmunu[nu][0]));
                 omega_thermal[mu][nu] += (
                     - u_local[3]/(2*tau*T_local)*(
                         - DATA.gmunu[mu][0]*DATA.gmunu[nu][3]

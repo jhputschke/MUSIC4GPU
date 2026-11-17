@@ -804,7 +804,11 @@ void Diss::Make_uqSource(const double tau, const Cell_small &grid_pt,
 
         // all other geometric terms....
         // + theta q[a] - q[a] u^\tau/tau
-        sourceTerms[nu-1] += (theta_local - grid_pt.u[0]/tau)*q[nu];
+        // (Cartesian, CoorType 1: theta has no u^tau/tau piece, so neither
+        // has this term; and there are no Christoffel terms below)
+        const double geom_theta = (DATA.CoorType == 0
+                                   ? grid_pt.u[0]/tau : 0.);
+        sourceTerms[nu-1] += (theta_local - geom_theta)*q[nu];
         //if (isnan(SW)) {
         //    cout << "theta term is nan! " << endl;
         //}
@@ -816,7 +820,7 @@ void Diss::Make_uqSource(const double tau, const Cell_small &grid_pt,
                         - (DATA.gmunu[nu][3]
                            + grid_pt.u[nu]*grid_pt.u[3])
                           *grid_pt.u[3]*q[0]/tau);
-        sourceTerms[nu-1] += tempf;
+        if (DATA.CoorType == 0) sourceTerms[nu-1] += tempf;
         //if (isnan(tempf)) {
         //    cout << "Delta^{a \tau} and Delta^{a \eta} terms are nan!" << endl;
         //}
