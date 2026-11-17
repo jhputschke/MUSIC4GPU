@@ -1169,6 +1169,15 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                                              /DATA.delta_tau) + 2);
         }
     }
+    // The freeze-out start is fixed at the run's first call.  A caller that
+    // moves the source end time during the run (X-SCAPE's dynamic
+    // fluidization: droplets arrive all along) moved it with every call, and
+    // every move wrote the equal-tau surface of the low-temperature cells
+    // again (FreezeOut_equal_tau_Surface): the dilute fluid was particlized
+    // over and over.  With a fixed source end time (every other caller) this
+    // is the value it had at every call.
+    if (itau == 0 || step_iFreezeStart_ < 0) step_iFreezeStart_ = iFreezeStart;
+    iFreezeStart = step_iFreezeStart_;
 
     Fields* fpPrev = &arenaFieldsPrev;
     Fields* fpCurr = &arenaFieldsCurr;

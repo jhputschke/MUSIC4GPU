@@ -76,6 +76,9 @@ class Evolve {
     //! the freeze-out steps of the step-by-step entry (EvolveOneTimeStep),
     //! kept from one call to the next
     FreezeoutSteps fo_step_;
+    //! EvolveOneTimeStep: the freeze-out start of the run, fixed at its
+    //! first call
+    int step_iFreezeStart_ = -1;
     //! Cornelius' tau spacing for the first check after the step switch
     //! (-1: to be measured at that check; 0: facTau * delta_tau)
     double dtau_check_override_ = 0.;
