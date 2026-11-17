@@ -42,6 +42,18 @@ __global__ void gpu_make_delta_qi(
     MUSICGridParams params,
     GPUEosParams eos_p);
 
+// the same, the failed half-cell states falling back to the cell on their
+// side of the interface (symmetric_flux_fallback 1)
+__global__ void gpu_make_delta_qi_sym(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_dPde,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    GPUEosParams eos_p);
+
 __global__ void gpu_finalize_ideal(
     const float* __restrict__ qi_buf,
     const float* __restrict__ dwmn_buf,

@@ -50,6 +50,7 @@ MetalPipelines::~MetalPipelines() {
     if (pso_uwrhs_)    { CFRelease(pso_uwrhs_); }
     if (pso_finalize_) { CFRelease(pso_finalize_); }
     if (pso_delta_qi_) { CFRelease(pso_delta_qi_); }
+    if (pso_delta_qi_sym_) { CFRelease(pso_delta_qi_sym_); }
     if (pso_w_source_) { CFRelease(pso_w_source_); }
     if (library_)      { CFRelease(library_); }
     if (cmd_queue_)    { CFRelease(cmd_queue_); }
@@ -155,6 +156,21 @@ bool MetalPipelines::initialize(const char* metallib_path) {
         return false;
     }
     pso_delta_qi_ = (__bridge_retained void*)pso_dqi;
+
+    // 5b. The same with the symmetric fallback (symmetric_flux_fallback 1)
+    id<MTLFunction> fn_dqis = [lib newFunctionWithName:@"gpu_make_delta_qi_sym"];
+    if (!fn_dqis) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_delta_qi_sym' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_dqis =
+        [dev newComputePipelineStateWithFunction:fn_dqis error:&err];
+    if (!pso_dqis) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_delta_qi_sym failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_delta_qi_sym_ = (__bridge_retained void*)pso_dqis;
 
     // 6. Build pipeline state for gpu_finalize_ideal
     id<MTLFunction> fn_fin = [lib newFunctionWithName:@"gpu_finalize_ideal"];
@@ -613,7 +629,9 @@ void MetalPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& para
 
     auto dev = (__bridge id<MTLDevice>)              device_;
     auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
-    auto pso = (__bridge id<MTLComputePipelineState>)pso_delta_qi_;
+    // the symmetric fallback is a pipeline of its own (gpu_make_delta_qi_sym)
+    auto pso = (__bridge id<MTLComputePipelineState>)(
+        gpu.sym_fallback ? pso_delta_qi_sym_ : pso_delta_qi_);
 
     int    n_handles = gpu.buf_handle_count();
     void** handles   = gpu.buf_handle_ptr();

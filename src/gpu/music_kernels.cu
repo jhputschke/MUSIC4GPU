@@ -817,7 +817,8 @@ DFI float gpu_get_TJb_reconst(ReconstResult r, int alpha, int direction,
 
 // ── gpu_make_delta_qi kernel ──────────────────────────────────────────────────
 
-__global__ void gpu_make_delta_qi(
+template <bool SYM>
+__device__ __forceinline__ void gpu_make_delta_qi_body(
     const float* __restrict__ epsilon_curr,
     const float* __restrict__ rhob_curr,
     const float* __restrict__ u_curr,
@@ -892,9 +893,29 @@ __global__ void gpu_make_delta_qi(
             qimhR[alpha] = gc  + fmhR;
         }
 
+        // A half-cell state that cannot be reconstructed falls back to a
+        // cell's state.  SYM = false (symmetric_flux_fallback 0): to this
+        // cell's, for all four.  Cells i and i+1 then use different states for
+        // their common interface, and its flux out of the one is not its flux
+        // into the other.  SYM = true: the left state to the left cell, the
+        // right state to the right cell, the same from both sides.  A
+        // template, so that the SYM = false kernel is the old code.
         ReconstResult r_phL = gpu_reconst(tau, qiphL, u_c, e_c, eos_P, eos_dPde, eos_p);
-        ReconstResult r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
-        ReconstResult r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_phR, r_mhL;
+        if constexpr (SYM) {
+            float u_p1[4], u_m1[4];
+            for (int m = 0; m < 4; m++) {
+                u_p1[m] = u_curr[m * Ncells + ip1];
+                u_m1[m] = u_curr[m * Ncells + im1];
+            }
+            r_phR = gpu_reconst(tau, qiphR, u_p1, epsilon_curr[ip1],
+                                eos_P, eos_dPde, eos_p);
+            r_mhL = gpu_reconst(tau, qimhL, u_m1, epsilon_curr[im1],
+                                eos_P, eos_dPde, eos_p);
+        } else {
+            r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
+            r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        }
         ReconstResult r_mhR = gpu_reconst(tau, qimhR, u_c, e_c, eos_P, eos_dPde, eos_p);
 
         float aiph_L = gpu_max_speed(tau, direction, r_phL, eos_P, eos_dPde, eos_p);
@@ -934,6 +955,33 @@ __global__ void gpu_make_delta_qi(
 
     for (int alpha = 0; alpha < 5; alpha++)
         qi_out[alpha * Ncells + c] = qi[alpha] + rhs[alpha];
+}
+
+__global__ void gpu_make_delta_qi(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_dPde,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    GPUEosParams eos_p)
+{
+    gpu_make_delta_qi_body<false>(epsilon_curr, rhob_curr, u_curr, eos_P, eos_dPde, qi_out, params, eos_p);
+}
+
+// the same with the symmetric fallback (symmetric_flux_fallback 1)
+__global__ void gpu_make_delta_qi_sym(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_dPde,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    GPUEosParams eos_p)
+{
+    gpu_make_delta_qi_body<true>(epsilon_curr, rhob_curr, u_curr, eos_P, eos_dPde, qi_out, params, eos_p);
 }
 
 // ── gpu_finalize_ideal ────────────────────────────────────────────────────────

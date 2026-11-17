@@ -850,6 +850,7 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
       mp.dispatch_uwrhs  (gpu_grid_, p);
       mp.dispatch_w_source(gpu_grid_, p);
       if (p.turn_on_bulk == 1) mp.dispatch_uprhs(gpu_grid_, p);
+      gpu_grid_.sym_fallback = (DATA.symmetric_flux_fallback == 1);
       mp.dispatch_delta_qi(gpu_grid_, p);
       mp.dispatch_finalize_ideal(gpu_grid_, p);
       mp.dispatch_first_rk_step_w_full(gpu_grid_, p);
@@ -1594,9 +1595,17 @@ void Advance::MakeDeltaQI(const double tauFactor, Fields &arenaFieldsCurr,
 
         // for each direction, reconstruct half-way cells
         // reconstruct e, rhob, and u[4] for half way cells
+        // A half-cell state that cannot be reconstructed falls back to a
+        // cell: to this one for all four (symmetric_flux_fallback 0), or the
+        // right state of i+1/2 to cell i+1 and the left one of i-1/2 to cell
+        // i-1 (1), so that cells i and i+1 use the same flux for their
+        // interface (gpu_make_delta_qi_sym on the GPU)
+        const bool sym = (DATA.symmetric_flux_fallback == 1);
         auto grid_phL = reconst_helper.ReconstIt_shell(tauFactor, qiphL, c);
-        auto grid_phR = reconst_helper.ReconstIt_shell(tauFactor, qiphR, c);
-        auto grid_mhL = reconst_helper.ReconstIt_shell(tauFactor, qimhL, c);
+        auto grid_phR = reconst_helper.ReconstIt_shell(tauFactor, qiphR,
+                                                       sym ? p1 : c);
+        auto grid_mhL = reconst_helper.ReconstIt_shell(tauFactor, qimhL,
+                                                       sym ? m1 : c);
         auto grid_mhR = reconst_helper.ReconstIt_shell(tauFactor, qimhR, c);
 
         double aiphL = MaxSpeed(tauFactor, direction, grid_phL, pressureP1);

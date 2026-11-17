@@ -534,7 +534,10 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     compute_launch(gpu, max_block_threads_, block, grid);
-    gpu_make_delta_qi<<<grid, block, 0, stream>>>(
+    // the symmetric fallback is a kernel of its own, so that the default one
+    // stays the old code (results bit-identical with the switch off)
+    (gpu.sym_fallback ? gpu_make_delta_qi_sym
+                      : gpu_make_delta_qi)<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_dPde,
         gpu.qi_out, params, gpu.eos_params);
