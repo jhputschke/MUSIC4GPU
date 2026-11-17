@@ -809,16 +809,17 @@ inline float gpu_get_TJb_reconst(ReconstResult r, int alpha, int direction,
 
 // ── gpu_make_delta_qi kernel ──────────────────────────────────────────────────
 
-kernel void gpu_make_delta_qi(
-    device const float*       epsilon_curr [[buffer(0)]],
-    device const float*       rhob_curr    [[buffer(1)]],
-    device const float*       u_curr       [[buffer(2)]],
-    device const float*       eos_P        [[buffer(3)]],
-    device const float*       eos_dPde     [[buffer(4)]],
-    device       float*       qi_out       [[buffer(5)]],
-    constant MUSICGridParams& params       [[buffer(6)]],
-    constant GPUEosParams&    eos_p        [[buffer(7)]],
-    uint3 gid [[thread_position_in_grid]])
+template <bool SYM>
+static inline void gpu_make_delta_qi_body(
+    device const float*       epsilon_curr,
+    device const float*       rhob_curr,
+    device const float*       u_curr,
+    device const float*       eos_P,
+    device const float*       eos_dPde,
+    device       float*       qi_out,
+    constant MUSICGridParams& params,
+    constant GPUEosParams&    eos_p,
+    uint3 gid)
 {
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
@@ -890,9 +891,30 @@ kernel void gpu_make_delta_qi(
         }
 
         // Reconstruct primitive variables at all four half-interfaces
+        // A failed reconstruction falls back to a cell's state: SYM = false
+        // (symmetric_flux_fallback 0) to this cell's for all four, SYM = true
+        // the left state to the left cell and the right state to the right
+        // cell, so that both cells use the same flux for their interface (see
+        // gpu_make_delta_qi in music_kernels.cu).  SYM is a template constant:
+        // the false branch is folded away, the default kernel is the old one.
         ReconstResult r_phL = gpu_reconst(tau, qiphL, u_c, e_c, eos_P, eos_dPde, eos_p);
-        ReconstResult r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
-        ReconstResult r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_phR;
+        ReconstResult r_mhL;
+        if (SYM) {
+            float u_p1[4];
+            float u_m1[4];
+            for (int m = 0; m < 4; m++) {
+                u_p1[m] = u_curr[m * Ncells + ip1];
+                u_m1[m] = u_curr[m * Ncells + im1];
+            }
+            r_phR = gpu_reconst(tau, qiphR, u_p1, epsilon_curr[ip1],
+                                eos_P, eos_dPde, eos_p);
+            r_mhL = gpu_reconst(tau, qimhL, u_m1, epsilon_curr[im1],
+                                eos_P, eos_dPde, eos_p);
+        } else {
+            r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
+            r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        }
         ReconstResult r_mhR = gpu_reconst(tau, qimhR, u_c, e_c, eos_P, eos_dPde, eos_p);
 
         // Local propagation speeds (KT upwinding)
@@ -937,6 +959,35 @@ kernel void gpu_make_delta_qi(
     // Write qi + rhs
     for (int alpha = 0; alpha < 5; alpha++)
         qi_out[alpha * Ncells + c] = qi[alpha] + rhs[alpha];
+}
+
+kernel void gpu_make_delta_qi(
+    device const float*       epsilon_curr [[buffer(0)]],
+    device const float*       rhob_curr    [[buffer(1)]],
+    device const float*       u_curr       [[buffer(2)]],
+    device const float*       eos_P        [[buffer(3)]],
+    device const float*       eos_dPde     [[buffer(4)]],
+    device       float*       qi_out       [[buffer(5)]],
+    constant MUSICGridParams& params       [[buffer(6)]],
+    constant GPUEosParams&    eos_p        [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    gpu_make_delta_qi_body<false>(epsilon_curr, rhob_curr, u_curr, eos_P, eos_dPde, qi_out, params, eos_p, gid);
+}
+
+// the same with the symmetric fallback (symmetric_flux_fallback 1)
+kernel void gpu_make_delta_qi_sym(
+    device const float*       epsilon_curr [[buffer(0)]],
+    device const float*       rhob_curr    [[buffer(1)]],
+    device const float*       u_curr       [[buffer(2)]],
+    device const float*       eos_P        [[buffer(3)]],
+    device const float*       eos_dPde     [[buffer(4)]],
+    device       float*       qi_out       [[buffer(5)]],
+    constant MUSICGridParams& params       [[buffer(6)]],
+    constant GPUEosParams&    eos_p        [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    gpu_make_delta_qi_body<true>(epsilon_curr, rhob_curr, u_curr, eos_P, eos_dPde, qi_out, params, eos_p, gid);
 }
 
 // ── gpu_finalize_ideal ────────────────────────────────────────────────────────

@@ -140,6 +140,7 @@ private:
     void*  library_       = nullptr;  // id<MTLLibrary>
     void*  pso_w_source_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_delta_qi_  = nullptr;  // id<MTLComputePipelineState>
+    void*  pso_delta_qi_sym_ = nullptr;  // the same, symmetric_flux_fallback
     void*  pso_finalize_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_uwrhs_     = nullptr;  // id<MTLComputePipelineState>
     void*  pso_make_du_   = nullptr;  // id<MTLComputePipelineState>

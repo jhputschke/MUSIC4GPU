@@ -605,14 +605,18 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
     compute_launch(gpu, max_block_threads_, block, grid);
     if (params.eos4d) {
         compute_launch(gpu, max_block_threads_eos4d_, block, grid);
-        gpu_make_delta_qi_eos4d<<<grid, block, 0, stream>>>(
+        // the symmetric fallback is a kernel of its own, so that the default
+        // one stays the old code (results bit-identical with the switch off)
+        (gpu.sym_fallback ? gpu_make_delta_qi_eos4d_sym
+                          : gpu_make_delta_qi_eos4d)<<<grid, block, 0, stream>>>(
             gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.rhoq,
             gpu.snap_curr.rhos, gpu.snap_curr.u, gpu.qi_out, params,
             gpu.eos4d_tab, gpu.eos4d_params);
         check_launch("gpu_make_delta_qi_eos4d");
         return;
     }
-    gpu_make_delta_qi<<<grid, block, 0, stream>>>(
+    (gpu.sym_fallback ? gpu_make_delta_qi_sym
+                      : gpu_make_delta_qi)<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_dPde,
         gpu.qi_out, params, gpu.eos_params);

@@ -143,6 +143,10 @@ public:
     // (set by Advance when the 4D EOS evolves Q and S on the GPU)
     bool with_qs = false;
 
+    // Host side only: dispatch_delta_qi launches the flux kernel with the
+    // symmetric fallback (DATA.symmetric_flux_fallback; CUDA and Metal)
+    bool sym_fallback = false;
+
     // The three snapshots (prev, current, future).
     GPUSnapshot snap_prev;
     GPUSnapshot snap_curr;
