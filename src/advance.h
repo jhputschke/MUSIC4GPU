@@ -181,6 +181,15 @@ class Advance {
 #endif
 
  public:
+    // drain_particlized (Evolve::drain_particlized_cells; CPU and GPU
+    // builds): cell cells[j] keeps the fraction keep[j] of e, rhob, rhoq,
+    // rhos, W^{mu nu} and Pi at its u; keep[j] <= 0 empties it (e = e_vac
+    // [1/fm^4], at rest).  In the current and the previous step: on the GPU
+    // when it holds the state, else in the host arenas prev and curr (the
+    // next step uploads them).
+    void drain_cells(const std::vector<int> &cells,
+                     const std::vector<float> &keep, Fields &prev,
+                     Fields &curr, double e_vac);
     Advance(const EOS &eosIn, const InitData &DATA_in,
             std::shared_ptr<HydroSourceBase> hydro_source_ptr_in,
             std::shared_ptr<HydroSourceBase> hydro_source_ptr_from_jets_in
@@ -253,14 +262,6 @@ class Advance {
                       Fields &curr, Fields *kept_into);
     //   copy_kept_to(state, f): all of a keep_state copy into host Fields
     bool copy_kept_to(const void* state, Fields &f);
-    // drain_particlized (Evolve::drain_particlized_cells): cell cells[j]
-    // keeps the fraction keep[j] of e, rhob, rhoq, rhos, W^{mu nu} and Pi at
-    // its u; keep[j] <= 0 empties it (e = e_vac [1/fm^4], at rest).  In the
-    // current and the previous step: on the GPU when it holds the state, else
-    // in the host arenas prev and curr (the next step uploads them).
-    void drain_cells(const std::vector<int> &cells,
-                     const std::vector<float> &keep, Fields &prev,
-                     Fields &curr, double e_vac);
     // The sources' books (Cartesian runs, GPU path): every source fill adds
     // what it deposits in this half step, E [GeV], B, Q, S, to all[] and,
     // where the cell stays below eps_raw [1/fm^4] with it (e + j^0 dtau, the
