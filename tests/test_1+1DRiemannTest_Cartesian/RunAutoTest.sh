@@ -41,7 +41,7 @@ fi
 
 ./MUSIChydro tests/test_1+1DRiemannTest_Cartesian/music_input_1+1DRiemannTest_z_viscous
 
-python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputVisFiles.py
+python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputVisFiles.py z
 STATUS=$?
 
 if [ $STATUS == 0 ]; then
@@ -54,7 +54,7 @@ fi
 
 ./MUSIChydro tests/test_1+1DRiemannTest_Cartesian/music_input_1+1DRiemannTest_y_viscous
 
-python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputVisFiles.py
+python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputVisFiles.py y
 STATUS=$?
 
 if [ $STATUS == 0 ]; then
@@ -67,7 +67,7 @@ fi
 
 ./MUSIChydro tests/test_1+1DRiemannTest_Cartesian/music_input_1+1DRiemannTest_x_viscous
 
-python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputVisFiles.py
+python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputVisFiles.py x
 STATUS=$?
 
 if [ $STATUS == 0 ]; then
