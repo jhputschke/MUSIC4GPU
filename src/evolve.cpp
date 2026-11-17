@@ -217,6 +217,7 @@ std::string Evolve::checkpoint_key(Fields &arena) const {
     KEY(eta_size); KEY(tau_size); KEY(tau0); KEY(delta_x); KEY(delta_y);
     KEY(delta_eta); KEY(delta_tau); KEY(rk_order); KEY(minmod_theta);
     KEY(late_delta_tau); KEY(late_tau_switch);
+    KEY(symmetric_flux_fallback); KEY(quest_revert_as_cpu);
     KEY(active_region_eps); KEY(active_region_halo); KEY(active_region_dtau);
     KEY(whichEOS); KEY(facTau); KEY(fac_x); KEY(fac_y); KEY(fac_eta);
     KEY(turn_on_rhob); KEY(turn_on_QS); KEY(viscosity_flag);

@@ -565,7 +565,10 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
-    gpu_make_delta_qi<<<grid, block, 0, stream>>>(
+    // the symmetric fallback is a kernel of its own, so that the default one
+    // stays the old code (results bit-identical with the switch off)
+    (gpu.sym_fallback ? gpu_make_delta_qi_sym
+                      : gpu_make_delta_qi)<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_dPde,
         gpu.qi_out, params, gpu.eos_params, ab);
@@ -641,7 +644,10 @@ void CUDAPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
-    gpu_first_rk_step_w_full<<<grid, block, 0, stream>>>(
+    // the CPU's shear regulator is a kernel of its own, so that the default
+    // one stays the old code (results bit-identical with the switch off)
+    (gpu.quest_revert_cpu ? gpu_first_rk_step_w_full_cpu
+                          : gpu_first_rk_step_w_full)<<<grid, block, 0, stream>>>(
         gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
         gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,
         gpu.snap_curr.epsilon, gpu.snap_prev.epsilon,
