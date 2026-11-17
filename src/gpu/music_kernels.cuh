@@ -226,6 +226,21 @@ __global__ void gpu_gather_cells(
     const float* __restrict__ rhos,
     int nf);
 
+// Drain of particlized matter (drain_particlized; CUDAPipelines::drain_cells):
+// cell cells[j] of one snapshot keeps the fraction keep[j] of e, rhob, W^{mu nu},
+// Pi (and rhoq, rhos unless null) at its u; keep[j] <= 0 empties it (e = e_vac,
+// at rest, everything else 0).
+__global__ void gpu_drain_cells(
+    float* __restrict__ epsilon,
+    float* __restrict__ rhob,
+    float* __restrict__ u,
+    float* __restrict__ Wmunu,
+    float* __restrict__ pi_b,
+    float* __restrict__ rhoq,
+    float* __restrict__ rhos,
+    const int* __restrict__ cells, const float* __restrict__ keep,
+    int n, int Ncells, float e_vac);
+
 // Pack ideal-hydro output for the down-sampled evolution grid (Phase 2b).
 // One thread per output cell; reads snap_curr (epsilon, u) and the device EOS
 // tables, writes 8 floats per cell into `out` in fluidCell_ideal field order

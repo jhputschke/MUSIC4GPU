@@ -99,6 +99,18 @@ class MUSIC {
 
     void prepare_run_hydro_one_time_step();
     int run_hydro_upto(const double tauEnd);
+    //! the step-by-step run (prepare_run_hydro_one_time_step): what
+    //! drain_particlized took off the grid, E [GeV], B, Q, S (and the number
+    //! of cells), and what is on the grid now; all 0 before the run
+    void get_drained_totals(double out[4], long *cells = nullptr) const {
+        for (int k = 0; k < 4; k++) out[k] = 0.;
+        if (cells) *cells = 0;
+        if (evolve_ptr_) evolve_ptr_->drained_totals(out, cells);
+    }
+    void get_fluid_totals(double out[4]) {
+        for (int k = 0; k < 4; k++) out[k] = 0.;
+        if (evolve_ptr_) evolve_ptr_->fluid_totals(out);
+    }
 
     //! this is a shell function to run Cooper-Frye
     int run_Cooper_Frye();

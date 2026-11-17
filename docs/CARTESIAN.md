@@ -3,8 +3,9 @@
 Status: November 2026, branch `trackB` (`bqs_gpu` + `cartesian_guards` +
 `active_region`). Track B of the "Cartesian MUSIC on GPU" plan: a Cartesian
 hydro for running next to SMASH at low beam energies. This file covers step
-B1, the CPU reference, and step B2, Cartesian coordinates in the CUDA
-kernels. Metal stays Milne only: there `gpu_features_supported()` sends
+B1, the CPU reference, step B2, Cartesian coordinates in the CUDA
+kernels, and the drain of particlized matter for X-SCAPE's dynamic
+fluidization. Metal stays Milne only: there `gpu_features_supported()` sends
 `CoorType 1` to the CPU path.
 
 ## What changed (B1)
@@ -145,12 +146,68 @@ Not on the GPU, in either coordinate system: ideal hydro
 (`Viscosity_Flag_Yes_1_No_0 0`) and the vorticity term of the shear
 equation (`Include_vorticity_terms 1` is ignored by the kernels).
 
+## Draining particlized matter (`drain_particlized`)
+
+X-SCAPE's dynamic fluidization runs this hydro next to SMASH, fed by source
+terms all the time, and particlizes every freeze-out check's surface at once
+(iSS), handing the hadrons back to SMASH. MUSIC never removes particlized
+matter: the fluid below the freeze-out density stays on the grid. Next to a
+growing dense region (sources, flow) it crosses the surface again, inward
+(u.dsigma < 0), and later outward a second time. iSS drops the inward
+elements, so it is particlized twice. Au+Au at 7.7 GeV, b 0-3 fm, 3 events:
+the outflow iSS samples is 5-14 % above what was fluidized (B 327 of 299,
+331 of 315, 316 of 278), final states 107 % in E, B 413-421 of 394.
+
+`drain_particlized 1` (X-SCAPE: `<BDM><drain_particlized_fluid>`, default 1
+with dynamic fluidization; Cartesian only) takes that matter off:
+
+- During the surface search each element with u.dsigma > 0 adds its
+  T^{0 mu} dsigma_mu to the corners of its cube below the freeze-out density
+  in the current step, shared by their energy
+  (`FindFreezeOutSurface_Cornelius_XY`, `drain_share_`).
+- After the search each such cell keeps the fraction 1 - share/E of e, n,
+  W^{mu nu} and Pi at its u (`Evolve::drain_particlized_cells`), in the
+  current and the previous step: a kernel when the GPU holds the state
+  (`gpu_drain_cells`), the host arenas otherwise.
+- A drained cell keeps at least `drain_particlized_floor` (1e-3 GeV/fm^3).
+  Emptying cells to vacuum next to the surface made float vacuum interfaces
+  there; their GPU cells blew up and reached the surface by interpolation
+  (Pi ~ 1e14 GeV/fm^3 on surface elements; on the CPU the same run is clean).
+- Matter that never reached the freeze-out density (the tails of the
+  sources) is not touched; when the dense region reaches it, it is
+  particlized once.
+
+`Evolve::drained_totals` and `fluid_totals` (`MUSIC::get_drained_totals`,
+`get_fluid_totals`) give the books; X-SCAPE prints them per event with iSS's
+surface fluxes. The same 3 events with the drain:
+
+| per event | B | E [GeV] |
+|---|---|---|
+| fluidized (SMASH -> MUSIC) | 295, 310, 291 | 1010, 1087, 1034 |
+| outflow iSS gets (u.dsigma > 0) | 214, 228, 213 | 730, 792, 745 |
+| drained | 216, 231, 215 | 707, 770, 726 |
+| left on the grid at the end | 62, 61, 60 | 232, 240, 237 |
+| through the grid edges (the rest) | 17, 18, 16 | 71, 77, 71 |
+| particlized (iSS, one sample) | 191, 209, 191 | 683, 807, 747 |
+
+Drained and outflow agree to 1-3 %: nothing is particlized twice. The final
+states are 80-83 % in E, B 290-294 of 394: what the drain leaves visible is
+lost matter (the fluid left on the grid, about 20 % of B, which a final
+particlization could take; the grid edges, 6 %) and iSS sampling less B
+than the outflow it gets (8-11 % in these single samples; the mean of 20
+samples: 7 % with the drain, 3 % without; iSS's hadron gas against NEOS-4D). `drain_particlized 0` (the default of
+MUSIC) changes nothing: the dynamic event and the staged Milne one are
+byte-identical to before.
+
 ## Not done
 
 - Upstream confirmation of the guards (MUSIC-fluid/MUSIC branch `XSCAPE`,
   `cee9460`, where the same lines sit at the same line numbers).
 - Transporting W^{zz} directly in Cartesian mode (see above).
 - Cartesian on Metal.
+- Particlizing the fluid left on the grid at the end of a drained run (it
+  is then matter that was never particlized), and the B deficit of iSS's
+  sampling against the outflow it gets.
 - The Cartesian diffusion terms on the GPU are checked only for Milne
   bit-identity; the blob has no baryon density. The SMASH runs of Track B
   (B3/B4, NEOS-4D with B, Q, S) are the test with charges.

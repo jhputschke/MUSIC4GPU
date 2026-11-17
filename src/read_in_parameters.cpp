@@ -656,6 +656,16 @@ InitData read_in_parameters(std::string input_file) {
     tempinput = Util::StringFind4(input_file, "late_tau_switch");
     if (tempinput != "empty") istringstream(tempinput) >> templatetau;
     parameter_list.late_tau_switch = templatetau;
+    // drain_particlized: empty the particlized cells at every freeze-out
+    // check (X-SCAPE's dynamic fluidization; 0, the default: keep them)
+    int temp_drain = 0;
+    tempinput = Util::StringFind4(input_file, "drain_particlized");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_drain;
+    parameter_list.drain_particlized = temp_drain;
+    double temp_drain_floor = 1e-3;
+    tempinput = Util::StringFind4(input_file, "drain_particlized_floor");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_drain_floor;
+    parameter_list.drain_particlized_floor = temp_drain_floor;
     // active_region_eps [GeV/fm^3], active_region_halo [cells],
     // active_region_dtau [fm/c]: C3, the GPU evolves only the region with
     // matter (0, the default: the whole grid).  See Advance::try_gpu_advance.
@@ -1082,6 +1092,10 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
         parameter_list.late_tau_switch = value;
     if (parameter_name == "active_region_eps")
         parameter_list.active_region_eps = value;
+    if (parameter_name == "drain_particlized")
+        parameter_list.drain_particlized = static_cast<int>(value);
+    if (parameter_name == "drain_particlized_floor")
+        parameter_list.drain_particlized_floor = value;
     if (parameter_name == "active_region_halo")
         parameter_list.active_region_halo = static_cast<int>(value);
     if (parameter_name == "active_region_dtau")

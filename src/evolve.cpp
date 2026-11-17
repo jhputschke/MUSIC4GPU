@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <cmath>
 #include <string>
@@ -217,7 +218,7 @@ std::string Evolve::checkpoint_key(Fields &arena) const {
     KEY(nx); KEY(ny); KEY(neta); KEY(nt); KEY(x_size); KEY(y_size);
     KEY(eta_size); KEY(tau_size); KEY(tau0); KEY(delta_x); KEY(delta_y);
     KEY(delta_eta); KEY(delta_tau); KEY(rk_order); KEY(minmod_theta);
-    KEY(late_delta_tau); KEY(late_tau_switch);
+    KEY(late_delta_tau); KEY(late_tau_switch); KEY(drain_particlized); KEY(drain_particlized_floor);
     KEY(active_region_eps); KEY(active_region_halo); KEY(active_region_dtau);
     KEY(whichEOS); KEY(facTau); KEY(fac_x); KEY(fac_y); KEY(fac_eta);
     KEY(turn_on_rhob); KEY(turn_on_QS); KEY(viscosity_flag);
@@ -1145,6 +1146,8 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
     if (itau == 0) {
         nonfinite_total_ = 0;
         nonfinite_first_it_ = -1;
+        for (double &d : drained_) d = 0.;
+        drained_cells_ = 0;
 #ifdef MUSIC_USE_GPU
         advance.nonfinite_count_gpu();   // discard a count left by an earlier run
 #endif
@@ -1427,6 +1430,8 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         advance.keep_state_for_next_call(prev_eq_curr);
 #endif
     }
+    last_prev_ = fpPrev;
+    last_curr_ = fpCurr;
     return frozenStatus;
 }
 
@@ -1538,6 +1543,9 @@ int Evolve::freezeout_check(FreezeoutSteps &fo, double tau, Fields &prev,
     Fields &now_p  = vorticity ? *now_prev : now;
     Fields &last_p = vorticity ? fo.prev[fo.k ^ 1] : last;
     int frozen;
+    drain_share_on_ = (DATA.drain_particlized == 1 && DATA.CoorType == 1
+                       && !DATA.boost_invariant);
+    if (drain_share_on_) drain_share_.resize(now.e_.size(), 0.);
     if (!DATA.boost_invariant) {
         frozen = FindFreezeOutSurface_Cornelius(tau, now_p, now, last_p, last,
                                                 visit);
@@ -1550,8 +1558,103 @@ int Evolve::freezeout_check(FreezeoutSteps &fo, double tau, Fields &prev,
 #ifdef MUSIC_USE_GPU
     if (visit && !kept_now) advance.copy_state_to(nullptr, now);
 #endif
+    // after the search and the copies the next check compares with: they keep
+    // the state the surface was found in
+    if (drain_share_on_) {
+        drain_particlized_cells(fo, now, visit != nullptr, prev, curr);
+        drain_share_on_ = false;
+    }
     fo.k ^= 1;
     return frozen;
+}
+
+//! drain_particlized: the matter the surface of this check hands over for
+//! particlization is taken off the grid.  Each element with u.dsigma > 0 (the
+//! ones iSS samples) emits T^{0 mu} dsigma_mu; that energy is shared among the
+//! corners of its cube below the freeze-out density (in this step), by their
+//! energy (FindFreezeOutSurface_Cornelius_XY, drain_share_), and each such
+//! cell keeps the fraction 1 - share/E of e, n, W^{mu nu} and Pi at its u (none
+//! when the share is its whole energy or more).  That matter crossed the
+//! surface since the previous check, out of the dense region or by cooling
+//! below it.  Left on the grid it is particlized a second time when the dense
+//! region grows back over it (sources, or flow): iSS drops the elements with
+//! u.dsigma < 0, which would subtract it.  Matter that never crossed (the
+//! tails of the sources outside the dense region) stays; when the dense region
+//! reaches it, it is particlized once.  A drained cell keeps an energy density
+//! of at least drain_particlized_floor (and its u).  Cartesian coordinates
+//! only.
+void Evolve::drain_particlized_cells(FreezeoutSteps &fo, Fields &now,
+                                     bool cells_listed, Fields &prev,
+                                     Fields &curr) {
+    bench::Timer _bt("evolve.drain_particlized");
+    const double e_vac = 1e-12;   // the empty grid's (Init, 1/fm^4)
+    // a drained cell keeps at least drain_particlized_floor (it is not made
+    // vacuum): float vacuum next to the surface blows up in the GPU kernels
+    // (Pi ~ 1e14 GeV/fm^3 on surface elements, from the interpolation)
+    const double e_floor = DATA.drain_particlized_floor/hbarc;
+    std::vector<int> cells;
+    std::vector<float> keep;
+    double sum[4] = {0., 0., 0., 0.};
+    auto visit_cell = [&](int c) {
+        const double share = drain_share_[c];
+        if (share <= 0.) return;
+        drain_share_[c] = 0.;
+        double q[4];
+        cell_content(now, c, q);
+        if (!(q[0] > 0.)) return;
+        double f = std::min(1., share/q[0]);
+        const double e_c = now.e_[c];
+        if (e_floor > 0. && e_c > 0.) {
+            f = std::min(f, std::max(0., 1. - e_floor/e_c));
+            if (f <= 0.) return;
+        }
+        for (int k = 0; k < 4; k++) sum[k] += f*q[k];
+        cells.push_back(c);
+        keep.push_back(f < 1. ? static_cast<float>(1. - f) : 0.f);
+    };
+    if (cells_listed) {
+        for (const int c : fo.cells) visit_cell(c);
+    } else {
+        for (int c = 0; c < static_cast<int>(drain_share_.size()); c++) {
+            visit_cell(c);
+        }
+    }
+    if (cells.empty()) return;
+    for (int k = 0; k < 4; k++) drained_[k] += sum[k];
+    drained_cells_ += static_cast<long>(cells.size());
+    advance.drain_cells(cells, keep, prev, curr, e_vac);
+}
+
+void Evolve::cell_content(const Fields &f, int idx, double out[4]) const {
+    const double vol = DATA.delta_x*DATA.delta_y*DATA.delta_eta;
+    const double e   = f.e_[idx];
+    const double P   = eos.get_pressure(e, f.rhob_[idx], f.rhoq_[idx],
+                                        f.rhos_[idx]);
+    const double Pi  = f.piBulk_[idx];
+    const double u0  = f.u_[0][idx];
+    const double T00 = (e + P + Pi)*u0*u0 - (P + Pi) + f.Wmunu_[0][idx];
+    out[0] = T00*hbarc*vol;
+    out[1] = (f.rhob_[idx]*u0 + f.Wmunu_[10][idx])*vol;
+    out[2] = f.rhoq_[idx]*u0*vol;
+    out[3] = f.rhos_[idx]*u0*vol;
+}
+
+void Evolve::fluid_totals(double out[4]) {
+    for (int k = 0; k < 4; k++) out[k] = 0.;
+    if (!last_curr_) return;
+#ifdef MUSIC_USE_GPU
+    advance.sync_curr_from_gpu_readonly(*last_curr_);
+#endif
+    const Fields &f = *last_curr_;
+    const long n = static_cast<long>(f.e_.size());
+    double E = 0., B = 0., Q = 0., S = 0.;
+    #pragma omp parallel for reduction(+:E, B, Q, S)
+    for (long c = 0; c < n; c++) {
+        double q[4];
+        cell_content(f, static_cast<int>(c), q);
+        E += q[0]; B += q[1]; Q += q[2]; S += q[3];
+    }
+    out[0] = E; out[1] = B; out[2] = Q; out[3] = S;
 }
 
 //! The cubes FindFreezeOutSurface_Cornelius_XY looks at: those its test
@@ -2269,6 +2372,47 @@ int Evolve::FindFreezeOutSurface_Cornelius_XY(double tau, int ieta,
                     FO_nBvsEta_[ieta] += u_dot_dsigma*fluid_center.rhob;
                     FO_nQvsEta_[ieta] += u_dot_dsigma*fluid_center.rhoq;
                     FO_nSvsEta_[ieta] += u_dot_dsigma*fluid_center.rhos;
+                }
+                if (drain_share_on_) {
+                    // drain_particlized: the energy this element emits,
+                    // T^{0 mu} dsigma_mu (Cartesian: dsigma_mu = FULLSU), to
+                    // the corners of the cube below e_fo in this step
+                    const double uds = (
+                          FULLSU[0]*fluid_center.u[0]
+                        + FULLSU[1]*fluid_center.u[1]
+                        + FULLSU[2]*fluid_center.u[2]
+                        + FULLSU[3]*fluid_center.u[3]);
+                    const double PPi = pressure + fluid_center.pi_b;
+                    const double E_el = hbarc*(
+                          (epsFO + PPi)*fluid_center.u[0]*uds
+                        - PPi*FULLSU[0]
+                        + fluid_center.Wmunu[0]*FULLSU[0]
+                        + fluid_center.Wmunu[1]*FULLSU[1]
+                        + fluid_center.Wmunu[2]*FULLSU[2]
+                        + fluid_center.Wmunu[3]*FULLSU[3]);
+                    if (uds > 0. && E_el > 0.) {
+                        const int corner[8] = {Idx000, Idx100, Idx010, Idx110,
+                                               Idx001, Idx101, Idx011, Idx111};
+                        double w[8];
+                        double wsum = 0.;
+                        for (int ic = 0; ic < 8; ic++) {
+                            w[ic] = 0.;
+                            if (arena_current.e_[corner[ic]] < epsFO) {
+                                double q[4];
+                                cell_content(arena_current, corner[ic], q);
+                                w[ic] = std::max(0., q[0]);
+                            }
+                            wsum += w[ic];
+                        }
+                        if (wsum > 0.) {
+                            for (int ic = 0; ic < 8; ic++) {
+                                if (w[ic] <= 0.) continue;
+                                const double add = E_el*w[ic]/wsum;
+                                #pragma omp atomic
+                                drain_share_[corner[ic]] += add;
+                            }
+                        }
+                    }
                 }
             }
         }

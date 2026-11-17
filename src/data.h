@@ -94,6 +94,15 @@ typedef struct init_data {
     //! facTau and the frame cadence are scaled with it (Evolve::EvolveIt)
     double late_delta_tau;
     double late_tau_switch;
+    //! drain_particlized = 1 (X-SCAPE's dynamic fluidization; 0 by default):
+    //! at every freeze-out check the energy the surface emits is taken from
+    //! the cells below the freeze-out energy density next to it (in the
+    //! current and the previous step; Evolve::drain_particlized_cells).  Left
+    //! on the grid it is particlized again when the dense region, fed by
+    //! sources, grows back over it.  Evolve::drained_totals() sums it.
+    int drain_particlized = 0;
+    //! the energy density [GeV/fm^3] a drained cell keeps at least
+    double drain_particlized_floor = 1e-3;
     //! C3, the active region (GPU, CUDA; opt-in): with active_region_eps > 0
     //! [GeV/fm^3] the GPU evolves only the 8 x 8 x 4 blocks within
     //! active_region_halo cells of a cell with e > active_region_eps or with

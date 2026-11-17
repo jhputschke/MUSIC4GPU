@@ -79,6 +79,23 @@ class Evolve {
     //! EvolveOneTimeStep: the freeze-out start of the run, fixed at its
     //! first call
     int step_iFreezeStart_ = -1;
+    //! drain_particlized (DATA): E [GeV], B, Q, S taken off the grid in this
+    //! run, and the number of cells emptied (drain_particlized_cells)
+    double drained_[4] = {0., 0., 0., 0.};
+    long   drained_cells_ = 0;
+    //! the energy [GeV] the surface of the current check emits, by cell: each
+    //! outgoing element's T^{0 mu} dsigma_mu shared among the corners of its
+    //! cube below the freeze-out density (FindFreezeOutSurface_Cornelius_XY)
+    bool drain_share_on_ = false;
+    std::vector<double> drain_share_;
+    void drain_particlized_cells(FreezeoutSteps &fo, Fields &now,
+                                 bool cells_listed, Fields &prev, Fields &curr);
+    //! E [GeV], B, Q, S of cell idx in the lab frame (Cartesian: the cell's
+    //! volume times T^{00}, N^0; Milne: at eta_s = 0 and tau = 1)
+    void cell_content(const Fields &f, int idx, double out[4]) const;
+    //! the arenas the last EvolveOneTimeStep left the state in (fluid_totals)
+    Fields* last_prev_ = nullptr;
+    Fields* last_curr_ = nullptr;
     //! Cornelius' tau spacing for the first check after the step switch
     //! (-1: to be measured at that check; 0: facTau * delta_tau)
     double dtau_check_override_ = 0.;
@@ -150,6 +167,16 @@ class Evolve {
     }
     //! what this run did with set_resume, for the log; "" if not asked
     const std::string &resume_status() const { return resume_status_; }
+
+    //! drain_particlized: what was drained in this run, E [GeV], B, Q, S
+    //! (and the number of cells, if `cells` is not null)
+    void drained_totals(double out[4], long *cells = nullptr) const {
+        for (int k = 0; k < 4; k++) out[k] = drained_[k];
+        if (cells) *cells = drained_cells_;
+    }
+    //! E [GeV], B, Q, S on the grid after the last EvolveOneTimeStep call
+    //! (brings the state from the GPU when it is there; all 0 before a call)
+    void fluid_totals(double out[4]);
 
     int EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                           Fields &arenaFieldsCurr, Fields &arenaFieldsNext,

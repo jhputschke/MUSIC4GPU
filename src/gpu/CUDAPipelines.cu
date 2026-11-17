@@ -94,6 +94,8 @@ CUDAPipelines::~CUDAPipelines() {
     if (gather_out_dev_)    cudaFree(gather_out_dev_);
     if (gather_cells_host_) cudaFreeHost(gather_cells_host_);
     if (gather_out_host_)   cudaFreeHost(gather_out_host_);
+    if (drain_cells_dev_)   cudaFree(drain_cells_dev_);
+    if (drain_keep_dev_)    cudaFree(drain_keep_dev_);
     if (copy_event_) {
         cudaEventDestroy(static_cast<cudaEvent_t>(copy_event_));
         copy_event_ = nullptr;
@@ -538,6 +540,46 @@ bool CUDAPipelines::gather_cells(GPUGrid& gpu, const void* kept,
                     nf * need * sizeof(float));
     }
     return true;
+}
+
+// ── drain_cells ───────────────────────────────────────────────────────────────
+
+bool CUDAPipelines::drain_cells(GPUGrid& gpu, const int* cells,
+                                const float* keep, int n, float e_vac) {
+    if (!ready_ || n < 0) return false;
+    if (n == 0) return true;
+    auto stream = static_cast<cudaStream_t>(compute_stream_);
+    const size_t need = static_cast<size_t>(n);
+    if (drain_cap_ < need) {
+        if (drain_cells_dev_) cudaFree(drain_cells_dev_);
+        if (drain_keep_dev_)  cudaFree(drain_keep_dev_);
+        drain_cells_dev_ = nullptr;
+        drain_keep_dev_  = nullptr;
+        drain_cap_ = 0;
+        const size_t cap = std::max(need + need / 2,
+                                    static_cast<size_t>(gpu.Ncells()) / 64);
+        if (cudaMalloc(&drain_cells_dev_, cap * sizeof(int)) != cudaSuccess
+            || cudaMalloc(&drain_keep_dev_, cap * sizeof(float)) != cudaSuccess) {
+            return false;
+        }
+        drain_cap_ = cap;
+    }
+    if (cudaMemcpyAsync(drain_cells_dev_, cells, need * sizeof(int),
+                        cudaMemcpyHostToDevice, stream) != cudaSuccess
+        || cudaMemcpyAsync(drain_keep_dev_, keep, need * sizeof(float),
+                           cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        return false;
+    }
+    const int block = 256;
+    const int grid  = (n + block - 1) / block;
+    for (GPUSnapshot* s : {&gpu.snap_curr, &gpu.snap_prev}) {
+        gpu_drain_cells<<<grid, block, 0, stream>>>(
+            s->epsilon, s->rhob, s->u, s->Wmunu, s->pi_b,
+            gpu.with_qs ? s->rhoq : nullptr, gpu.with_qs ? s->rhos : nullptr,
+            drain_cells_dev_, drain_keep_dev_, n, gpu.Ncells(), e_vac);
+        check_launch("gpu_drain_cells");
+    }
+    return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
 // ── pack_evolution_ideal ──────────────────────────────────────────────────────

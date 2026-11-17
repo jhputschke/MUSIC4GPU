@@ -801,6 +801,54 @@ bool Advance::copy_kept_to(const void* state, Fields &f) {
     return true;
 }
 
+void Advance::drain_cells(const std::vector<int> &cells,
+                          const std::vector<float> &keep, Fields &prev,
+                          Fields &curr, double e_vac) {
+    if (cells.empty()) return;
+#ifdef MUSIC_USE_GPU
+    if (gpu_owns_state_ && gpu_ready_) {
+#if defined(USE_CUDA)
+        if (GPUPipelines::instance().drain_cells(
+                gpu_grid_, cells.data(), keep.data(),
+                static_cast<int>(cells.size()), static_cast<float>(e_vac))) {
+            // the host copies (if any) are older than the GPU's state now
+            host_curr_fresh_ = false;
+            host_prev_fresh_ = false;
+            prev_fresh_buf_  = nullptr;
+            curr_synced_buf_ = nullptr;
+            return;
+        }
+#endif
+        // no drain kernel (Metal) or it failed: the host takes the state
+        // over, and the next step uploads it
+        sync_arena_from_gpu(prev, curr);
+    }
+#endif
+    for (Fields* f : {&prev, &curr}) {
+        for (size_t j = 0; j < cells.size(); j++) {
+            const int c = cells[j];
+            const double k = keep[j];
+            if (k > 0.) {
+                f->e_[c] *= k;
+                f->rhob_[c] *= k;
+                f->rhoq_[c] *= k;
+                f->rhos_[c] *= k;
+                f->piBulk_[c] *= k;
+                for (auto &w : f->Wmunu_) w[c] *= k;
+                continue;
+            }
+            f->e_[c]    = e_vac;
+            f->rhob_[c] = 0.;
+            f->rhoq_[c] = 0.;
+            f->rhos_[c] = 0.;
+            f->piBulk_[c] = 0.;
+            f->u_[0][c] = 1.;
+            for (int m = 1; m < 4; m++) f->u_[m][c] = 0.;
+            for (auto &w : f->Wmunu_) w[c] = 0.;
+        }
+    }
+}
+
 // ── Feature support predicate ────────────────────────────────────────────────
 //
 // Gate the GPU dispatch on the configuration falling inside the support matrix

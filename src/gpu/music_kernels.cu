@@ -3486,6 +3486,41 @@ __global__ void gpu_gather_cells(
     }
 }
 
+__global__ void gpu_drain_cells(
+    float* __restrict__ epsilon,
+    float* __restrict__ rhob,
+    float* __restrict__ u,
+    float* __restrict__ Wmunu,
+    float* __restrict__ pi_b,
+    float* __restrict__ rhoq,
+    float* __restrict__ rhos,
+    const int* __restrict__ cells, const float* __restrict__ keep,
+    int n, int Ncells, float e_vac)
+{
+    const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (j >= n) return;
+    const size_t c  = static_cast<size_t>(cells[j]);
+    const size_t nc = static_cast<size_t>(Ncells);
+    const float k = keep[j];
+    if (k > 0.f) {
+        epsilon[c] *= k;
+        rhob[c]    *= k;
+        for (int m = 0; m < 14; ++m) Wmunu[m*nc + c] *= k;
+        pi_b[c] *= k;
+        if (rhoq) rhoq[c] *= k;
+        if (rhos) rhos[c] *= k;
+        return;
+    }
+    epsilon[c] = e_vac;
+    rhob[c]    = 0.f;
+    u[c]       = 1.f;
+    for (int m = 1; m < 4; ++m)  u[m*nc + c] = 0.f;
+    for (int m = 0; m < 14; ++m) Wmunu[m*nc + c] = 0.f;
+    pi_b[c] = 0.f;
+    if (rhoq) rhoq[c] = 0.f;
+    if (rhos) rhos[c] = 0.f;
+}
+
 __global__ void gpu_reduce_max_eps_rhob(
     const float* __restrict__ epsilon,
     const float* __restrict__ rhob,

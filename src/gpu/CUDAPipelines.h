@@ -92,6 +92,11 @@ public:
     bool  keep_curr(GPUGrid& gpu, void* state);
     bool  gather_cells(GPUGrid& gpu, const void* kept, const int* cells,
                        int n, float* host_curr, float* host_kept);
+    // The drain of particlized matter (drain_particlized, evolve.cpp): cell
+    // cells[j] keeps the fraction keep[j] of its matter (gpu_drain_cells), in
+    // snap_curr and snap_prev.  Synchronizes.
+    bool  drain_cells(GPUGrid& gpu, const int* cells, const float* keep,
+                      int n, float e_vac);
 
     // Cell updates in which gpu_first_rk_step_w_full set a non-finite
     // W^{mu nu} or Pi to 0 since the last call (resets the count).
@@ -177,5 +182,8 @@ private:
     float* gather_out_host_   = nullptr;
     int    max_block_threads_eos4d_ = 128;   // gpu_make_delta_qi_eos4d
     size_t gather_cap_        = 0;
+    int*   drain_cells_dev_   = nullptr;   // drain_cells' list and fractions,
+    float* drain_keep_dev_    = nullptr;   // drain_cap_ cells
+    size_t drain_cap_         = 0;
     int    gather_nf_         = 0;     // fields per cell the buffers hold
 };

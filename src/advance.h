@@ -248,6 +248,14 @@ class Advance {
                       Fields &curr, Fields *kept_into);
     //   copy_kept_to(state, f): all of a keep_state copy into host Fields
     bool copy_kept_to(const void* state, Fields &f);
+    // drain_particlized (Evolve::drain_particlized_cells): cell cells[j]
+    // keeps the fraction keep[j] of e, rhob, rhoq, rhos, W^{mu nu} and Pi at
+    // its u; keep[j] <= 0 empties it (e = e_vac [1/fm^4], at rest).  In the
+    // current and the previous step: on the GPU when it holds the state, else
+    // in the host arenas prev and curr (the next step uploads them).
+    void drain_cells(const std::vector<int> &cells,
+                     const std::vector<float> &keep, Fields &prev,
+                     Fields &curr, double e_vac);
     // Cell updates since the last call in which the GPU set a non-finite
     // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();
