@@ -208,6 +208,14 @@ __global__ void gpu_make_w_source(
 
         float sf = params.tau * dWdtau + Wc[idx_alpha0] + dWdx;
         float bf = params.tau * dPidtau + Pi_alpha0 + dPidx;
+        if (params.cartesian) {
+            // no "+ W", "+ Pi" from partial_tau (tau W^{tau alpha}).  The
+            // Cartesian overrides in these kernels use the _rn intrinsics
+            // (never contracted, never merged with the Milne arithmetic), so
+            // the Milne code compiles exactly as before: bit-identical
+            sf = __fadd_rn(dWdtau, dWdx);
+            bf = __fadd_rn(dPidtau, dPidx);
+        }
         dwmn[alpha] += sf + bf;
     }  // alpha loop
 
@@ -383,6 +391,14 @@ __global__ void gpu_make_w_source_tiled(
 
         float sf = params.tau * dWdtau + Wc[idx_alpha0] + dWdx;
         float bf = params.tau * dPidtau + Pi_alpha0 + dPidx;
+        if (params.cartesian) {
+            // no "+ W", "+ Pi" from partial_tau (tau W^{tau alpha}).  The
+            // Cartesian overrides in these kernels use the _rn intrinsics
+            // (never contracted, never merged with the Milne arithmetic), so
+            // the Milne code compiles exactly as before: bit-identical
+            sf = __fadd_rn(dWdtau, dWdx);
+            bf = __fadd_rn(dPidtau, dPidx);
+        }
         dwmn[alpha] += sf + bf;
     }
 
@@ -1300,7 +1316,8 @@ __device__ void gpu_finalize_ideal_4d(
     const int   rkf      = params.rk_flag;
     const float dt       = params.delta_tau;
     const float tau_org  = params.tau_orig;
-    const float tau_next = tau_org + dt;
+    // Cartesian: tau_orig = 1 from the host, tauNextFactor = 1
+    const float tau_next = params.cartesian ? 1.f : tau_org + dt;
     const float rk_norm  = 1.f / (1.f + (float)rkf);
 
     const float u0p = u_prev[c];
@@ -1566,7 +1583,8 @@ __global__ void gpu_finalize_ideal(
     const int   rkf      = params.rk_flag;
     const float dt       = params.delta_tau;
     const float tau_org  = params.tau_orig;
-    const float tau_next = tau_org + dt;
+    // Cartesian: tau_orig = 1 from the host, tauNextFactor = 1
+    const float tau_next = params.cartesian ? 1.f : tau_org + dt;
     const float rk_norm  = 1.f / (1.f + (float)rkf);
 
     float u0p   = u_prev[c];
@@ -1897,6 +1915,12 @@ __global__ void gpu_make_du(
     float theta_cell = (-dUsup_local[0][0] + dUsup_local[1][1]
                         + dUsup_local[2][2] + dUsup_local[3][3]
                         + u[0] / tau);
+    // Cartesian: no u^tau/tau piece (U_derivative::calculate_expansion_rate)
+    if (params.cartesian)
+        theta_cell = __fadd_rn(__fadd_rn(__fadd_rn(-dUsup_local[0][0],
+                                                   dUsup_local[1][1]),
+                                         dUsup_local[2][2]),
+                               dUsup_local[3][3]);
     theta_out[c] = theta_cell;
 
     float a_loc[4];
@@ -1922,6 +1946,17 @@ __global__ void gpu_make_du(
                 + u[0] / tau * g_a3 * g_b3
                 + u[3] * u[0] / tau * 0.5f * (g_a3 * u[b] + g_b3 * u[a])
                 + (u[a] * a_loc[b] + u[b] * a_loc[a]) * 0.5f;
+            if (params.cartesian) {   // no Christoffel terms
+                const float sym = __fmul_rn(__fadd_rn(dUsup_local[a][b],
+                                                      dUsup_local[b][a]), 0.5f);
+                const float proj = __fdiv_rn(
+                    __fmul_rn(__fadd_rn(gfac, __fmul_rn(u[a], u[b])),
+                              theta_cell), 3.f);
+                const float acc = __fmul_rn(
+                    __fadd_rn(__fmul_rn(u[a], a_loc[b]),
+                              __fmul_rn(u[b], a_loc[a])), 0.5f);
+                sigma_local[a][b] = __fadd_rn(__fsub_rn(sym, proj), acc);
+            }
             sigma_local[b][a] = sigma_local[a][b];
         }
     }
@@ -2303,7 +2338,8 @@ DFI float gpu_uW_source(
 DFI float gpu_uWRHS_geom(
         const float W_local[4][4], const float u[4],
         const float a_loc[4],
-        int mu, int nu, float theta, float tau, float delta_tau)
+        int mu, int nu, float theta, float tau, float delta_tau,
+        int cartesian)
 {
     float g3m = (mu == 3) ? 1.f : 0.f;
     float g3n = (nu == 3) ? 1.f : 0.f;
@@ -2327,9 +2363,25 @@ DFI float gpu_uWRHS_geom(
                 + W_local[ic][mu] * u[nu] * a_loc[ic] * ic_fac;
     }
 
-    return tempf * delta_tau
+    float res = tempf * delta_tau
            + (-(u[0] * W_local[mu][nu]) / tau
               + theta * W_local[mu][nu]) * delta_tau;
+    if (cartesian) {
+        // Cartesian: no Christoffel terms and no -u^tau W/tau (_rn
+        // intrinsics: the Milne arithmetic above compiles as before)
+        float tc = 0.f;
+        for (int ic = 0; ic < 4; ic++) {
+            const float ic_fac = (ic == 0) ? -1.f : 1.f;
+            const float aw = __fmul_rn(a_loc[ic], ic_fac);
+            tc = __fadd_rn(tc, __fadd_rn(
+                     __fmul_rn(__fmul_rn(W_local[ic][nu], u[mu]), aw),
+                     __fmul_rn(__fmul_rn(W_local[ic][mu], u[nu]), aw)));
+        }
+        res = __fadd_rn(__fmul_rn(tc, delta_tau),
+                        __fmul_rn(__fmul_rn(theta, W_local[mu][nu]),
+                                  delta_tau));
+    }
+    return res;
 }
 
 // ── non-finite counter ───────────────────────────────────────────────────────
@@ -2473,7 +2525,8 @@ __global__ void gpu_first_rk_step_w_full(
                        eos_P, eos_s, eos_T, eos_p, params, dt);
 
         float w_rhs_geom = gpu_uWRHS_geom(W4, u_c, a_loc, mu, nu,
-                                          theta, tau_now, dt);
+                                          theta, tau_now, dt,
+                                          params.cartesian);
         float w_rhs = uwrhs_flux + w_rhs_geom;
 
         float tempf =
@@ -2515,6 +2568,9 @@ __global__ void gpu_first_rk_step_w_full(
 
         float p_rhs = uprhs_in[c]
                     + (-(u_c[0] * pi_c) / tau_now + theta * pi_c) * dt;
+        if (params.cartesian)   // no -u^tau Pi/tau
+            p_rhs = __fadd_rn(uprhs_in[c],
+                              __fmul_rn(__fmul_rn(theta, pi_c), dt));
 
         float SPi = gpu_uPi_source(pi_c, theta, eps_src, Wsigma_scalar,
                                    eos_P, eos_dPde, eos_T, eos_p, params, dt);
@@ -2999,7 +3055,8 @@ __global__ void gpu_first_rk_step_w_full_eos4d(
                        th, params, dt);
 
         float w_rhs_geom = gpu_uWRHS_geom(W4, u_c, a_loc, mu, nu,
-                                          theta, tau_now, dt);
+                                          theta, tau_now, dt,
+                                          params.cartesian);
         float w_rhs = uwrhs_flux + w_rhs_geom;
 
         float tempf =
@@ -3068,12 +3125,16 @@ __global__ void gpu_first_rk_step_w_full_eos4d(
                 qs += qc[i] * s4[i][nu] * ((i == 0) ? -1.f : 1.f);
             const float NL2 = -tc2 * qs;
             float src = (-qc[nu] - NS + NL1 + NL2) / tau_rho;
+            const float src_relax = src;
             src += (theta - u_c[0] / tau_now) * qc[nu];
             // the Milne terms: (g^{nu tau} + u^nu u^tau) u^eta q^eta/tau
             //                - (g^{nu eta} + u^nu u^eta) u^eta q^tau/tau
             const float g_nu3 = (nu == 3) ? 1.f : 0.f;
             src += (u_c[nu] * u_c[0]) * u_c[3] * qc[3] / tau_now
                    - (g_nu3 + u_c[nu] * u_c[3]) * u_c[3] * qc[0] / tau_now;
+            // Cartesian: theta has no u^tau/tau piece, no Christoffel terms
+            if (params.cartesian)
+                src = __fadd_rn(src_relax, __fmul_rn(theta, qc[nu]));
             src += u_c[nu] * q_dot_a;
 
             float t = (1.f - (float)rkf) * (qc[nu] * u_c[0])
@@ -3095,6 +3156,9 @@ __global__ void gpu_first_rk_step_w_full_eos4d(
 
         float p_rhs = uprhs_in[c]
                     + (-(u_c[0] * pi_c) / tau_now + theta * pi_c) * dt;
+        if (params.cartesian)   // no -u^tau Pi/tau
+            p_rhs = __fadd_rn(uprhs_in[c],
+                              __fmul_rn(__fmul_rn(theta, pi_c), dt));
 
         float SPi = gpu_uPi_source_th(pi_c, theta, eps_src, Wsigma_scalar,
                                    th, params, dt);

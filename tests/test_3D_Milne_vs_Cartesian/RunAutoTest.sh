@@ -6,9 +6,9 @@
 # t = 0 with shear and bulk.  The two coordinate systems start on different
 # surfaces (t = t0, tau = tau0, about z^2/(2 tau0) apart inside the blob), so
 # their difference must fall like 1/tau0; compare.py checks that on the common
-# slice z = 0 = eta and for u^z at z = +-1 fm.  CPU path (the GPU kernels are
-# Milne only).  Run from the MUSIC directory, as the other tests: about 10
-# minutes on 20 cores.
+# slice z = 0 = eta and for u^z at z = +-1 fm.  CPU path (MUSIC_FORCE_CPU;
+# the GPU kernels in Cartesian coordinates: RunGPUTest.sh).  Run from the
+# MUSIC directory, as the other tests: about 10 minutes on 20 cores.
 set -e
 here=tests/test_3D_Milne_vs_Cartesian
 work=test_3D_Milne_vs_Cartesian_runs

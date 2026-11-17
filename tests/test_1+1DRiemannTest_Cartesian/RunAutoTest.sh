@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# CPU references (sums to 1e-8): a CUDA build would run the viscous tubes on
+# the GPU (Cartesian kernels, B2), which differs in float32 at the shock
+export MUSIC_FORCE_CPU=1
+
 ./MUSIChydro tests/test_1+1DRiemannTest_Cartesian/music_input_1+1DRiemannTest_z
 
 python3 tests/test_1+1DRiemannTest_Cartesian/TestOutputFiles.py

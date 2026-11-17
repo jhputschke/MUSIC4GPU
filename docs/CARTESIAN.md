@@ -1,10 +1,11 @@
 # Cartesian coordinates (CoorType 1)
 
-Status: November 2026, branch `trackB` (`bqs_gpu` + `cartesian_guards`).
-Track B of the "Cartesian MUSIC on GPU" plan: a Cartesian hydro for running
-next to SMASH at low beam energies. This file covers step B1, the CPU
-reference. The GPU kernels are Milne only: `gpu_features_supported()` sends
-`CoorType 1` to the CPU path until step B2.
+Status: November 2026, branch `trackB` (`bqs_gpu` + `cartesian_guards` +
+`active_region`). Track B of the "Cartesian MUSIC on GPU" plan: a Cartesian
+hydro for running next to SMASH at low beam energies. This file covers step
+B1, the CPU reference, and step B2, Cartesian coordinates in the CUDA
+kernels. Metal stays Milne only: there `gpu_features_supported()` sends
+`CoorType 1` to the CPU path.
 
 ## What changed (B1)
 
@@ -74,9 +75,82 @@ maximum):
 same way.) u^z is zero on z = 0 in both (1e-13); at z = +-1 fm its
 difference falls from 0.15 (tau0 = 20) to 0.036 (80).
 
-## Not done in B1
+## Cartesian coordinates in the CUDA kernels (B2)
+
+One flag, `MUSICGridParams::cartesian` (in the CUDA-only tail of the
+struct), and the host settings of `Advance::make_gpu_params` do most of it,
+as `tauRkFactor`/`tauNextFactor` do on the CPU:
+
+| Host setting (CoorType 1) | Effect in the kernels |
+|---|---|
+| `tau = tau_orig = 1` | conserved variables, fluxes, reconstruction and the RK combination without tau weights; the z spacing `delta_eta*tau` becomes `delta_eta`; `1/tau` in the z signal speed becomes 1 |
+| `cosh_deta = 1/delta_eta`, `sinh_deta = 0` | the cosh/sinh form of the eta flux of T^{0 alpha}, T^{3 alpha}, W, Pi becomes the plain flux difference |
+
+and the kernels drop the terms that are geometric, not a tau weight:
+
+| Kernel | Term dropped where `cartesian` is set |
+|---|---|
+| `gpu_make_w_source`, `_tiled` | "+ W", "+ Pi" from partial_tau (tau W^{tau alpha}) |
+| `gpu_finalize_ideal`, `_eos4d` | tau_next = 1 (tauNextFactor) |
+| `gpu_make_du` | u^tau/tau in theta; the Christoffel terms of sigma^{mu nu} |
+| `gpu_uWRHS_geom` (both `w_full` kernels) | the Christoffel terms ~ u^3/tau; - u^tau W/tau |
+| `gpu_first_rk_step_w_full`, `_eos4d` | - u^tau Pi/tau |
+| `gpu_first_rk_step_w_full_eos4d` (baryon diffusion) | - q u^tau/tau and the Delta^{a tau}, Delta^{a eta} terms |
+
+`gpu_features_supported()` lets `CoorType 1` through on CUDA. The source
+pre-fill already used `tauRkFactor`, so jet and droplet sources need nothing.
+
+**Milne stays bit-identical**, and that needs care. The first version put
+the Milne and Cartesian expressions in the two arms of a branch; the Milne
+output then changed in the last bits (seed-42 SMASH-IC event: 633 instead of
+638 hadrons, the freeze-out surface identical to its printed precision).
+Arithmetic shared by both arms (e.g. `theta*pi_c`) is computed once, in a
+block of its own, and the Milne addition that used to be fused with it into
+one FMA is not any more. Now every Milne expression is computed exactly as
+before, unconditionally, and the Cartesian value overrides it afterwards,
+written with the `_rn` intrinsics (`__fmul_rn`, `__fadd_rn`, ...), which the
+compiler never contracts and never merges with ordinary arithmetic. Checked:
+standalone Milne runs with the 1D EOS, with NEOS-4D, and with NEOS-4D and
+baryon diffusion, byte-identical state dumps against `c0841df`; the staged
+Milne SMASH-IC event (seed 42) byte-identical in its hadrons to the run
+before B2. The rule for later edits: no Cartesian arithmetic in a branch
+around Milne arithmetic; override afterwards, with intrinsics.
+
+**Tests.** `tests/test_3D_Milne_vs_Cartesian/RunGPUTest.sh` (CUDA builds,
+half a minute): the viscous blob of the 3D test on the GPU. The limits sit
+between the correct kernels and three planted errors (the table in
+`gpu_check.py`):
+
+| Check | Correct | Christoffel terms left in sigma | u^tau/tau left in theta | - u^tau Pi/tau left |
+|---|---|---|---|---|
+| GPU t0 = 0 against t0 = 20 (nothing may depend on t) | bit-identical | bit-identical | bit-identical | bit-identical |
+| x <-> z mirror symmetry after 3 fm/c (sigma_x = sigma_z): e | 3.2e-4 | 1.5e-2 | 1.6e-1 | 3.3e-4 |
+| same, pi^xy against pi^yz | 3.1e-3 | 7.1e-1 | 6.1e-1 | 3.1e-3 |
+| GPU against CPU after 10 steps, core: u^tau | 1.7e-6 | 1.8e-6 | 1.0e-3 | 1.7e-6 |
+| same, Pi | 1.1e-2 | 1.1e-2 | 1.4e+1 | 6.9e-2 |
+
+The x <-> z residual of the correct kernels is the W^{zz} rebuild (the CPU
+shows the same, 2.5e-2 in pi^xx/pi^zz). GPU against CPU in Cartesian
+coordinates differs as much as in Milne coordinates. Blob after 3 fm/c: e
+2.7e-2 (Milne 2.5e-2) of the maximum, in the expanding shell. Viscous shock
+tube, x: e 0.54 % (Milne at tau0 = 100: 0.54 %), theta 2.8 % (5.1 %), pi
+2.7 % (2.9 %); x and z show the same offset. So the viscous shock tubes do not
+reproduce their CPU reference sums on the GPU (`TestOutputVisFiles.py` asks
+for 1e-8); they are CPU tests (`MUSIC_FORCE_CPU=1`).
+
+**Speed.** Blob, 81^3 cells, 150 steps, shear + bulk + second order: GPU
+(GB10) 3.75 s, CPU (20 threads) 31 s.
+
+Not on the GPU, in either coordinate system: ideal hydro
+(`Viscosity_Flag_Yes_1_No_0 0`) and the vorticity term of the shear
+equation (`Include_vorticity_terms 1` is ignored by the kernels).
+
+## Not done
 
 - Upstream confirmation of the guards (MUSIC-fluid/MUSIC branch `XSCAPE`,
   `cee9460`, where the same lines sit at the same line numbers).
-- `Make_uWRHS_geom` serves the GPU path only (B2).
 - Transporting W^{zz} directly in Cartesian mode (see above).
+- Cartesian on Metal.
+- The Cartesian diffusion terms on the GPU are checked only for Milne
+  bit-identity; the blob has no baryon density. The SMASH runs of Track B
+  (B3/B4, NEOS-4D with B, Q, S) are the test with charges.

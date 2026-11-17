@@ -130,6 +130,11 @@ struct MUSICGridParams {
     // in the struct (Metal's copy ends before).
     const unsigned char* active_blk;
     int act_bz, act_gx, act_gy;
+    // B2, Cartesian coordinates (CoorType 1, CUDA only): the host sets tau =
+    // tau_orig = 1 (the CPU's tauRkFactor / tauNextFactor), cosh_deta =
+    // 1/delta_eta and sinh_deta = 0 (a plain flux in z), and the kernels drop
+    // the Christoffel and u^tau/tau terms where this flag is set
+    int cartesian;
 #endif
 };
 

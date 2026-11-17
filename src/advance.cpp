@@ -496,6 +496,15 @@ void Advance::make_gpu_params(double tau, int rk_flag,
         p.cosh_deta = static_cast<float>(cd);
         p.sinh_deta = static_cast<float>(std::max(0.5, sd));
     }
+
+    // Cartesian (CoorType 1, CUDA): no tau weights, a plain flux in z
+    p.cartesian = (DATA.CoorType == 1) ? 1 : 0;
+    if (p.cartesian) {
+        p.tau       = 1.f;
+        p.tau_orig  = 1.f;
+        p.cosh_deta = static_cast<float>(1. / de);
+        p.sinh_deta = 0.f;
+    }
 }
 
 void Advance::swap_curr_future_gpu() {
@@ -816,9 +825,13 @@ bool Advance::eos4d_on_gpu() const {
 }
 
 bool Advance::gpu_features_supported() const {
-    // The kernels implement Milne coordinates only (tau factors and the
-    // geometric terms are built in); CoorType 1 (Cartesian) runs on the CPU.
+    // Milne (CoorType 0) everywhere; Cartesian (CoorType 1) on CUDA only
+    // (MUSICGridParams::cartesian), Metal keeps it on the CPU.
+#if defined(USE_CUDA)
+    if (DATA.CoorType != 0 && DATA.CoorType != 1) return false;
+#else
     if (DATA.CoorType != 0)               return false;
+#endif
     const bool eos4d = eos4d_on_gpu();
     if (DATA.viscosity_flag != 1)         return false;
     // baryon diffusion: with the 4D EOS (CUDA), without the vorticity terms
