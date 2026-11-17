@@ -30,7 +30,8 @@ __global__ void gpu_make_w_source_tiled(
     const float* __restrict__ pi_b_prev,
     const float* __restrict__ u_prev,
     float* __restrict__ dwmn_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_delta_qi(
     const float* __restrict__ epsilon_curr,
@@ -40,7 +41,8 @@ __global__ void gpu_make_delta_qi(
     const float* __restrict__ eos_dPde,
     float* __restrict__ qi_out,
     MUSICGridParams params,
-    GPUEosParams eos_p);
+    GPUEosParams eos_p,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_finalize_ideal(
     const float* __restrict__ qi_buf,
@@ -57,7 +59,8 @@ __global__ void gpu_finalize_ideal(
     const float* __restrict__ eos_dPde,
     MUSICGridParams params,
     GPUEosParams eos_p,
-    const float* __restrict__ qi_source_in);
+    const float* __restrict__ qi_source_in,
+    const unsigned char* __restrict__ active_blk);
 
 // the ideal step with the NEOS-4D EOS and the B, Q, S densities
 // (params.eos4d == 1, params.n_alpha = 5 or 7)
@@ -99,13 +102,15 @@ __global__ void gpu_make_uwrhs(
     const float* __restrict__ Wmunu_curr,
     const float* __restrict__ u_curr,
     float* __restrict__ uwrhs_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_uprhs(
     const float* __restrict__ pi_b_curr,
     const float* __restrict__ u_curr,
     float* __restrict__ uprhs_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_make_du(
     const float* __restrict__ u_curr,
@@ -113,7 +118,8 @@ __global__ void gpu_make_du(
     float* __restrict__ theta_out,
     float* __restrict__ a_out,
     float* __restrict__ sigma_out,
-    MUSICGridParams params);
+    MUSICGridParams params,
+    const unsigned char* __restrict__ active_blk);
 
 __global__ void gpu_first_rk_step_w_full(
     const float* __restrict__ Wmunu_curr,
@@ -139,7 +145,8 @@ __global__ void gpu_first_rk_step_w_full(
     MUSICGridParams params,
     GPUEosParams eos_p,
     const float* __restrict__ epsilon_future,
-    const float* __restrict__ rhob_future);
+    const float* __restrict__ rhob_future,
+    const unsigned char* __restrict__ active_blk);
 
 // gpu_first_rk_step_w_full with the NEOS-4D thermodynamics (params.eos4d)
 __global__ void gpu_first_rk_step_w_full_eos4d(
@@ -273,3 +280,31 @@ __global__ void gpu_make_uwrhs_q(
     const float* __restrict__ u_curr,
     float* __restrict__ uwrhs_q_out,
     MUSICGridParams params);
+
+// The five field arrays of one GPUSnapshot, passed to a kernel by value.
+struct GPUSnapPtrs {
+    float* epsilon;
+    float* rhob;
+    float* u;
+    float* Wmunu;
+    float* pi_b;
+    float* rhoq;      // null unless Q and S are on the device (with_qs)
+    float* rhos;
+};
+
+// C3, the active region (see music_kernels.cu): flag the blocks within `halo`
+// cells of an active cell, and freeze the cells of blocks that turned inactive.
+__global__ void gpu_active_mark(
+    const float* __restrict__ epsilon,
+    const float* __restrict__ qi_source,
+    float eps_act, int halo,
+    int Nx, int Ny, int Neta,
+    int bx, int by, int bz, int gx, int gy,
+    unsigned char* __restrict__ active_blk);
+
+__global__ void gpu_active_freeze(
+    const unsigned char* __restrict__ old_blk,
+    const unsigned char* __restrict__ new_blk,
+    int Nx, int Ny, int Neta,
+    int bx, int by, int bz, int gx, int gy,
+    GPUSnapPtrs curr, GPUSnapPtrs prev, GPUSnapPtrs future);

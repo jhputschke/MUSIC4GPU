@@ -36,6 +36,17 @@ inline int clamped_cell(int ix, int iy, int ieta,
     return cell_idx(ix, iy, ieta, Nx, Ny);
 }
 
+// C3, the active region (opt-in, active_region_eps > 0): the step kernels run
+// on 8 x 8 x 4 threadgroups, and with active_on a threadgroup whose flag in
+// active_blk is 0 holds only frozen vacuum cells and returns before it reads
+// or writes anything (gpu_active_mark sets the flags).  active_on == 0 (the
+// default): every threadgroup runs, active_blk is a dummy binding.
+inline bool gpu_block_inactive(device const uchar* active_blk, uint active_on,
+                               uint3 tgp, uint3 ntg) {
+    return active_on != 0u
+        && active_blk[tgp.x + ntg.x * (tgp.y + ntg.y * tgp.z)] == 0;
+}
+
 // Read Wmunu[comp] for a cell (with boundary clamping)
 inline float get_Wmunu(device const float* Wmunu, int comp,
                        int ix, int iy, int ieta,
@@ -70,6 +81,7 @@ inline float get_pi_b(device const float* pi_b,
 //   5  u_prev     [4*Ncells]
 //   6  dwmn_out   [5*Ncells]
 //   7  params
+//   8  active_blk, 9 active_on (C3; as in every step kernel)
 
 kernel void gpu_make_w_source(
     device const float*       Wmunu_curr [[buffer(0)]],
@@ -80,8 +92,13 @@ kernel void gpu_make_w_source(
     device const float*       u_prev     [[buffer(5)]],
     device       float*       dwmn_out   [[buffer(6)]],
     constant MUSICGridParams& params     [[buffer(7)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(8)]],
+    constant uint&            active_on  [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -818,8 +835,13 @@ kernel void gpu_make_delta_qi(
     device       float*       qi_out       [[buffer(5)]],
     constant MUSICGridParams& params       [[buffer(6)]],
     constant GPUEosParams&    eos_p        [[buffer(7)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(8)]],
+    constant uint&            active_on  [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -987,8 +1009,13 @@ kernel void gpu_finalize_ideal(
     constant MUSICGridParams& params        [[buffer(12)]],
     constant GPUEosParams&    eos_p         [[buffer(13)]],
     device const float*       qi_source_in  [[buffer(14)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(15)]],
+    constant uint&            active_on  [[buffer(16)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -1082,8 +1109,13 @@ kernel void gpu_make_uwrhs(
     device const float*       u_curr       [[buffer(1)]],
     device       float*       uwrhs_out    [[buffer(2)]],
     constant MUSICGridParams& params       [[buffer(3)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(4)]],
+    constant uint&            active_on  [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -1209,8 +1241,13 @@ kernel void gpu_make_uprhs(
     device const float*       u_curr     [[buffer(1)]],
     device       float*       uprhs_out  [[buffer(2)]],
     constant MUSICGridParams& params     [[buffer(3)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(4)]],
+    constant uint&            active_on  [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -1341,8 +1378,13 @@ kernel void gpu_make_du(
     device       float*       a_out      [[buffer(3)]],
     device       float*       sigma_out  [[buffer(4)]],
     constant MUSICGridParams& params     [[buffer(5)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(6)]],
+    constant uint&            active_on  [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -1986,8 +2028,13 @@ kernel void gpu_first_rk_step_w_full(
     device const float*       rhob_future    [[buffer(23)]],
     // cell updates with a non-finite W^{mu nu} or Pi set to 0 (see below)
     device atomic_uint*       nonfinite_count [[buffer(24)]],
-    uint3 gid [[thread_position_in_grid]])
+    device const uchar*       active_blk [[buffer(25)]],
+    constant uint&            active_on  [[buffer(26)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]])
 {
+    if (gpu_block_inactive(active_blk, active_on, tgp, ntg)) return;
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
     int ieta = (int)gid.z;
@@ -2292,4 +2339,88 @@ kernel void gpu_pack_evolution_ideal(
     cell[5] = u[1 * Ncells + c];
     cell[6] = u[2 * Ncells + c];
     cell[7] = u[3 * Ncells + c];
+}
+
+// ── C3: build the active region ───────────────────────────────────────────────
+//
+// gpu_active_mark: one thread per cell.  A cell is active if e > eps_act
+// (ap.use_eps; NaN counts as active) or if any of its 5 source components is
+// non-zero (ap.use_src).  An active cell sets the flag of every block that
+// holds a cell within ap.halo cells of it.  The stores race only with stores
+// of the same value.  Port of the CUDA gpu_active_mark.
+kernel void gpu_active_mark(
+    device const float*       epsilon    [[buffer(0)]],
+    device const float*       qi_source  [[buffer(1)]],
+    device       uchar*       active_blk [[buffer(2)]],
+    constant GPUActiveParams& ap         [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int Ncells = ap.Nx * ap.Ny * ap.Neta;
+    const int c = (int)gid;
+    if (c >= Ncells) return;
+    bool act = false;
+    if (ap.use_eps != 0) act = !(epsilon[c] <= ap.eps_act);
+    if (!act && ap.use_src != 0) {
+        for (int a = 0; a < 5; ++a) act = act || (qi_source[a * Ncells + c] != 0.f);
+    }
+    if (!act) return;
+    const int ix   = c % ap.Nx;
+    const int iy   = (c / ap.Nx) % ap.Ny;
+    const int ieta = c / (ap.Nx * ap.Ny);
+    const int h = ap.halo;
+    const int x0 = max(ix - h, 0) / ap.bx,   x1 = min(ix + h, ap.Nx - 1) / ap.bx;
+    const int y0 = max(iy - h, 0) / ap.by,   y1 = min(iy + h, ap.Ny - 1) / ap.by;
+    const int z0 = max(ieta - h, 0) / ap.bz, z1 = min(ieta + h, ap.Neta - 1) / ap.bz;
+    for (int z = z0; z <= z1; ++z)
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x)
+                active_blk[x + ap.gx * (y + ap.gy * z)] = 1;
+}
+
+// gpu_active_freeze: one thread per cell.  A cell whose block was active
+// (old_blk) and is not any more (new_blk) is frozen: snap_curr's fields are
+// copied into snap_prev and snap_future, so that the three buffers agree and
+// the snapshot rotations leave the cell where it is.  Port of the CUDA
+// gpu_active_freeze.
+kernel void gpu_active_freeze(
+    device const uchar*       old_blk  [[buffer(0)]],
+    device const uchar*       new_blk  [[buffer(1)]],
+    device const float*       e_curr   [[buffer(2)]],
+    device const float*       r_curr   [[buffer(3)]],
+    device const float*       u_curr   [[buffer(4)]],
+    device const float*       w_curr   [[buffer(5)]],
+    device const float*       p_curr   [[buffer(6)]],
+    device       float*       e_prev   [[buffer(7)]],
+    device       float*       r_prev   [[buffer(8)]],
+    device       float*       u_prev   [[buffer(9)]],
+    device       float*       w_prev   [[buffer(10)]],
+    device       float*       p_prev   [[buffer(11)]],
+    device       float*       e_fut    [[buffer(12)]],
+    device       float*       r_fut    [[buffer(13)]],
+    device       float*       u_fut    [[buffer(14)]],
+    device       float*       w_fut    [[buffer(15)]],
+    device       float*       p_fut    [[buffer(16)]],
+    constant GPUActiveParams& ap       [[buffer(17)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int Ncells = ap.Nx * ap.Ny * ap.Neta;
+    const int c = (int)gid;
+    if (c >= Ncells) return;
+    const int ix   = c % ap.Nx;
+    const int iy   = (c / ap.Nx) % ap.Ny;
+    const int ieta = c / (ap.Nx * ap.Ny);
+    const int b = ix / ap.bx + ap.gx * (iy / ap.by + ap.gy * (ieta / ap.bz));
+    if (old_blk[b] == 0 || new_blk[b] != 0) return;
+    const float e = e_curr[c], r = r_curr[c], p = p_curr[c];
+    e_prev[c] = e;  e_fut[c] = e;
+    r_prev[c] = r;  r_fut[c] = r;
+    p_prev[c] = p;  p_fut[c] = p;
+    for (int m = 0; m < 4; ++m) {
+        const float v = u_curr[m * Ncells + c];
+        u_prev[m * Ncells + c] = v;  u_fut[m * Ncells + c] = v;
+    }
+    for (int m = 0; m < 14; ++m) {
+        const float v = w_curr[m * Ncells + c];
+        w_prev[m * Ncells + c] = v;  w_fut[m * Ncells + c] = v;
+    }
 }

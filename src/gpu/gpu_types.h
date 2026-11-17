@@ -122,6 +122,15 @@ struct MUSICGridParams {
     float kappa_coefficient;       // DATA.kappa_coefficient (C_B)
     float delta_qq_coeff;          // TransportCoeffs::get_delta_qq_coeff()
     float lambda_qq_coeff;         // TransportCoeffs::get_lambda_qq_coeff()
+#ifndef __METAL_VERSION__
+    // C3, the active region, for the kernels that check it per cell (the
+    // NEOS-4D and diffusion kernels; the others take the flags as an
+    // argument): the flag of the 8 x 8 x act_bz block of a cell, act_gx x
+    // act_gy blocks per eta layer; null = the whole grid.  CUDA only, last
+    // in the struct (Metal's copy ends before).
+    const unsigned char* active_blk;
+    int act_bz, act_gx, act_gy;
+#endif
 };
 
 // EOS table sampled on a uniform grid: P(e) and dP/de(e) at rhob=0.
@@ -190,6 +199,26 @@ struct GPUPackParams {
     float hbarc;           // Util::hbarc (GeV*fm), applied to e/p/T
     int   eos4d;           // 1: P, s, T from the NEOS-4D lookup with the charges
     int   with_qs;         // rhoq / rhos are on the device
+};
+
+// C3, the active region (Metal): the parameters of gpu_active_mark and
+// gpu_active_freeze (the CUDA kernels take them as arguments).  Blocks of
+// bx x by x bz cells, gx x gy blocks per eta layer.  gpu_active_mark flags the
+// blocks within `halo` cells of a cell with e > eps_act (use_eps) or with a
+// non-zero source component (use_src).
+struct GPUActiveParams {
+    float eps_act;
+    int   halo;
+    int   use_eps;
+    int   use_src;
+    int   Nx;
+    int   Ny;
+    int   Neta;
+    int   bx;
+    int   by;
+    int   bz;
+    int   gx;
+    int   gy;
 };
 
 // Wmunu 2D->1D index table (same as Util::map_2d_idx_to_1d)
