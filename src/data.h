@@ -107,6 +107,14 @@ typedef struct init_data {
     //! unregulated in that cell (fast, dilute cells, where the float
     //! invariant drowns in the cancellation of W's components).
     int quest_revert_as_cpu = 0;
+    //! C3, the active region (GPU, CUDA; opt-in): with active_region_eps > 0
+    //! [GeV/fm^3] the GPU evolves only the 8 x 8 x 4 blocks within
+    //! active_region_halo cells of a cell with e > active_region_eps or with
+    //! a source term; the other cells stay frozen.  The region is rebuilt every
+    //! active_region_dtau [fm/c].  0 (the default): the whole grid.
+    double active_region_eps;
+    int    active_region_halo;
+    double active_region_dtau;
     double dtaudxRatio;
 
     bool resetDtau;

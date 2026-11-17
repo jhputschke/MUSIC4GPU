@@ -146,6 +146,26 @@ struct GPUPackParams {
     float hbarc;           // Util::hbarc (GeV*fm), applied to e/p/T
 };
 
+// C3, the active region (Metal): the parameters of gpu_active_mark and
+// gpu_active_freeze (the CUDA kernels take them as arguments).  Blocks of
+// bx x by x bz cells, gx x gy blocks per eta layer.  gpu_active_mark flags the
+// blocks within `halo` cells of a cell with e > eps_act (use_eps) or with a
+// non-zero source component (use_src).
+struct GPUActiveParams {
+    float eps_act;
+    int   halo;
+    int   use_eps;
+    int   use_src;
+    int   Nx;
+    int   Ny;
+    int   Neta;
+    int   bx;
+    int   by;
+    int   bz;
+    int   gx;
+    int   gy;
+};
+
 // Wmunu 2D->1D index table (same as Util::map_2d_idx_to_1d)
 // Use as: WMUNU_IDX[alpha][direction]  for alpha in [0,4], direction in [0,3]
 #ifdef __METAL_VERSION__

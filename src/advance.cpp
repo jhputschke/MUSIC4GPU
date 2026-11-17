@@ -323,6 +323,94 @@ unsigned int Advance::nonfinite_count_gpu() {
     return GPUPipelines::instance().read_and_reset_nonfinite();
 }
 
+// ── C3: the active region (opt-in) ──────────────────────────────────────────
+//
+// DATA.active_region_eps > 0 [GeV/fm^3]: the GPU evolves only the 8 x 8 x 4
+// blocks within active_region_halo cells of a cell with e > active_region_eps
+// or with a source term this substep.  The cells of the other blocks are
+// frozen: they keep their values, the same in snap_prev, snap_curr and
+// snap_future, so the pointer rotations leave them where they are; their
+// neighbours read them through the stencils as before.  The region is rebuilt
+// at the first substep of a step every active_region_dtau fm/c, and after any
+// upload from the host or checkpoint restore every block is active until the
+// next rebuild.  Not bit-identical to the whole grid, through the vacuum
+// cells only (the whole grid evolves them with fluxes at the 1e-12 level).
+//   MUSIC_ACTIVE_REGION_ALL=1  every block active at every rebuild (the
+//       8 x 8 x 4 blocks and the freezing machinery, for validation: equal
+//       to the whole-grid run)
+//   MUSIC_ACTIVE_REGION_LOG=1  one line per rebuild
+static bool env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
+void Advance::active_region_step(double tau, int rk_flag, bool uploaded) {
+    auto& mp = GPUPipelines::instance();
+    gpu_grid_.active_on = false;
+    if (DATA.active_region_eps <= 0. || active_failed_) return;
+    static const bool log = env_flag("MUSIC_ACTIVE_REGION_LOG");
+    if (uploaded || !active_valid_) {
+        active_region_tally(log);   // the last rebuild, before the reset drops it
+        if (!mp.active_region_reset(gpu_grid_)) {
+            music_message << "[MUSIC-GPU] active region (active_region_eps) is "
+                             "not available on this back-end: the whole grid "
+                             "is evolved.";
+            music_message.flush("warning");
+            active_failed_ = true;
+            return;
+        }
+        active_valid_    = true;
+        active_next_tau_ = -1e30;   // rebuild at the next first substep
+    }
+    gpu_grid_.active_on = true;
+    if (rk_flag != 0 || tau < active_next_tau_ - 1e-9) return;
+    static const bool all = env_flag("MUSIC_ACTIVE_REGION_ALL");
+    const float eps_act = all ? -3.4e38f
+                              : static_cast<float>(DATA.active_region_eps/Util::hbarc);
+    // the stream has synchronized since the last rebuild (every substep
+    // ends with wait()): count its flags before they are overwritten
+    active_region_tally(log);
+    bench::Timer _bt("advance.active_region_rebuild");
+    mp.active_region_rebuild(gpu_grid_, eps_act, DATA.active_region_halo);
+    active_pending_tau_ = tau;
+    active_next_tau_ = tau + DATA.active_region_dtau;
+}
+
+void Advance::active_region_tally(bool log) {
+    const int n = GPUPipelines::instance().active_region_count(gpu_grid_);
+    if (n < 0 || gpu_grid_.active_nblk <= 0) return;
+    const double frac = static_cast<double>(n)/gpu_grid_.active_nblk;
+    active_rebuilds_++;
+    active_frac_sum_ += frac;
+    active_frac_min_ = std::min(active_frac_min_, frac);
+    active_frac_max_ = std::max(active_frac_max_, frac);
+    if (log) {
+        music_message << "[MUSIC-GPU] active region at tau = " << active_pending_tau_
+                      << " fm/c: " << n << " of " << gpu_grid_.active_nblk
+                      << " blocks (" << 100.*frac << " %)";
+        music_message.flush("info");
+    }
+}
+
+void Advance::active_region_report() {
+    // called after the end-of-run sync: the last rebuild's copy is complete
+    if (gpu_ready_) active_region_tally(env_flag("MUSIC_ACTIVE_REGION_LOG"));
+    if (active_rebuilds_ > 0) {
+        music_message << "GPU active region (active_region_eps = "
+                      << DATA.active_region_eps << " GeV/fm^3, halo "
+                      << DATA.active_region_halo << "): "
+                      << 100.*active_frac_sum_/active_rebuilds_
+                      << " % of the blocks on average over " << active_rebuilds_
+                      << " rebuilds (min " << 100.*active_frac_min_ << " %, max "
+                      << 100.*active_frac_max_ << " %)";
+        music_message.flush("info");
+    }
+    active_rebuilds_ = 0;
+    active_frac_sum_ = 0.;
+    active_frac_min_ = 1.;
+    active_frac_max_ = 0.;
+}
+
 void Advance::reduce_max_gpu(double& eps_max, double& rhob_max) {
     if (!gpu_owns_state_ || !gpu_ready_) { eps_max = rhob_max = 0.0; return; }
     GPUPipelines::instance().reduce_max(gpu_grid_, eps_max, rhob_max);
@@ -339,6 +427,10 @@ size_t Advance::gpu_state_floats() const {
 
 void* Advance::save_gpu_state() {
     if (!gpu_owns_state_ || !gpu_ready_) return nullptr;
+    // C3: rebuild the active region at the next step, as a run restored from
+    // this state does (restore_gpu_state), so that both evolve the same blocks
+    // from here on (the checkpoint, and MUSIC_RESTART_VERIFY's comparison)
+    active_next_tau_ = -1e30;
     auto& mp = GPUPipelines::instance();
     void* state = mp.alloc_state(gpu_state_floats());
     if (state && !mp.save_snapshots(gpu_grid_, state)) {
@@ -362,6 +454,7 @@ bool Advance::restore_gpu_state(const void* state, Fields &arenaFieldsCurr) {
     host_prev_fresh_ = false;
     prev_fresh_buf_  = nullptr;
     curr_synced_buf_ = nullptr;
+    active_valid_    = false;   // C3: every block active until the next rebuild
     mp.read_and_reset_nonfinite();
     return true;
 }
@@ -794,7 +887,8 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     // truncation of every cell every step.  Without it, eps_max drifts
     // ~1e-2 over 100 steps; with it, drift stays at the kernel's
     // intrinsic single-precision noise level (~1e-4).
-    if (!gpu_state_authoritative_ && !gpu_owns_state_) {
+    const bool uploaded = !gpu_state_authoritative_ && !gpu_owns_state_;
+    if (uploaded) {
         gpu_grid_.copy_to_gpu(arenaFieldsCurr, gpu_grid_.snap_curr);
         if (rk_flag > 0) {
             gpu_grid_.copy_to_gpu(arenaFieldsPrev, gpu_grid_.snap_prev);
@@ -818,6 +912,9 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
     MUSICGridParams p;
     make_gpu_params(tau, rk_flag, p);
 
+    // C3 (opt-in): the region the step kernels evolve
+    active_region_step(tau, rk_flag, uploaded);
+
     // Hydro source pre-pass (energy + momentum, plus rhob if turn_on_rhob).
     // turn_on_QS == 1 is rejected upstream in gpu_features_supported(), so we
     // only need to evaluate energy + baryon channels here.
@@ -839,6 +936,11 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
                                     with_main, with_jets);
         p.has_hydro_source = 1;
         p.has_rhob_source  = (DATA.turn_on_rhob == 1) ? 1 : 0;
+        // C3: the cells a source deposits in are evolved this substep
+        if (gpu_grid_.active_on) {
+            GPUPipelines::instance().active_region_add_sources(
+                gpu_grid_, DATA.active_region_halo);
+        }
     } else {
         p.has_hydro_source = 0;
         p.has_rhob_source  = 0;

@@ -108,6 +108,26 @@ public:
     // called under a USE_CUDA guard in advance.cpp).
     void upload_snapshots_async(GPUGrid& gpu);
 
+    // C3, the active region (opt-in; MUSIC's active_region_eps > 0).  With
+    // gpu.active_on the seven step kernels run on 8 x 8 x bz blocks and skip
+    // the blocks whose flag in gpu.active_blk is 0: the cells there are frozen
+    // (the same values in snap_prev, snap_curr and snap_future).
+    //   active_region_reset: allocate the flags if needed, every block active.
+    //   active_region_rebuild: flag the blocks within `halo` cells of a cell
+    //       of snap_curr with e > eps_act [1/fm^4], freeze the cells of the
+    //       blocks that were active and are not any more.  Call it at a step
+    //       boundary.  Does not synchronize: the new flags are copied to
+    //       pinned host memory on the stream.
+    //   active_region_count: the number of active blocks of the last rebuild
+    //       (-1 if none is pending); call it only after the stream has
+    //       synchronized since that rebuild.
+    //   active_region_add_sources: also flag the blocks within `halo` cells
+    //       of a cell with a non-zero qi_source_buf (after the source fill).
+    bool active_region_reset(GPUGrid& gpu);
+    void active_region_rebuild(GPUGrid& gpu, float eps_act, int halo);
+    int  active_region_count(GPUGrid& gpu);
+    void active_region_add_sources(GPUGrid& gpu, int halo);
+
 private:
     CUDAPipelines() = default;
     ~CUDAPipelines();
