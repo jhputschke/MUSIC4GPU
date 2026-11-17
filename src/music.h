@@ -111,6 +111,12 @@ class MUSIC {
         for (int k = 0; k < 4; k++) out[k] = 0.;
         if (evolve_ptr_) evolve_ptr_->fluid_totals(out);
     }
+    //! what the sources deposited in this run, all and into cells below the
+    //! freeze-out density, E [GeV], B, Q, S; false if not measured
+    bool get_source_totals(double all[4], double below[4]) const {
+        for (int k = 0; k < 4; k++) all[k] = below[k] = 0.;
+        return evolve_ptr_ && evolve_ptr_->source_totals(all, below);
+    }
 
     //! this is a shell function to run Cooper-Frye
     int run_Cooper_Frye();

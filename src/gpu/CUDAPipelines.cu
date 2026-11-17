@@ -678,7 +678,10 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
     if (params.eos4d) {
         // the 4D kernels: the whole grid (no active region yet)
         compute_launch(gpu, max_block_threads_eos4d_, block, grid);
-        gpu_make_delta_qi_eos4d<<<grid, block, 0, stream>>>(
+        // symmetric fallback of the half-cell states: a kernel of its own,
+        // so that the other one stays the old code (Milne bit-identical)
+        (params.sym_fallback ? gpu_make_delta_qi_eos4d_sym
+                             : gpu_make_delta_qi_eos4d)<<<grid, block, 0, stream>>>(
             gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.rhoq,
             gpu.snap_curr.rhos, gpu.snap_curr.u, gpu.qi_out, params,
             gpu.eos4d_tab, gpu.eos4d_params);
@@ -686,7 +689,8 @@ void CUDAPipelines::dispatch_delta_qi(GPUGrid& gpu, const MUSICGridParams& param
         return;
     }
     const unsigned char* ab = step_launch(gpu, max_block_threads_, block, grid);
-    gpu_make_delta_qi<<<grid, block, 0, stream>>>(
+    (params.sym_fallback ? gpu_make_delta_qi_sym
+                         : gpu_make_delta_qi)<<<grid, block, 0, stream>>>(
         gpu.snap_curr.epsilon, gpu.snap_curr.rhob, gpu.snap_curr.u,
         gpu.eos_P, gpu.eos_dPde,
         gpu.qi_out, params, gpu.eos_params, ab);

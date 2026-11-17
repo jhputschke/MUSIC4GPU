@@ -666,6 +666,10 @@ InitData read_in_parameters(std::string input_file) {
     tempinput = Util::StringFind4(input_file, "drain_particlized_floor");
     if (tempinput != "empty") istringstream(tempinput) >> temp_drain_floor;
     parameter_list.drain_particlized_floor = temp_drain_floor;
+    int temp_sym_fallback = 1;
+    tempinput = Util::StringFind4(input_file, "symmetric_flux_fallback");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_sym_fallback;
+    parameter_list.symmetric_flux_fallback = temp_sym_fallback;
     // active_region_eps [GeV/fm^3], active_region_halo [cells],
     // active_region_dtau [fm/c]: C3, the GPU evolves only the region with
     // matter (0, the default: the whole grid).  See Advance::try_gpu_advance.
@@ -1096,6 +1100,8 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
         parameter_list.drain_particlized = static_cast<int>(value);
     if (parameter_name == "drain_particlized_floor")
         parameter_list.drain_particlized_floor = value;
+    if (parameter_name == "symmetric_flux_fallback")
+        parameter_list.symmetric_flux_fallback = static_cast<int>(value);
     if (parameter_name == "active_region_halo")
         parameter_list.active_region_halo = static_cast<int>(value);
     if (parameter_name == "active_region_dtau")

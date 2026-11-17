@@ -135,6 +135,9 @@ struct MUSICGridParams {
     // 1/delta_eta and sinh_deta = 0 (a plain flux in z), and the kernels drop
     // the Christoffel and u^tau/tau terms where this flag is set
     int cartesian;
+    // Cartesian, symmetric_flux_fallback: a half-cell state that cannot be
+    // reconstructed falls back to the cell on its side of the interface
+    int sym_fallback;
 #endif
 };
 

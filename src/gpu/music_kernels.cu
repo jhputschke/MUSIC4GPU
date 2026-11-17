@@ -1182,6 +1182,7 @@ DFI void gpu_cell_qi_4d(int c, int Ncells, int na, float tau,
 }
 
 // gpu_make_delta_qi for the 4D EOS
+template <bool SYM>
 __device__ void gpu_make_delta_qi_4d(
     int ix, int iy, int ieta,
     const float* __restrict__ epsilon_curr,
@@ -1249,9 +1250,38 @@ __device__ void gpu_make_delta_qi_4d(
             qimhR[a] = gc     + fmhR;
         }
 
+        // A half-cell state that cannot be reconstructed falls back to a
+        // cell's state.  SYM = false (Milne, and Cartesian with
+        // symmetric_flux_fallback 0): to this cell's, for all four; cell i
+        // and cell i+1 then use different states for the same interface, and
+        // its flux out of the one is not its flux into the other.  In the
+        // SMASH-fed Cartesian runs (fast, dilute matter) that lost ~10 % of E
+        // and B.  SYM = true (gpu_make_delta_qi_eos4d_sym): the left state to
+        // the left cell, the right state to the right cell, the same from
+        // both sides (Advance::MakeDeltaQI on the CPU alike).  A template, so
+        // that the SYM = false code is the old one, bit for bit.
         const Reconst4D r_phL = gpu_reconst4d(tau, qiphL, na, u_c, e_c, rho_c, tab, p4);
-        const Reconst4D r_phR = gpu_reconst4d(tau, qiphR, na, u_c, e_c, rho_c, tab, p4);
-        const Reconst4D r_mhL = gpu_reconst4d(tau, qimhL, na, u_c, e_c, rho_c, tab, p4);
+        Reconst4D r_phR, r_mhL;
+        if constexpr (SYM) {
+            float u_p1[4], u_m1[4];
+            for (int m = 0; m < 4; m++) {
+                u_p1[m] = u_curr[m * Ncells + ip1];
+                u_m1[m] = u_curr[m * Ncells + im1];
+            }
+            const float rho_p1[3] = {rhob_curr[ip1],
+                                     (na > 5) ? rhoq_curr[ip1] : 0.f,
+                                     (na > 5) ? rhos_curr[ip1] : 0.f};
+            const float rho_m1[3] = {rhob_curr[im1],
+                                     (na > 5) ? rhoq_curr[im1] : 0.f,
+                                     (na > 5) ? rhos_curr[im1] : 0.f};
+            r_phR = gpu_reconst4d(tau, qiphR, na, u_p1, epsilon_curr[ip1],
+                                  rho_p1, tab, p4);
+            r_mhL = gpu_reconst4d(tau, qimhL, na, u_m1, epsilon_curr[im1],
+                                  rho_m1, tab, p4);
+        } else {
+            r_phR = gpu_reconst4d(tau, qiphR, na, u_c, e_c, rho_c, tab, p4);
+            r_mhL = gpu_reconst4d(tau, qimhL, na, u_c, e_c, rho_c, tab, p4);
+        }
         const Reconst4D r_mhR = gpu_reconst4d(tau, qimhR, na, u_c, e_c, rho_c, tab, p4);
 
         const float aiph = fmaxf(gpu_max_speed_4d(tau, direction, r_phL, tab, p4),
@@ -1386,7 +1416,29 @@ __global__ void gpu_make_delta_qi_eos4d(
     const int ieta = blockIdx.z * blockDim.z + threadIdx.z;
     if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
     if (gpu_cell_inactive(params, ix, iy, ieta)) return;   // C3
-    gpu_make_delta_qi_4d(ix, iy, ieta, epsilon_curr, rhob_curr, rhoq_curr,
+    gpu_make_delta_qi_4d<false>(ix, iy, ieta, epsilon_curr, rhob_curr, rhoq_curr,
+                         rhos_curr, u_curr, qi_out, params, eos4d_tab, eos4d_p);
+}
+
+// as gpu_make_delta_qi_eos4d, the failed half-cell states falling back to
+// the cell on their side of the interface (Cartesian, symmetric_flux_fallback)
+__global__ void gpu_make_delta_qi_eos4d_sym(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ rhoq_curr,
+    const float* __restrict__ rhos_curr,
+    const float* __restrict__ u_curr,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    const float* __restrict__ eos4d_tab,
+    GPUEos4DParams eos4d_p)
+{
+    const int ix   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int iy   = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ieta = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ix >= params.Nx || iy >= params.Ny || ieta >= params.Neta) return;
+    if (gpu_cell_inactive(params, ix, iy, ieta)) return;   // C3
+    gpu_make_delta_qi_4d<true>(ix, iy, ieta, epsilon_curr, rhob_curr, rhoq_curr,
                          rhos_curr, u_curr, qi_out, params, eos4d_tab, eos4d_p);
 }
 
@@ -1428,7 +1480,8 @@ __global__ void gpu_finalize_ideal_eos4d(
 
 // ── gpu_make_delta_qi kernel ──────────────────────────────────────────────────
 
-__global__ void gpu_make_delta_qi(
+template <bool SYM>
+__device__ __forceinline__ void gpu_make_delta_qi_body(
     const float* __restrict__ epsilon_curr,
     const float* __restrict__ rhob_curr,
     const float* __restrict__ u_curr,
@@ -1505,9 +1558,24 @@ __global__ void gpu_make_delta_qi(
             qimhR[alpha] = gc  + fmhR;
         }
 
+        // the fallback cell of a failed reconstruction: see
+        // gpu_make_delta_qi_4d (SYM: gpu_make_delta_qi_sym)
         ReconstResult r_phL = gpu_reconst(tau, qiphL, u_c, e_c, eos_P, eos_dPde, eos_p);
-        ReconstResult r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
-        ReconstResult r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        ReconstResult r_phR, r_mhL;
+        if constexpr (SYM) {
+            float u_p1[4], u_m1[4];
+            for (int m = 0; m < 4; m++) {
+                u_p1[m] = u_curr[m * Ncells + ip1];
+                u_m1[m] = u_curr[m * Ncells + im1];
+            }
+            r_phR = gpu_reconst(tau, qiphR, u_p1, epsilon_curr[ip1],
+                                eos_P, eos_dPde, eos_p);
+            r_mhL = gpu_reconst(tau, qimhL, u_m1, epsilon_curr[im1],
+                                eos_P, eos_dPde, eos_p);
+        } else {
+            r_phR = gpu_reconst(tau, qiphR, u_c, e_c, eos_P, eos_dPde, eos_p);
+            r_mhL = gpu_reconst(tau, qimhL, u_c, e_c, eos_P, eos_dPde, eos_p);
+        }
         ReconstResult r_mhR = gpu_reconst(tau, qimhR, u_c, e_c, eos_P, eos_dPde, eos_p);
 
         float aiph_L = gpu_max_speed(tau, direction, r_phL, eos_P, eos_dPde, eos_p);
@@ -1547,6 +1615,34 @@ __global__ void gpu_make_delta_qi(
 
     for (int alpha = 0; alpha < 5; alpha++)
         qi_out[alpha * Ncells + c] = qi[alpha] + rhs[alpha];
+}
+
+__global__ void gpu_make_delta_qi(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_dPde,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    GPUEosParams eos_p,
+    const unsigned char* __restrict__ active_blk)
+{
+    gpu_make_delta_qi_body<false>(epsilon_curr, rhob_curr, u_curr, eos_P, eos_dPde, qi_out, params, eos_p, active_blk);
+}
+
+__global__ void gpu_make_delta_qi_sym(
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ rhob_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_dPde,
+    float* __restrict__ qi_out,
+    MUSICGridParams params,
+    GPUEosParams eos_p,
+    const unsigned char* __restrict__ active_blk)
+{
+    gpu_make_delta_qi_body<true>(epsilon_curr, rhob_curr, u_curr, eos_P, eos_dPde, qi_out, params, eos_p, active_blk);
 }
 
 // ── gpu_finalize_ideal ────────────────────────────────────────────────────────

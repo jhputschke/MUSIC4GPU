@@ -81,6 +81,9 @@ static bool gpu_no_pack() {
 // thread wake-up — negligible for their coarse-grained loops.  See the X-SCAPE
 // README.md ("OpenMP defaults for GPU builds") and docs/PORT_GPU.md.
 extern "C" void kmp_set_blocktime(int) __attribute__((weak));
+#if defined(USE_CUDA)
+extern bool g_cuda_coherent;   // CUDAPipelines.cu: the snapshots host-readable
+#endif
 
 namespace {
 // True if OMP_WAIT_POLICY was already present in the environment at process
@@ -499,6 +502,7 @@ void Advance::make_gpu_params(double tau, int rk_flag,
 
     // Cartesian (CoorType 1, CUDA): no tau weights, a plain flux in z
     p.cartesian = (DATA.CoorType == 1) ? 1 : 0;
+    p.sym_fallback = (p.cartesian && DATA.symmetric_flux_fallback == 1) ? 1 : 0;
     if (p.cartesian) {
         p.tau       = 1.f;
         p.tau_orig  = 1.f;
@@ -1084,6 +1088,47 @@ void Advance::prefill_hydro_source_on_cpu(double tau, int rk_flag,
             src_check_.cells  += nonzero;
             src_check_.differ += differ;
         }
+    }
+    if (src_tally_eps_ > 0. && DATA.CoorType == 1) {
+        source_tally_fill(qb, N, ncomp);
+    }
+}
+
+//! the sources' books (set_source_tally): this half step's deposit, half of
+//! the step's (RK2 averages the two fills), from the buffer the kernels add
+void Advance::source_tally_fill(const float* qb, int N, int ncomp) {
+    const float* e = nullptr;
+#if defined(USE_CUDA)
+    if (g_cuda_coherent) e = gpu_grid_.snap_curr.epsilon;
+#endif
+    if (!e) {
+        src_tally_valid_ = false;
+        return;
+    }
+    const double dt  = DATA.delta_tau;
+    const double w   = 0.5*dt*DATA.delta_x*DATA.delta_y*DATA.delta_eta;
+    const double eps = src_tally_eps_;
+    const bool charges = (DATA.turn_on_rhob == 1);
+    const bool qs = (ncomp > 5);
+    double a0 = 0., a1 = 0., a2 = 0., a3 = 0.;
+    double b0 = 0., b1 = 0., b2 = 0., b3 = 0.;
+    #pragma omp parallel for reduction(+:a0, a1, a2, a3, b0, b1, b2, b3)
+    for (int c = 0; c < N; c++) {
+        const double j0 = qb[c];
+        const double jB = charges ? qb[4*N + c] : 0.;
+        const double jQ = qs ? qb[5*N + c] : 0.;
+        const double jS = qs ? qb[6*N + c] : 0.;
+        if (j0 == 0. && jB == 0.) continue;
+        a0 += j0; a1 += jB; a2 += jQ; a3 += jS;
+        if (static_cast<double>(e[c]) + j0*dt < eps) {
+            b0 += j0; b1 += jB; b2 += jQ; b3 += jS;
+        }
+    }
+    const double a[4] = {a0*Util::hbarc, a1, a2, a3};
+    const double b[4] = {b0*Util::hbarc, b1, b2, b3};
+    for (int k = 0; k < 4; k++) {
+        src_tally_all_[k]   += w*a[k];
+        src_tally_below_[k] += w*b[k];
     }
 }
 
@@ -2108,9 +2153,18 @@ void Advance::MakeDeltaQI(const double tauFactor, Fields &arenaFieldsCurr,
 
         // for each direction, reconstruct half-way cells
         // reconstruct e, rhob, and u[4] for half way cells
+        // a state that cannot be reconstructed falls back to a cell: all to
+        // this one (Milne), or (Cartesian, symmetric_flux_fallback) the
+        // right state of i+1/2 to cell i+1, the left one of i-1/2 to cell
+        // i-1, so cells i and i+1 use the same flux for their interface
+        // (gpu_make_delta_qi_4d)
+        const bool sym = (DATA.CoorType == 1
+                          && DATA.symmetric_flux_fallback == 1);
         auto grid_phL = reconst_helper.ReconstIt_shell(tauFactor, qiphL, c);
-        auto grid_phR = reconst_helper.ReconstIt_shell(tauFactor, qiphR, c);
-        auto grid_mhL = reconst_helper.ReconstIt_shell(tauFactor, qimhL, c);
+        auto grid_phR = reconst_helper.ReconstIt_shell(tauFactor, qiphR,
+                                                       sym ? p1 : c);
+        auto grid_mhL = reconst_helper.ReconstIt_shell(tauFactor, qimhL,
+                                                       sym ? m1 : c);
         auto grid_mhR = reconst_helper.ReconstIt_shell(tauFactor, qimhR, c);
 
         double aiphL = MaxSpeed(tauFactor, direction, grid_phL, pressureP1);

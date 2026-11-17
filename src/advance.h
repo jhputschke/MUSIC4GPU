@@ -166,6 +166,11 @@ class Advance {
     std::vector<double> src_rho_;                   // rho_B, Q, S per cell (or none)
     std::vector<int>    src_written_;               // cells of the last fill
     bool                src_buf_unknown_ = true;    // clear the whole buffer
+    double src_tally_eps_ = -1.;
+    bool   src_tally_valid_ = true;
+    double src_tally_all_[4] = {0., 0., 0., 0.};
+    double src_tally_below_[4] = {0., 0., 0., 0.};
+    void   source_tally_fill(const float* qb, int N, int ncomp);
     // MUSIC_SOURCE_GRID_FILL=check: every such fill is compared with the
     // loop over all cells; the run's totals are printed when this object is
     // destroyed (when the next run is set up, or at the end of the job).
@@ -256,6 +261,24 @@ class Advance {
     void drain_cells(const std::vector<int> &cells,
                      const std::vector<float> &keep, Fields &prev,
                      Fields &curr, double e_vac);
+    // The sources' books (Cartesian runs, GPU path): every source fill adds
+    // what it deposits in this half step, E [GeV], B, Q, S, to all[] and,
+    // where the cell stays below eps_raw [1/fm^4] with it (e + j^0 dtau, the
+    // lab energy as a rest-frame estimate), to below[].  set_source_tally
+    // starts them (eps_raw <= 0: off); valid is false where e is not
+    // readable on the host (a discrete GPU) or the CPU path ran.
+    void set_source_tally(double eps_raw) {
+        src_tally_eps_ = eps_raw;
+        src_tally_valid_ = true;
+        for (int k = 0; k < 4; k++) src_tally_all_[k] = src_tally_below_[k] = 0.;
+    }
+    bool source_tally(double all[4], double below[4]) const {
+        for (int k = 0; k < 4; k++) {
+            all[k] = src_tally_all_[k];
+            below[k] = src_tally_below_[k];
+        }
+        return src_tally_eps_ > 0. && src_tally_valid_;
+    }
     // Cell updates since the last call in which the GPU set a non-finite
     // W^{mu nu} or Pi to 0 (0 on the CPU path).
     unsigned int nonfinite_count_gpu();

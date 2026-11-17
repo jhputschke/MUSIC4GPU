@@ -219,6 +219,7 @@ std::string Evolve::checkpoint_key(Fields &arena) const {
     KEY(eta_size); KEY(tau_size); KEY(tau0); KEY(delta_x); KEY(delta_y);
     KEY(delta_eta); KEY(delta_tau); KEY(rk_order); KEY(minmod_theta);
     KEY(late_delta_tau); KEY(late_tau_switch); KEY(drain_particlized); KEY(drain_particlized_floor);
+    KEY(symmetric_flux_fallback);
     KEY(active_region_eps); KEY(active_region_halo); KEY(active_region_dtau);
     KEY(whichEOS); KEY(facTau); KEY(fac_x); KEY(fac_y); KEY(fac_eta);
     KEY(turn_on_rhob); KEY(turn_on_QS); KEY(viscosity_flag);
@@ -1149,6 +1150,12 @@ int Evolve::EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
         for (double &d : drained_) d = 0.;
         drained_cells_ = 0;
 #ifdef MUSIC_USE_GPU
+        // the sources' books (Cartesian): below the lowest freeze-out density
+        if (DATA.CoorType == 1 && !epsFO_list.empty()) {
+            double eps_fo = epsFO_list[0];
+            for (const double eps : epsFO_list) eps_fo = std::min(eps_fo, eps);
+            advance.set_source_tally(eps_fo/hbarc);
+        }
         advance.nonfinite_count_gpu();   // discard a count left by an earlier run
 #endif
     }
@@ -1637,6 +1644,20 @@ void Evolve::cell_content(const Fields &f, int idx, double out[4]) const {
     out[1] = (f.rhob_[idx]*u0 + f.Wmunu_[10][idx])*vol;
     out[2] = f.rhoq_[idx]*u0*vol;
     out[3] = f.rhos_[idx]*u0*vol;
+}
+
+void Evolve::drained_totals(double out[4], long *cells) const {
+    for (int k = 0; k < 4; k++) out[k] = drained_[k];
+    if (cells) *cells = drained_cells_;
+}
+
+bool Evolve::source_totals(double all[4], double below[4]) const {
+#ifdef MUSIC_USE_GPU
+    return advance.source_tally(all, below);
+#else
+    for (int k = 0; k < 4; k++) all[k] = below[k] = 0.;
+    return false;
+#endif
 }
 
 void Evolve::fluid_totals(double out[4]) {

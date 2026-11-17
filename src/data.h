@@ -103,6 +103,12 @@ typedef struct init_data {
     int drain_particlized = 0;
     //! the energy density [GeV/fm^3] a drained cell keeps at least
     double drain_particlized_floor = 1e-3;
+    //! Cartesian only (1, the default): a half-cell state of the KT fluxes that
+    //! cannot be reconstructed falls back to the cell on its side of the
+    //! interface, so both cells use the same flux (energy and charges
+    //! conserved); 0: to the cell computing it, as in Milne (the two cells'
+    //! fluxes differ; with SMASH sources ~10 % of E and B was lost)
+    int symmetric_flux_fallback = 1;
     //! C3, the active region (GPU, CUDA; opt-in): with active_region_eps > 0
     //! [GeV/fm^3] the GPU evolves only the 8 x 8 x 4 blocks within
     //! active_region_halo cells of a cell with e > active_region_eps or with

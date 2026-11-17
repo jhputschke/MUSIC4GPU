@@ -179,7 +179,8 @@ with dynamic fluidization; Cartesian only) takes that matter off:
 
 `Evolve::drained_totals` and `fluid_totals` (`MUSIC::get_drained_totals`,
 `get_fluid_totals`) give the books; X-SCAPE prints them per event with iSS's
-surface fluxes. The same 3 events with the drain:
+surface fluxes. The same 3 events with the drain (before the flux fix of the
+next section):
 
 | per event | B | E [GeV] |
 |---|---|---|
@@ -198,6 +199,52 @@ than the outflow it gets (8-11 % in these single samples; the mean of 20
 samples: 7 % with the drain, 3 % without; iSS's hadron gas against NEOS-4D). `drain_particlized 0` (the default of
 MUSIC) changes nothing: the dynamic event and the staged Milne one are
 byte-identical to before.
+
+## Conserving fluxes (`symmetric_flux_fallback`)
+
+With SMASH sources the grid lost energy and baryon number while the sources
+were still feeding it, on the GPU and the CPU alike: deposited minus what is
+on the grid grew from 0 at t = 2 fm/c to 114 GeV and 27 baryons at t = 10
+(of 1060 GeV and 300; seed 1, no drain), on a +-12 fm grid and on a +-20 fm
+one, so not through the edges. A source-free blob conserves to 0.01 % until
+it reaches the edges, and the reconstruction of the cells themselves kept
+all but ~15 GeV. The cause is the KT flux: cell i computes the flux through
+its interface with cell i+1 from half-cell states, and so does cell i+1. A
+half-cell state that cannot be reconstructed (fast, dilute matter: SMASH puts
+hadrons with v ~ 1 into nearly empty cells) fell back to the state of the
+cell computing it, so cells i and i+1 used different fluxes for the same
+interface. With `symmetric_flux_fallback 1` (Cartesian only, the default;
+X-SCAPE `<Hydro><MUSIC><symmetric_flux_fallback>`) the left state falls back
+to the left cell and the right state to the right cell
+(`gpu_make_delta_qi_4d<true>`, `gpu_make_delta_qi_body<true>`, separate
+kernels `*_sym` so that the old ones stay the same code; `MakeDeltaQI` on
+the CPU). The same event: deposited minus on the grid -4 to +1 GeV and 0.5
+to 4 baryons up to t = 10.
+
+Without the drain the final states move from 107 % in E (B 413-421) to
+104-105 % (B 390-408). Milne runs, and Cartesian with 0, are unchanged (the
+staged seed-42 event and the dynamic one with `--no-drain --legacy-fluxes`
+byte-identical).
+
+## The sources' books
+
+`Advance::set_source_tally` / `MUSIC::get_source_totals` (Cartesian, GPU on
+coherent memory): what the sources deposited, and how much of it went into
+cells that stay below the freeze-out density with it. X-SCAPE logs both per
+event (`MUSIC, sources`). In Au+Au at 7.7 GeV the total matches what SMASH
+handed over to 0.01 GeV; the part into thin cells is 4 % (E 36-46 GeV,
+B 11-14 per event).
+
+## Open: what the surface does not emit
+
+With the drain and conserving fluxes about 25 % of the fluidized E and B is
+still on the grid at the end (E 252-316 GeV, B 65-74 of ~295; 3 events) and
+another ~7 % leaves through the grid edges. Only 4 % went into thin cells
+directly. It is not the surface's time resolution (a check every step
+instead of every 5: the same), nor the grid spacing (0.2 instead of 0.4 fm:
+the same). The surface's own fluxes close for a source-free blob (out
+216.5 GeV against 216.9 GeV above e_fo at t0), but in the SMASH-fed runs
+much less leaves through it than enters the dense region. To be found.
 
 ## Not done
 

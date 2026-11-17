@@ -170,13 +170,16 @@ class Evolve {
 
     //! drain_particlized: what was drained in this run, E [GeV], B, Q, S
     //! (and the number of cells, if `cells` is not null)
-    void drained_totals(double out[4], long *cells = nullptr) const {
-        for (int k = 0; k < 4; k++) out[k] = drained_[k];
-        if (cells) *cells = drained_cells_;
-    }
+    void drained_totals(double out[4], long *cells = nullptr) const;
     //! E [GeV], B, Q, S on the grid after the last EvolveOneTimeStep call
     //! (brings the state from the GPU when it is there; all 0 before a call)
     void fluid_totals(double out[4]);
+    //! the sources' books of this run (Advance::set_source_tally): all that
+    //! was deposited and what went into cells below e_fo, E [GeV], B, Q, S;
+    //! false if not measured (CPU path, discrete GPU, Milne)
+    //! (out of line: Advance's layout depends on MUSIC_USE_GPU, which not
+    //! every file that includes this header defines)
+    bool source_totals(double all[4], double below[4]) const;
 
     int EvolveOneTimeStep(const int itau, Fields &arenaFieldsPrev,
                           Fields &arenaFieldsCurr, Fields &arenaFieldsNext,
