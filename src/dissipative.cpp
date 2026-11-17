@@ -66,6 +66,12 @@ void Diss::MakeWSource(const double tau,
         }
         double sf = tau*dWdtau + arenaCurr.Wmunu_[idx_1d_alpha0][fieldIdx];
         double bf = tau*dPidtau + Pi_alpha0;
+        if (DATA.CoorType == 1) {
+            // Cartesian: the "+ W", "+ Pi" terms come from
+            // partial_tau (tau W^{tau alpha}); only partial_t W remains
+            sf = dWdtau;
+            bf = dPidtau;
+        }
         dwmn[alpha] += sf + bf;
         if (std::isnan(sf + bf)) {
             music_message << "[Error]Diss::MakeWSource: ";
@@ -117,7 +123,11 @@ void Diss::MakeWSource(const double tau,
                 Pi_m = (bg + bgm1)*0.5;
                 Pi_p = (bg + bgp1)*0.5;
             }
-            if (direction == 3 && (alpha == 0 || alpha == 3)) {
+            if (direction == 3 && (alpha == 0 || alpha == 3)
+                && DATA.CoorType == 0) {
+                // Milne only: these fluxes are added below with the
+                // discretized geometric terms.  In Cartesian coordinates
+                // they are plain flux differences like every other one.
                 W_eta_p[alpha] = W_p + Pi_p;
                 W_eta_m[alpha] = W_m + Pi_m;
             } else {
@@ -496,6 +506,10 @@ void Diss::Make_uWRHS(const double tau, Fields &arena,
              - (Wmunu_local[0][nu])*(grid_pt.u[mu])*(grid_pt.u[3])
              - (Wmunu_local[0][mu])*(grid_pt.u[nu])*(grid_pt.u[3]))
              *(grid_pt.u[3]/tau);
+        if (DATA.CoorType == 1) {
+            // Cartesian: no Christoffel terms
+            tempf = 0.;
+        }
 
         for (int ic = 0; ic < 4; ic++) {
             const double ic_fac = (ic == 0 ? -1.0 : 1.0);
@@ -504,12 +518,20 @@ void Diss::Make_uWRHS(const double tau, Fields &arena,
                 + (Wmunu_local[ic][mu])*(grid_pt.u[nu])*(a_local[ic])*ic_fac);
         }
 
+        // - u^tau W/tau cancels the u^tau/tau piece of theta in Milne
+        // coordinates.  In Cartesian coordinates theta has no such piece
+        // (U_derivative::calculate_expansion_rate), so the term is absent.
+        const double geom = (
+            DATA.CoorType == 0
+            ? - (grid_pt.u[0]*Wmunu_local[mu][nu])/tau : 0.);
         w_rhs[idx_1d-4] += (tempf*(DATA.delta_tau)
-                  + (- (grid_pt.u[0]*Wmunu_local[mu][nu])/tau
+                  + (geom
                      + (theta_local*Wmunu_local[mu][nu]))*(DATA.delta_tau));
     }
     if (DATA.turn_on_bulk == 1) {
-        w_rhs[5] -= (grid_pt.pi_b)*(grid_pt.u[0])/tau*DATA.delta_tau;
+        if (DATA.CoorType == 0) {
+            w_rhs[5] -= (grid_pt.pi_b)*(grid_pt.u[0])/tau*DATA.delta_tau;
+        }
         w_rhs[5] += (grid_pt.pi_b)*theta_local*DATA.delta_tau;
     }
 }

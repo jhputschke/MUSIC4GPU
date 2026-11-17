@@ -723,6 +723,9 @@ bool Advance::eos4d_on_gpu() const {
 }
 
 bool Advance::gpu_features_supported() const {
+    // The kernels implement Milne coordinates only (tau factors and the
+    // geometric terms are built in); CoorType 1 (Cartesian) runs on the CPU.
+    if (DATA.CoorType != 0)               return false;
     const bool eos4d = eos4d_on_gpu();
     if (DATA.viscosity_flag != 1)         return false;
     // baryon diffusion: with the 4D EOS (CUDA), without the vorticity terms
