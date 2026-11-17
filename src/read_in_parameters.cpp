@@ -643,13 +643,15 @@ InitData read_in_parameters(std::string input_file) {
     tempinput = Util::StringFind4(input_file, "late_tau_switch");
     if (tempinput != "empty") istringstream(tempinput) >> templatetau;
     parameter_list.late_tau_switch = templatetau;
-    // symmetric_flux_fallback: see data.h (0, the default: as before)
-    int temp_sym_fallback = 0;
+    // symmetric_flux_fallback: see data.h (1, the default: conserving fluxes;
+    // 0: the old fallback)
+    int temp_sym_fallback = 1;
     tempinput = Util::StringFind4(input_file, "symmetric_flux_fallback");
     if (tempinput != "empty") istringstream(tempinput) >> temp_sym_fallback;
     parameter_list.symmetric_flux_fallback = temp_sym_fallback;
-    // quest_revert_as_cpu: see data.h (0, the default: as before)
-    int temp_qr_cpu = 0;
+    // quest_revert_as_cpu: see data.h (1, the default: the CPU's rule;
+    // 0: the old GPU clamp)
+    int temp_qr_cpu = 1;
     tempinput = Util::StringFind4(input_file, "quest_revert_as_cpu");
     if (tempinput != "empty") istringstream(tempinput) >> temp_qr_cpu;
     parameter_list.quest_revert_as_cpu = temp_qr_cpu;

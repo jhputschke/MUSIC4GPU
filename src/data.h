@@ -95,18 +95,20 @@ typedef struct init_data {
     double late_delta_tau;
     double late_tau_switch;
     //! KT fluxes: a half-cell state that cannot be reconstructed falls back to
-    //! a cell's state.  0 (default, as before): to the cell computing the flux,
-    //! so cells i and i+1 can use different fluxes for their common interface
-    //! and energy and charges are not conserved there.  1: the left state to
+    //! a cell's state.  1 (the default since 2026-11-17): the left state to
     //! the left cell, the right state to the right cell; both cells then use
-    //! the same flux.  Changes results wherever a reconstruction fails.
-    int symmetric_flux_fallback = 0;
+    //! the same flux.  0 (the old rule): to the cell computing the flux, so
+    //! cells i and i+1 can use different fluxes for their common interface
+    //! and energy and charges are not conserved there.  The two differ
+    //! wherever a reconstruction fails.
+    int symmetric_flux_fallback = 1;
     //! GPU shear regulator (QuestRevert): a negative pi^{mu nu} pi_{mu nu}
-    //! sets W^{mu nu} to 0, as Advance::QuestRevert on the CPU does (1).  0
-    //! (default, as before): the GPU kernels clamp it to 0, which leaves W
-    //! unregulated in that cell (fast, dilute cells, where the float
-    //! invariant drowns in the cancellation of W's components).
-    int quest_revert_as_cpu = 0;
+    //! sets W^{mu nu} to 0, as Advance::QuestRevert on the CPU does (1, the
+    //! default since 2026-11-17).  0 (the old rule): the GPU kernels clamp it
+    //! to 0, which leaves W unregulated in that cell (fast, dilute cells,
+    //! where the float invariant drowns in the cancellation of W's
+    //! components).
+    int quest_revert_as_cpu = 1;
     //! C3, the active region (GPU, CUDA; opt-in): with active_region_eps > 0
     //! [GeV/fm^3] the GPU evolves only the 8 x 8 x 4 blocks within
     //! active_region_halo cells of a cell with e > active_region_eps or with

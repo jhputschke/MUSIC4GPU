@@ -820,6 +820,45 @@ Au+Au job (`nsys`, GB10):
   the stored frames: halo 1 gives 46 %, 4 × 4 × 2 blocks 2–3 points less).
   A threshold of 1e-3 instead of 1e-5 changes it by only ~5 points.
 
+## Phase 9 — Two conservation fixes, on by default (2026-11-17)
+
+Two rules of the step differed from what conservation (or the CPU) asks for. Both are fixed
+by switches that are **on by default since 2026-11-17**; 0 restores the old rule. On the GPU
+each rule is a kernel of its own (`gpu_make_delta_qi_sym`, `gpu_first_rk_step_w_full_cpu`,
+chosen on the host), so with 0 the old kernels run bit for bit.
+
+- **`symmetric_flux_fallback`** (CPU, CUDA, Metal). The KT flux through the face i+1/2 is
+  computed by cell i and again by cell i+1. A half-cell state that cannot be reconstructed
+  fell back to the *computing* cell's state, so the two cells could use different fluxes for
+  the same face, and energy and charges were not conserved there. With 1 the left state falls
+  back to the left cell and the right state to the right cell, so both use the same flux.
+- **`quest_revert_as_cpu`** (CUDA, Metal). `gpu_first_rk_step_w_full` clamped a negative
+  π^{μν}π_{μν} (fast, dilute cells, where the float invariant drowns in the cancellation of
+  W's components) to 0 and left W unregulated, while `Advance::QuestRevert` on the CPU gets
+  NaN and sets W to 0. With 1 the GPU tests the sign (also under Metal's fast math) and sets
+  W to 0 as the CPU does.
+
+**Effect** (GB10, CUDA): off is byte-identical to the code before (IP-Glasma, 25 output
+files). Milne IP-Glasma event: changes ~1e-5, mean p_T 3e-5. SMASH sources on a Cartesian
+grid: ~10 % of E and B were lost with 0; staged SMASH-IC 19.6 GeV, grid energy τ 0.6 → 5 fm/c
+−3.3 % with 0, within ±0.6 % with 1. 0–10 % Au+Au two-stage jet events (js-contrib
+`run_prod_jet.py --native`, 4 jobs × 8 events, 32 jet events, 8 backgrounds):
+
+| | fixes 0 | fixes 1 |
+|---|---|---|
+| background fluid energy (e ≥ 1e-4) lost by τ = 8 fm/c, relative to τ = 1 | 1.3–1.9 % | 0.9–1.5 % |
+| the same at the last frame | 1.7–2.4 % | 1.2–1.9 % |
+| wake / deposited energy | 1.022 ± 0.003 | 1.024 ± 0.003 |
+| active region (Phase 8, 1e-5) − whole grid, wake per deposit, per event: median / 90 % / max | 1.15 % / 5.7 % / 7.6 % | 0.84 % / 2.05 % / 4.2 % |
+| active-region bias (mean) | +0.0001 ± 0.005 | +0.003 ± 0.002 |
+| job time (whole grid / active region) | 155 / 142 s | 156 / 143 s |
+
+The fixes change the wake itself by 0.9 % per event (median; 90 %: 2.9 %), as large as what
+the active region still changes with them. Of the active region's difference, the part in
+cells with e_bg = 1e-3–0.24 GeV/fm³ halves with the fixes (summed |ΔW| 8.2 → 4.0 GeV over the
+32 events); the part below 1e-3 GeV/fm³ stays (13.9 → 16.0 GeV). The Metal kernels are not
+yet built or run on a Mac.
+
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
 | Phase | Change | Per-step speedup | Key kernel-level result |
