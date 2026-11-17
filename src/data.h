@@ -94,6 +94,19 @@ typedef struct init_data {
     //! facTau and the frame cadence are scaled with it (Evolve::EvolveIt)
     double late_delta_tau;
     double late_tau_switch;
+    //! KT fluxes: a half-cell state that cannot be reconstructed falls back to
+    //! a cell's state.  0 (default, as before): to the cell computing the flux,
+    //! so cells i and i+1 can use different fluxes for their common interface
+    //! and energy and charges are not conserved there.  1: the left state to
+    //! the left cell, the right state to the right cell; both cells then use
+    //! the same flux.  Changes results wherever a reconstruction fails.
+    int symmetric_flux_fallback = 0;
+    //! GPU shear regulator (QuestRevert): a negative pi^{mu nu} pi_{mu nu}
+    //! sets W^{mu nu} to 0, as Advance::QuestRevert on the CPU does (1).  0
+    //! (default, as before): the GPU kernels clamp it to 0, which leaves W
+    //! unregulated in that cell (fast, dilute cells, where the float
+    //! invariant drowns in the cancellation of W's components).
+    int quest_revert_as_cpu = 0;
     double dtaudxRatio;
 
     bool resetDtau;
