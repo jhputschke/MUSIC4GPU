@@ -55,6 +55,10 @@ class Init {
     void initial_1p1D_Riemann(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr);
     void initial_1p1D_Diffusion(Fields &arenaFieldsPrev,
                                 Fields &arenaFieldsCurr);
+    //! Initial_profile 5: a 3D Gaussian blob at rest in the lab frame,
+    //! defined in physical (t, x, y, z) so that a Milne and a Cartesian run
+    //! start from the same state (test of the two coordinate systems)
+    void initial_3D_blob(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr);
     void initial_1p1D_eta(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr);
     void initial_IPGlasma_XY(int ieta, Fields &arenaFieldsPrev,
                              Fields &arenaFieldsCurr);

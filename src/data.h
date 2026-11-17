@@ -102,6 +102,14 @@ typedef struct init_data {
 
     int CoorType;       //!< 0: Milne; 1: Cartesian
     int Test1DDirection;
+    //! Initial_profile 5 (3D Gaussian blob at rest in the lab frame, a test
+    //! of Milne against Cartesian coordinates): peak and floor energy density
+    //! [GeV/fm^3], widths [fm]
+    double test_blob_e0;
+    double test_blob_e_floor;
+    double test_blob_sigma_x;
+    double test_blob_sigma_y;
+    double test_blob_sigma_z;
 
     double sFactor;     //!< overall normalization on energy density profile
     int whichEOS;       //!< type of EoS

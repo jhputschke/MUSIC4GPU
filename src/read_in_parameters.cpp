@@ -80,6 +80,19 @@ InitData read_in_parameters(std::string input_file) {
         istringstream(tempinput) >> temp_TestDirection;
     parameter_list.Test1DDirection = temp_TestDirection;
 
+    // Initial_profile 5: the 3D Gaussian blob test (Milne against Cartesian)
+    auto read_blob = [&](const char* key, double def) {
+        double v = def;
+        std::string t = Util::StringFind4(input_file, key);
+        if (t != "empty") istringstream(t) >> v;
+        return v;
+    };
+    parameter_list.test_blob_e0      = read_blob("test_blob_e0", 10.);
+    parameter_list.test_blob_e_floor = read_blob("test_blob_e_floor", 1e-3);
+    parameter_list.test_blob_sigma_x = read_blob("test_blob_sigma_x", 1.0);
+    parameter_list.test_blob_sigma_y = read_blob("test_blob_sigma_y", 1.5);
+    parameter_list.test_blob_sigma_z = read_blob("test_blob_sigma_z", 1.0);
+
     // hydro source
     double temp_string_quench_factor = 0.;
     tempinput = Util::StringFind4(input_file, "string_quench_factor");

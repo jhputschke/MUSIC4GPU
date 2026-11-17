@@ -48,7 +48,8 @@ void Init::InitArena(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr,
                       << DATA.delta_y << " fm. ";
         music_message << "neta=" << DATA.neta << ", deta=" << DATA.delta_eta;
         music_message.flush("info");
-    } else if (DATA.Initial_profile == 3 || DATA.Initial_profile == 4) {
+    } else if (DATA.Initial_profile == 3 || DATA.Initial_profile == 4
+               || DATA.Initial_profile == 5) {
         music_message << "Using Initial_profile=" << DATA.Initial_profile;
         music_message << ", nx=" << DATA.nx << ", ny=" << DATA.ny;
         music_message << ", dx=" << DATA.delta_x << ", dy=" << DATA.delta_y;
@@ -273,6 +274,10 @@ void Init::InitTJb(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr) {
         // code test in 1+1 D Relativistic diffusion equation
         music_message.info(" Perform 1+1D diffusion test ... ");
         initial_1p1D_Diffusion(arenaFieldsPrev, arenaFieldsCurr);
+    } else if (DATA.Initial_profile == 5) {
+        // test: 3D Gaussian blob at rest, Milne against Cartesian
+        music_message.info(" 3D Gaussian blob at rest (Milne/Cartesian test) ... ");
+        initial_3D_blob(arenaFieldsPrev, arenaFieldsCurr);
     } else if (DATA.Initial_profile == 8) {
         // read in the profile from file
         // - IPGlasma initial conditions with initial flow
@@ -550,6 +555,12 @@ void Init::initial_1p1D_Riemann(Fields &arenaFieldsPrev,
     const double T4 = 0.2;  // GeV
     const double g = 16.;
     const double rhob = 0.;
+    // The discontinuity is at coordinate 0, the centre of a cell. Compare
+    // with a tolerance: computed as delta*i - size/2, the centre comes out
+    // as +-1e-16 depending on rounding (with a fused multiply-add on
+    // aarch64 the eta coordinate gave +2.8e-16, so the z test started one
+    // cell off the x and y tests).
+    const double edge_tol = 1e-9;
     for (int ieta = 0; ieta < neta; ieta++) {
         double eta_local = (DATA.delta_eta)*ieta - (DATA.eta_size)/2.0;
         for (int ix = 0; ix < nx; ix++) {
@@ -560,13 +571,13 @@ void Init::initial_1p1D_Riemann(Fields &arenaFieldsPrev,
 
                 double epsilon = 3*g/(M_PI*M_PI)*pow(T0, 4)/pow(hbarc, 4);       // fm^-4
                 if (DATA.Test1DDirection == 3) {
-                    if (eta_local > 0)
+                    if (eta_local > edge_tol)
                         epsilon = 3*g/(M_PI*M_PI)*pow(T4, 4)/pow(hbarc, 4);      // fm^-4
                 } else if (DATA.Test1DDirection == 2) {
-                    if (y_local > 0)
+                    if (y_local > edge_tol)
                         epsilon = 3*g/(M_PI*M_PI)*pow(T4, 4)/pow(hbarc, 4);      // fm^-4
                 } else if (DATA.Test1DDirection == 1) {
-                    if (x_local > 0)
+                    if (x_local > edge_tol)
                         epsilon = 3*g/(M_PI*M_PI)*pow(T4, 4)/pow(hbarc, 4);      // fm^-4
                 }
 
@@ -599,6 +610,10 @@ void Init::initial_1p1D_Diffusion(Fields &arenaFieldsPrev,
     const int ny = arenaFieldsCurr.nY();
     const double v = 0.5;
     const double gamma = 1./sqrt(1. - v*v);
+    // the charge sits in (-1, 0), whose ends are cell centres: compare with
+    // a tolerance (see initial_1p1D_Riemann; the eta coordinate came out
+    // as -1 + 2e-16, and the z test had one charged cell more)
+    const double edge_tol = 1e-9;
     for (int ieta = 0; ieta < neta; ieta++) {
         double eta_local = (DATA.delta_eta)*ieta - (DATA.eta_size)/2.0;
         for (int ix = 0; ix < nx; ix++) {
@@ -610,19 +625,19 @@ void Init::initial_1p1D_Diffusion(Fields &arenaFieldsPrev,
                 double rhob = 0.;
                 double epsilon = 1.0;   // fm^-4
                 if (DATA.Test1DDirection == 3) {
-                    if (eta_local > -1 && eta_local < 0.)
+                    if (eta_local > -1 + edge_tol && eta_local < -edge_tol)
                         rhob = 1.;
                     arenaFieldsCurr.u_[1][idx] = 0.0;
                     arenaFieldsCurr.u_[2][idx] = 0.0;
                     arenaFieldsCurr.u_[3][idx] = gamma*v;
                 } else if (DATA.Test1DDirection == 2) {
-                    if (y_local > -1 && y_local < 0.)
+                    if (y_local > -1 + edge_tol && y_local < -edge_tol)
                         rhob = 1.;
                     arenaFieldsCurr.u_[1][idx] = 0.0;
                     arenaFieldsCurr.u_[2][idx] = gamma*v;
                     arenaFieldsCurr.u_[3][idx] = 0.0;
                 } else if (DATA.Test1DDirection == 1) {
-                    if (x_local > -1 && x_local < 0.)
+                    if (x_local > -1 + edge_tol && x_local < -edge_tol)
                         rhob = 1.;
                     arenaFieldsCurr.u_[1][idx] = gamma*v;
                     arenaFieldsCurr.u_[2][idx] = 0.0;
@@ -639,6 +654,51 @@ void Init::initial_1p1D_Diffusion(Fields &arenaFieldsPrev,
                 arenaFieldsPrev.rhob_[idx] = arenaFieldsCurr.rhob_[idx];
                 for (int ii = 0; ii < 4; ii++) {
                     arenaFieldsPrev.u_[ii][idx] = arenaFieldsCurr.u_[ii][idx];
+                }
+            }
+        }
+    }
+}
+
+
+void Init::initial_3D_blob(Fields &arenaFieldsPrev, Fields &arenaFieldsCurr) {
+    // e(x, y, z) = e_floor + e0 exp(-x^2/2sx^2 - y^2/2sy^2 - z^2/2sz^2),
+    // the fluid at rest in the lab frame, no viscous stress.  In Cartesian
+    // coordinates (CoorType 1) the third coordinate is z itself and u = (1,
+    // 0, 0, 0).  In Milne coordinates the cell at (tau0, eta) sits at
+    // z = tau0 sinh(eta), and the lab rest frame has u^tau = cosh(eta),
+    // tau u^eta = -sinh(eta).  The two runs then start from the same state,
+    // on t = t0 and on tau = tau0 respectively; these surfaces differ by
+    // about z^2/(2 tau0) inside the blob.
+    const int neta = arenaFieldsCurr.nEta();
+    const int nx = arenaFieldsCurr.nX();
+    const int ny = arenaFieldsCurr.nY();
+    const double e0  = DATA.test_blob_e0/hbarc;        // 1/fm^4
+    const double ef  = DATA.test_blob_e_floor/hbarc;
+    const double sx2 = 2.*DATA.test_blob_sigma_x*DATA.test_blob_sigma_x;
+    const double sy2 = 2.*DATA.test_blob_sigma_y*DATA.test_blob_sigma_y;
+    const double sz2 = 2.*DATA.test_blob_sigma_z*DATA.test_blob_sigma_z;
+    const bool milne = (DATA.CoorType == 0);
+    for (int ieta = 0; ieta < neta; ieta++) {
+        const double eta_local = DATA.delta_eta*ieta - DATA.eta_size/2.;
+        const double z = milne ? DATA.tau0*sinh(eta_local) : eta_local;
+        const double u0 = milne ? cosh(eta_local) : 1.;
+        const double u3 = milne ? -sinh(eta_local) : 0.;
+        for (int ix = 0; ix < nx; ix++) {
+            const double x = DATA.delta_x*ix - DATA.x_size/2.;
+            for (int iy = 0; iy < ny; iy++) {
+                const double y = DATA.delta_y*iy - DATA.y_size/2.;
+                const int idx = arenaFieldsCurr.getFieldIdx(ix, iy, ieta);
+                const double e = ef + e0*exp(-x*x/sx2 - y*y/sy2 - z*z/sz2);
+                for (Fields* f : {&arenaFieldsCurr, &arenaFieldsPrev}) {
+                    f->e_[idx] = e;
+                    f->rhob_[idx] = 0.;
+                    f->u_[0][idx] = u0;
+                    f->u_[1][idx] = 0.;
+                    f->u_[2][idx] = 0.;
+                    f->u_[3][idx] = u3;
+                    f->piBulk_[idx] = 0.;
+                    for (int j = 0; j < 14; j++) f->Wmunu_[j][idx] = 0.;
                 }
             }
         }
