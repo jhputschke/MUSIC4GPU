@@ -648,6 +648,11 @@ InitData read_in_parameters(std::string input_file) {
     tempinput = Util::StringFind4(input_file, "symmetric_flux_fallback");
     if (tempinput != "empty") istringstream(tempinput) >> temp_sym_fallback;
     parameter_list.symmetric_flux_fallback = temp_sym_fallback;
+    // quest_revert_as_cpu: see data.h (0, the default: as before)
+    int temp_qr_cpu = 0;
+    tempinput = Util::StringFind4(input_file, "quest_revert_as_cpu");
+    if (tempinput != "empty") istringstream(tempinput) >> temp_qr_cpu;
+    parameter_list.quest_revert_as_cpu = temp_qr_cpu;
     music_message << " DeltaTau = " << parameter_list.delta_tau << " fm";
     music_message.flush("info");
 
@@ -1059,6 +1064,8 @@ void set_parameter(InitData &parameter_list, std::string parameter_name,
         parameter_list.late_tau_switch = value;
     if (parameter_name == "symmetric_flux_fallback")
         parameter_list.symmetric_flux_fallback = static_cast<int>(value);
+    if (parameter_name == "quest_revert_as_cpu")
+        parameter_list.quest_revert_as_cpu = static_cast<int>(value);
 
     if (parameter_name == "dtau") {
         parameter_list.delta_tau = value;

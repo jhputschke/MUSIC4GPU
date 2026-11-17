@@ -117,6 +117,33 @@ __global__ void gpu_first_rk_step_w_full(
     const float* __restrict__ epsilon_future,
     const float* __restrict__ rhob_future);
 
+// the same with the CPU's shear regulator (quest_revert_as_cpu 1)
+__global__ void gpu_first_rk_step_w_full_cpu(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ pi_b_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ u_prev,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ u_future,
+    const float* __restrict__ uwrhs_in,
+    const float* __restrict__ theta_in,
+    const float* __restrict__ a_in,
+    const float* __restrict__ sigma_in,
+    float* __restrict__ Wmunu_future,
+    float* __restrict__ pi_b_future,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_s,
+    const float* __restrict__ eos_T,
+    const float* __restrict__ eos_dPde,
+    const float* __restrict__ uprhs_in,
+    MUSICGridParams params,
+    GPUEosParams eos_p,
+    const float* __restrict__ epsilon_future,
+    const float* __restrict__ rhob_future);
+
 // Block-parallel max-reduction over epsilon and rhob in snap_curr.
 // Each block reduces blockDim.x cells via shared memory; blocks collaborate
 // via atomicMax (IEEE-754 trick for non-negative floats).

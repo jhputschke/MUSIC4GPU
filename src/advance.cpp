@@ -851,6 +851,7 @@ bool Advance::try_gpu_advance(double tau, Fields &arenaFieldsPrev,
       mp.dispatch_w_source(gpu_grid_, p);
       if (p.turn_on_bulk == 1) mp.dispatch_uprhs(gpu_grid_, p);
       gpu_grid_.sym_fallback = (DATA.symmetric_flux_fallback == 1);
+      gpu_grid_.quest_revert_cpu = (DATA.quest_revert_as_cpu == 1);
       mp.dispatch_delta_qi(gpu_grid_, p);
       mp.dispatch_finalize_ideal(gpu_grid_, p);
       mp.dispatch_first_rk_step_w_full(gpu_grid_, p);

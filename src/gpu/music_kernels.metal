@@ -2009,35 +2009,34 @@ inline float gpu_uWRHS_geom(
               + theta * W_local[mu][nu]) * delta_tau;
 }
 
-kernel void gpu_first_rk_step_w_full(
-    device const float*       Wmunu_curr   [[buffer(0)]],
-    device const float*       pi_b_curr    [[buffer(1)]],
-    device const float*       u_curr       [[buffer(2)]],
-    device const float*       Wmunu_prev   [[buffer(3)]],
-    device const float*       pi_b_prev    [[buffer(4)]],
-    device const float*       u_prev       [[buffer(5)]],
-    device const float*       epsilon_curr [[buffer(6)]],
-    device const float*       epsilon_prev [[buffer(7)]],
-    device const float*       u_future     [[buffer(8)]],
-    device const float*       uwrhs_in     [[buffer(9)]],
-    device const float*       theta_in     [[buffer(10)]],
-    device const float*       a_in         [[buffer(11)]],
-    device const float*       sigma_in     [[buffer(12)]],
-    device       float*       Wmunu_future [[buffer(13)]],
-    device       float*       pi_b_future  [[buffer(14)]],
-    device const float*       eos_P        [[buffer(15)]],
-    device const float*       eos_s        [[buffer(16)]],
-    device const float*       eos_T        [[buffer(17)]],
-    device const float*       eos_dPde     [[buffer(18)]],
-    device const float*       uprhs_in     [[buffer(19)]],
-    constant MUSICGridParams& params       [[buffer(20)]],
-    constant GPUEosParams&    eos_p        [[buffer(21)]],
-    // For QuestRevert: needs the future-state primitives (post-Newton).
-    device const float*       epsilon_future [[buffer(22)]],
-    device const float*       rhob_future    [[buffer(23)]],
-    // cell updates with a non-finite W^{mu nu} or Pi set to 0 (see below)
-    device atomic_uint*       nonfinite_count [[buffer(24)]],
-    uint3 gid [[thread_position_in_grid]])
+template <bool QR>
+static inline void gpu_first_rk_step_w_full_body(
+    device const float*       Wmunu_curr,
+    device const float*       pi_b_curr,
+    device const float*       u_curr,
+    device const float*       Wmunu_prev,
+    device const float*       pi_b_prev,
+    device const float*       u_prev,
+    device const float*       epsilon_curr,
+    device const float*       epsilon_prev,
+    device const float*       u_future,
+    device const float*       uwrhs_in,
+    device const float*       theta_in,
+    device const float*       a_in,
+    device const float*       sigma_in,
+    device       float*       Wmunu_future,
+    device       float*       pi_b_future,
+    device const float*       eos_P,
+    device const float*       eos_s,
+    device const float*       eos_T,
+    device const float*       eos_dPde,
+    device const float*       uprhs_in,
+    constant MUSICGridParams& params,
+    constant GPUEosParams&    eos_p,
+    device const float*       epsilon_future,
+    device const float*       rhob_future,
+    device atomic_uint*       nonfinite_count,
+    uint3 gid)
 {
     int ix   = (int)gid.x;
     int iy   = (int)gid.y;
@@ -2254,7 +2253,14 @@ kernel void gpu_first_rk_step_w_full(
         float rho_shear = sqrt(max(pisize, 0.f) / eq_size) / factor;
         float rho_bulk  = sqrt(max(bulksize, 0.f) / eq_size) / factor;
 
-        if (isnan(rho_shear)) {
+        // QR (quest_revert_as_cpu 1): a negative pi^{mu nu} pi_{mu nu} sets W
+        // to 0, as Advance::QuestRevert (sqrt of it is NaN there).  The clamp
+        // above leaves W unregulated in that cell.  The sign is tested
+        // directly (Metal compiles with fast math); QR is a template
+        // constant, so the default kernel is the old code.
+        bool zero_shear = isnan(rho_shear);
+        if (QR) zero_shear = zero_shear || !(pisize >= 0.f);
+        if (zero_shear) {
             for (int m = 0; m < 10; m++) Wf[m] = 0.f;
         } else if (rho_shear > rho_shear_max) {
             float scale = rho_shear_max / rho_shear;
@@ -2285,6 +2291,73 @@ kernel void gpu_first_rk_step_w_full(
     for (int m = 0; m < 14; m++)
         Wmunu_future[m * Ncells + c] = Wf[m];
     pi_b_future[c] = pi_b_out;
+}
+
+kernel void gpu_first_rk_step_w_full(
+    device const float*       Wmunu_curr   [[buffer(0)]],
+    device const float*       pi_b_curr    [[buffer(1)]],
+    device const float*       u_curr       [[buffer(2)]],
+    device const float*       Wmunu_prev   [[buffer(3)]],
+    device const float*       pi_b_prev    [[buffer(4)]],
+    device const float*       u_prev       [[buffer(5)]],
+    device const float*       epsilon_curr [[buffer(6)]],
+    device const float*       epsilon_prev [[buffer(7)]],
+    device const float*       u_future     [[buffer(8)]],
+    device const float*       uwrhs_in     [[buffer(9)]],
+    device const float*       theta_in     [[buffer(10)]],
+    device const float*       a_in         [[buffer(11)]],
+    device const float*       sigma_in     [[buffer(12)]],
+    device       float*       Wmunu_future [[buffer(13)]],
+    device       float*       pi_b_future  [[buffer(14)]],
+    device const float*       eos_P        [[buffer(15)]],
+    device const float*       eos_s        [[buffer(16)]],
+    device const float*       eos_T        [[buffer(17)]],
+    device const float*       eos_dPde     [[buffer(18)]],
+    device const float*       uprhs_in     [[buffer(19)]],
+    constant MUSICGridParams& params       [[buffer(20)]],
+    constant GPUEosParams&    eos_p        [[buffer(21)]],
+    // For QuestRevert: needs the future-state primitives (post-Newton).
+    device const float*       epsilon_future [[buffer(22)]],
+    device const float*       rhob_future    [[buffer(23)]],
+    // cell updates with a non-finite W^{mu nu} or Pi set to 0 (see below)
+    device atomic_uint*       nonfinite_count [[buffer(24)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    gpu_first_rk_step_w_full_body<false>(Wmunu_curr, pi_b_curr, u_curr, Wmunu_prev, pi_b_prev, u_prev, epsilon_curr, epsilon_prev, u_future, uwrhs_in, theta_in, a_in, sigma_in, Wmunu_future, pi_b_future, eos_P, eos_s, eos_T, eos_dPde, uprhs_in, params, eos_p, epsilon_future, rhob_future, nonfinite_count, gid);
+}
+
+// the same with the CPU's shear regulator (quest_revert_as_cpu 1)
+kernel void gpu_first_rk_step_w_full_cpu(
+    device const float*       Wmunu_curr   [[buffer(0)]],
+    device const float*       pi_b_curr    [[buffer(1)]],
+    device const float*       u_curr       [[buffer(2)]],
+    device const float*       Wmunu_prev   [[buffer(3)]],
+    device const float*       pi_b_prev    [[buffer(4)]],
+    device const float*       u_prev       [[buffer(5)]],
+    device const float*       epsilon_curr [[buffer(6)]],
+    device const float*       epsilon_prev [[buffer(7)]],
+    device const float*       u_future     [[buffer(8)]],
+    device const float*       uwrhs_in     [[buffer(9)]],
+    device const float*       theta_in     [[buffer(10)]],
+    device const float*       a_in         [[buffer(11)]],
+    device const float*       sigma_in     [[buffer(12)]],
+    device       float*       Wmunu_future [[buffer(13)]],
+    device       float*       pi_b_future  [[buffer(14)]],
+    device const float*       eos_P        [[buffer(15)]],
+    device const float*       eos_s        [[buffer(16)]],
+    device const float*       eos_T        [[buffer(17)]],
+    device const float*       eos_dPde     [[buffer(18)]],
+    device const float*       uprhs_in     [[buffer(19)]],
+    constant MUSICGridParams& params       [[buffer(20)]],
+    constant GPUEosParams&    eos_p        [[buffer(21)]],
+    // For QuestRevert: needs the future-state primitives (post-Newton).
+    device const float*       epsilon_future [[buffer(22)]],
+    device const float*       rhob_future    [[buffer(23)]],
+    // cell updates with a non-finite W^{mu nu} or Pi set to 0 (see below)
+    device atomic_uint*       nonfinite_count [[buffer(24)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    gpu_first_rk_step_w_full_body<true>(Wmunu_curr, pi_b_curr, u_curr, Wmunu_prev, pi_b_prev, u_prev, epsilon_curr, epsilon_prev, u_future, uwrhs_in, theta_in, a_in, sigma_in, Wmunu_future, pi_b_future, eos_P, eos_s, eos_T, eos_dPde, uprhs_in, params, eos_p, epsilon_future, rhob_future, nonfinite_count, gid);
 }
 
 // ── Phase 2b: pack ideal-hydro evolution output on the GPU ────────────────────

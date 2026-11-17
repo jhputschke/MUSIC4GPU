@@ -101,6 +101,12 @@ typedef struct init_data {
     //! the left cell, the right state to the right cell; both cells then use
     //! the same flux.  Changes results wherever a reconstruction fails.
     int symmetric_flux_fallback = 0;
+    //! GPU shear regulator (QuestRevert): a negative pi^{mu nu} pi_{mu nu}
+    //! sets W^{mu nu} to 0, as Advance::QuestRevert on the CPU does (1).  0
+    //! (default, as before): the GPU kernels clamp it to 0, which leaves W
+    //! unregulated in that cell (fast, dilute cells, where the float
+    //! invariant drowns in the cancellation of W's components).
+    int quest_revert_as_cpu = 0;
     double dtaudxRatio;
 
     bool resetDtau;

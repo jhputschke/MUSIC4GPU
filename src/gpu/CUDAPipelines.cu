@@ -613,7 +613,10 @@ void CUDAPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     auto stream = static_cast<cudaStream_t>(compute_stream_);
     dim3 block, grid;
     compute_launch(gpu, max_block_threads_, block, grid);
-    gpu_first_rk_step_w_full<<<grid, block, 0, stream>>>(
+    // the CPU's shear regulator is a kernel of its own, so that the default
+    // one stays the old code (results bit-identical with the switch off)
+    (gpu.quest_revert_cpu ? gpu_first_rk_step_w_full_cpu
+                          : gpu_first_rk_step_w_full)<<<grid, block, 0, stream>>>(
         gpu.snap_curr.Wmunu, gpu.snap_curr.pi_b, gpu.snap_curr.u,
         gpu.snap_prev.Wmunu, gpu.snap_prev.pi_b, gpu.snap_prev.u,
         gpu.snap_curr.epsilon, gpu.snap_prev.epsilon,

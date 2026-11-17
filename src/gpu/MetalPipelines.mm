@@ -46,6 +46,7 @@ MetalPipelines::~MetalPipelines() {
     if (pso_pack_evo_) { CFRelease(pso_pack_evo_); }
     if (pso_uprhs_)    { CFRelease(pso_uprhs_); }
     if (pso_w_full_)   { CFRelease(pso_w_full_); }
+    if (pso_w_full_cpu_) { CFRelease(pso_w_full_cpu_); }
     if (pso_make_du_)  { CFRelease(pso_make_du_); }
     if (pso_uwrhs_)    { CFRelease(pso_uwrhs_); }
     if (pso_finalize_) { CFRelease(pso_finalize_); }
@@ -231,6 +232,21 @@ bool MetalPipelines::initialize(const char* metallib_path) {
         return false;
     }
     pso_w_full_ = (__bridge_retained void*)pso_wf;
+
+    // 9b. The same with the CPU's shear regulator (quest_revert_as_cpu 1)
+    id<MTLFunction> fn_wfc = [lib newFunctionWithName:@"gpu_first_rk_step_w_full_cpu"];
+    if (!fn_wfc) {
+        fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_first_rk_step_w_full_cpu' not found in library.\n");
+        return false;
+    }
+    id<MTLComputePipelineState> pso_wfc =
+        [dev newComputePipelineStateWithFunction:fn_wfc error:&err];
+    if (!pso_wfc) {
+        fprintf(stderr, "[MUSIC-GPU] PSO for gpu_first_rk_step_w_full_cpu failed: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    pso_w_full_cpu_ = (__bridge_retained void*)pso_wfc;
 
     // 10. Build pipeline state for gpu_make_uprhs (bulk-pressure stencil)
     id<MTLFunction> fn_up = [lib newFunctionWithName:@"gpu_make_uprhs"];
@@ -843,7 +859,10 @@ void MetalPipelines::dispatch_first_rk_step_w_full(GPUGrid& gpu,
     if (!ready_ || !pso_w_full_) return;
 
     auto q   = (__bridge id<MTLCommandQueue>)        cmd_queue_;
-    auto pso = (__bridge id<MTLComputePipelineState>)pso_w_full_;
+    // the CPU's shear regulator is a pipeline of its own
+    // (gpu_first_rk_step_w_full_cpu)
+    auto pso = (__bridge id<MTLComputePipelineState>)(
+        gpu.quest_revert_cpu ? pso_w_full_cpu_ : pso_w_full_);
 
     int    n_handles = gpu.buf_handle_count();
     void** handles   = gpu.buf_handle_ptr();

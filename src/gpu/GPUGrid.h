@@ -124,6 +124,9 @@ public:
     // Host side only: dispatch_delta_qi launches the flux kernel with the
     // symmetric fallback (DATA.symmetric_flux_fallback; CUDA and Metal)
     bool sym_fallback = false;
+    // Host side only: dispatch_first_rk_step_w_full launches the viscous
+    // kernel with the CPU's shear regulator (DATA.quest_revert_as_cpu)
+    bool quest_revert_cpu = false;
 
     // The three snapshots (prev, current, future).
     GPUSnapshot snap_prev;

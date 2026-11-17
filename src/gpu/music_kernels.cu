@@ -1796,7 +1796,8 @@ unsigned int gpu_nonfinite_count_read_and_reset(void* stream_v) {
 
 // ── gpu_first_rk_step_w_full ─────────────────────────────────────────────────
 
-__global__ void gpu_first_rk_step_w_full(
+template <bool QR>
+__device__ __forceinline__ void gpu_first_rk_step_w_full_body(
     const float* __restrict__ Wmunu_curr,
     const float* __restrict__ pi_b_curr,
     const float* __restrict__ u_curr,
@@ -2003,7 +2004,13 @@ __global__ void gpu_first_rk_step_w_full(
         float rho_shear = sqrtf(fmaxf(pisize, 0.f) / eq_size) / factor;
         float rho_bulk  = sqrtf(fmaxf(bulksize, 0.f) / eq_size) / factor;
 
-        if (isnan(rho_shear)) {
+        // QR (quest_revert_as_cpu 1): a negative pi^{mu nu} pi_{mu nu} sets W
+        // to 0, as Advance::QuestRevert (sqrt of it is NaN there).  The clamp
+        // above leaves W unregulated in that cell.  The sign is tested
+        // directly; a template, so that the default kernel is the old code.
+        bool zero_shear = isnan(rho_shear);
+        if constexpr (QR) zero_shear = zero_shear || !(pisize >= 0.f);
+        if (zero_shear) {
             for (int m = 0; m < 10; m++) Wf[m] = 0.f;
         } else if (rho_shear > rho_shear_max) {
             float scale = rho_shear_max / rho_shear;
@@ -2034,6 +2041,65 @@ __global__ void gpu_first_rk_step_w_full(
     for (int m = 0; m < 14; m++)
         Wmunu_future[m * Ncells + c] = Wf[m];
     pi_b_future[c] = pi_b_out;
+}
+
+__global__ void gpu_first_rk_step_w_full(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ pi_b_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ u_prev,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ u_future,
+    const float* __restrict__ uwrhs_in,
+    const float* __restrict__ theta_in,
+    const float* __restrict__ a_in,
+    const float* __restrict__ sigma_in,
+    float* __restrict__ Wmunu_future,
+    float* __restrict__ pi_b_future,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_s,
+    const float* __restrict__ eos_T,
+    const float* __restrict__ eos_dPde,
+    const float* __restrict__ uprhs_in,
+    MUSICGridParams params,
+    GPUEosParams eos_p,
+    const float* __restrict__ epsilon_future,
+    const float* __restrict__ rhob_future)
+{
+    gpu_first_rk_step_w_full_body<false>(Wmunu_curr, pi_b_curr, u_curr, Wmunu_prev, pi_b_prev, u_prev, epsilon_curr, epsilon_prev, u_future, uwrhs_in, theta_in, a_in, sigma_in, Wmunu_future, pi_b_future, eos_P, eos_s, eos_T, eos_dPde, uprhs_in, params, eos_p, epsilon_future, rhob_future);
+}
+
+// the same with the CPU's shear regulator (quest_revert_as_cpu 1)
+__global__ void gpu_first_rk_step_w_full_cpu(
+    const float* __restrict__ Wmunu_curr,
+    const float* __restrict__ pi_b_curr,
+    const float* __restrict__ u_curr,
+    const float* __restrict__ Wmunu_prev,
+    const float* __restrict__ pi_b_prev,
+    const float* __restrict__ u_prev,
+    const float* __restrict__ epsilon_curr,
+    const float* __restrict__ epsilon_prev,
+    const float* __restrict__ u_future,
+    const float* __restrict__ uwrhs_in,
+    const float* __restrict__ theta_in,
+    const float* __restrict__ a_in,
+    const float* __restrict__ sigma_in,
+    float* __restrict__ Wmunu_future,
+    float* __restrict__ pi_b_future,
+    const float* __restrict__ eos_P,
+    const float* __restrict__ eos_s,
+    const float* __restrict__ eos_T,
+    const float* __restrict__ eos_dPde,
+    const float* __restrict__ uprhs_in,
+    MUSICGridParams params,
+    GPUEosParams eos_p,
+    const float* __restrict__ epsilon_future,
+    const float* __restrict__ rhob_future)
+{
+    gpu_first_rk_step_w_full_body<true>(Wmunu_curr, pi_b_curr, u_curr, Wmunu_prev, pi_b_prev, u_prev, epsilon_curr, epsilon_prev, u_future, uwrhs_in, theta_in, a_in, sigma_in, Wmunu_future, pi_b_future, eos_P, eos_s, eos_T, eos_dPde, uprhs_in, params, eos_p, epsilon_future, rhob_future);
 }
 
 // ── Max-reduction over epsilon and rhob ───────────────────────────────────────
