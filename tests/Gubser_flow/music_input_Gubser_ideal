@@ -115,4 +115,7 @@ dNdy_nrap  51
 dNdyptdpt_eta_max  0.5 
 dNdyptdpt_y_min  -0.5 
 dNdy_eta_min  -5.0 
+symmetric_flux_fallback 0      # old KT flux fallback (MUSIC4GPU's default is 1):
+                               # the reference values come from MUSIC with it
+quest_revert_as_cpu 0          # old GPU shear regulator (GPU only; default 1)
 EndOfData

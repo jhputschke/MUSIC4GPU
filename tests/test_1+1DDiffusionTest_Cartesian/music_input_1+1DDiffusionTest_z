@@ -23,4 +23,7 @@ turn_on_baryon_diffusion  0
 boost_invariant  0
 Do_FreezeOut_Yes_1_No_0  0
 Minmod_Theta 1.8
+symmetric_flux_fallback 0      # old KT flux fallback (MUSIC4GPU's default is 1):
+                               # the reference values come from MUSIC with it
+quest_revert_as_cpu 0          # old GPU shear regulator (GPU only; default 1)
 EndOfData

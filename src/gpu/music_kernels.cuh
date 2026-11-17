@@ -45,7 +45,8 @@ __global__ void gpu_make_delta_qi(
     const unsigned char* __restrict__ active_blk);
 
 // the same, the failed half-cell states falling back to the cell on their
-// side of the interface (symmetric_flux_fallback 1)
+// side of the interface (symmetric_flux_fallback 1, the default; the kernel
+// above is the old rule, 0)
 __global__ void gpu_make_delta_qi_sym(
     const float* __restrict__ epsilon_curr,
     const float* __restrict__ rhob_curr,
@@ -125,7 +126,8 @@ __global__ void gpu_first_rk_step_w_full(
     const float* __restrict__ rhob_future,
     const unsigned char* __restrict__ active_blk);
 
-// the same with the CPU's shear regulator (quest_revert_as_cpu 1)
+// the same with the CPU's shear regulator (quest_revert_as_cpu 1, the default;
+// the kernel above is the old GPU rule, 0)
 __global__ void gpu_first_rk_step_w_full_cpu(
     const float* __restrict__ Wmunu_curr,
     const float* __restrict__ pi_b_curr,
