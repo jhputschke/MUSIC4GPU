@@ -844,49 +844,52 @@ chosen on the host), so with 0 the old kernels run bit for bit.
 **Effect** (GB10, CUDA): off is byte-identical to the code before (IP-Glasma, 25 output
 files). Milne IP-Glasma event: changes ~1e-5, mean p_T 3e-5. SMASH sources on a Cartesian
 grid: ~10 % of E and B were lost with 0; staged SMASH-IC 19.6 GeV, grid energy τ 0.6 → 5 fm/c
-−3.3 % with 0, within ±0.6 % with 1. 0–10 % Au+Au two-stage jet events (js-contrib
-`run_prod_jet.py --native`, 4 jobs × 8 events, 32 jet events, 8 backgrounds):
+−3.3 % with 0, within ±0.6 % with 1.
 
-| | fixes 0 | fixes 1 |
-|---|---|---|
-| background fluid energy (e ≥ 1e-4) lost by τ = 8 fm/c, relative to τ = 1 | 1.3–1.9 % | 0.9–1.5 % |
-| the same at the last frame | 1.7–2.4 % | 1.2–1.9 % |
-| wake / deposited energy | 1.022 ± 0.003 | 1.024 ± 0.003 |
-| active region (Phase 8, 1e-5) − whole grid, wake per deposit, per event: median / 90 % / max | 1.15 % / 5.7 % / 7.6 % | 0.84 % / 2.05 % / 4.2 % |
-| active-region bias (mean) | +0.0001 ± 0.005 | +0.003 ± 0.002 |
-| job time (whole grid / active region) | 155 / 142 s | 156 / 143 s |
+**Metal** (M3 Max, 2026-11-17, MUSIC4GPU `a84e8a5`, X-SCAPE contrib `7717ecc3`): the standalone
+IP-Glasma 2D test event (τ = 0.4 and 15 fm/c) with both switches 0 is byte-identical to
+`1c99bee` (25 of 25 files, on the GPU and with `MUSIC_FORCE_CPU=1`); `symmetric_flux_fallback` 1
+changes 14 of 25 files, `quest_revert_as_cpu` 1 five (only to τ = 15), the same files as on CUDA;
+energy through the surface −1.1e-5 and +6e-7 (CUDA 1e-5 and 2e-7).
 
-The fixes change the wake itself by 0.9 % per event (median; 90 %: 2.9 %), as large as what
-the active region still changes with them. Of the active region's difference, the part in
-cells with e_bg = 1e-3–0.24 GeV/fm³ halves with the fixes (summed |ΔW| 8.2 → 4.0 GeV over the
-32 events); the part below 1e-3 GeV/fm³ stays (13.9 → 16.0 GeV).
+**0–10 % Au+Au two-stage jet events, GB10 (CUDA) and M3 Max (Metal).** The same study on both:
+js-contrib `run_prod_jet.py --native --reuse 4`, seeds 21–24 × 8 events (32 jet events,
+8 backgrounds), four variants: fixes 0 / 1 × active region off / 1e-5. Fluid energy = lab energy
+of the cells with e ≥ 1e-4 GeV/fm³; wake W = E_fluid(jet) − E_fluid(bg) at the last frame common
+to the compared legs (τ ≈ 10–11 fm/c), per deposited energy; events paired by seed and number.
+The same seed gives different backgrounds on the two machines, so compare the effects of the
+switches, not the absolute values.
 
-**Metal** (M3 Max, 2026-11-17, MUSIC4GPU `a84e8a5`, X-SCAPE contrib `7717ecc3`). Standalone
-IP-Glasma 2D test event (τ = 0.4 and 15 fm/c): with both switches 0 the output is byte-identical
-to `1c99bee` (25 of 25 files, on the GPU and with `MUSIC_FORCE_CPU=1`).
-`symmetric_flux_fallback` 1 changes 14 of 25 files, `quest_revert_as_cpu` 1 five (only to
-τ = 15), as on CUDA; energy through the surface −1.1e-5 and +6e-7. The same 0–10 % Au+Au study
-(seeds 21–24 × 8 events, `--native --reuse 4`; Mac and GB10 backgrounds differ for the same seed):
+| | GB10, fixes 0 | GB10, fixes 1 | M3 Max, fixes 0 | M3 Max, fixes 1 |
+|---|---|---|---|---|
+| background fluid energy lost by τ = 8 fm/c, relative to τ = 1 | 1.3–1.9 % | 0.9–1.5 % | 1.07–2.47 % | 0.75–2.12 % |
+| the same at the last frame | 1.7–2.4 % | 1.2–1.9 % | 1.48–2.79 % | 1.06–2.35 % |
+| energy the fixes keep, per background (τ = 8 / last frame) | | ~0.4–0.5 % | | 0.33–0.43 % / 0.42–0.52 % |
+| active region's effect on the backgrounds' fluid energy (τ = 8) | ≤ 1e-4 (both settings) | | ≤ 3e-5 | ≤ 8e-6 |
+| wake / deposit, whole grid | 1.022 | 1.024 | 1.012 | 1.021 |
+| wake / deposit, active region | 1.022 | 1.027 | 1.009 | 1.014 |
+| active region − whole grid, wake per deposit, per event: median / 90 % / max | 1.15 % / 5.7 % / 7.6 % | 0.84 % / 2.05 % / 4.2 % | 1.25 % / 3.9 % / 16.6 % ¹ | 0.59 % / 2.8 % / 6.2 % |
+| active-region bias (mean) | +0.0001 ± 0.005 | +0.003 ± 0.002 | −0.011 ± 0.008 ¹ | −0.006 ± 0.003 |
+| active-region difference smaller with the fixes | | 19 of 32 events, median ratio 0.65 | | 15 of 24 ¹, median ratio 0.55 |
+| summed \|ΔW\| of the active region, e_bg 1e-3–0.24 / below 1e-3 GeV/fm³ | 8.2 / 13.9 GeV | 4.0 / 16.0 GeV | 5.1 / 7.4 GeV ¹ | 2.8 / 6.6 GeV |
+| the fixes' own change of the wake, per event: median / 90 % | 0.86 % / 2.9 % | | 0.94 % / 4.0 % ¹ | |
+| share of the blocks active (1e-5) | ~55 % | | 54–58 % | |
+| job time, whole grid / active region | 155 / 142 s | 156 / 143 s | 59 / 55 s ² | 60 / 55 s ² |
 
-| Metal | fixes 0 | fixes 1 |
-|---|---|---|
-| background energy lost by τ = 8 fm/c / at the last frame | 1.07–2.47 % / 1.48–2.79 % | 0.75–2.12 % / 1.06–2.35 % |
-| the same per background, fixes 0 − fixes 1 | | 0.33–0.43 % / 0.42–0.52 % |
-| wake / deposited energy (whole grid, active region) | 1.012, 1.009 (± 0.009) | 1.021, 1.014 (± 0.004) |
-| active region − whole grid, per event: median / 90 % / max | 1.25 % / 3.9 % / 16.6 % (24 events) | 0.59 % / 2.8 % / 6.2 % (32 events) |
-| active-region bias (mean) | −0.011 ± 0.008 | −0.006 ± 0.003 |
-| job alone (whole grid / active region) | 59 / 55 s | 60 / 55 s |
+¹ 24 events: with fixes 0 and the whole grid, seed 23 deposits one more parton at the fireball's
+edge (r ≈ 13 fm, t = 10.3 fm/c; +20 GeV), and its random numbers then diverge for the job's
+8 events. A rerun is bit-identical, so it is a threshold in a medium that differs at this level,
+not nondeterminism; those 8 events are left out of the pairs with that variant. The 16.6 % is an
+event with 4.9 GeV deposited (~0.8 GeV in the dilute shell). ² One job alone (seed 21); jobs run
+three at a time took 70–90 s.
 
-- On the same 24 events the active region's difference is smaller with the fixes in 15, median
-  ratio 0.55 (GB10 19 of 32, 0.65); the part in e_bg = 1e-3–0.24 GeV/fm³ 5.1 → 2.8 GeV. The
-  16.6 % is an event with 4.9 GeV deposited (~0.8 GeV in the dilute shell). The bias has the
-  opposite sign of the GB10's: together, no bias.
-- **Showers:** the variants have the same showers in structure (parton ids, status, links), but
-  momenta differ by ~1e-4 GeV: LBT reads the medium, which differs at this level. With fixes 0
-  and the whole grid, seed 23 deposits one more parton at the fireball's edge (r ≈ 13 fm,
-  t = 10.3 fm/c; +20 GeV) and its random numbers then diverge for the job's 8 events; a rerun
-  is bit-identical, so it is a threshold, not nondeterminism. Those 8 events are left out of the
-  pairs with fixes 0 / whole grid.
+- **Same on both:** the fixes keep ~0.4 % more of the background's energy, roughly halve the
+  active region's difference in cells with e_bg = 1e-3–0.24 GeV/fm³ and shrink its tails, cost
+  no time, and change the wake per event by ~0.9 % (median); the active region forced to the
+  whole grid is bit-identical to off, and 1e-5 saves 8–9 % of a job.
+- **Bias:** the two machines give small biases of opposite sign: together, none.
+- **Showers:** the variants have the same showers in structure (ids, status, links); the momenta
+  differ by ~1e-4 GeV on Metal, since LBT reads the medium. Compare showers by structure.
 
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
