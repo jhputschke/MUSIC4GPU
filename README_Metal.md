@@ -59,8 +59,21 @@ first call to `AdvanceIt()`.  Confirmation messages are printed to stderr:
 [MUSIC-GPU] GPU grid allocated (NxxNyx1 cells).
 ```
 
-If Metal initialisation fails (e.g. `music_kernels.metallib` not found), the
-code falls back to the CPU path with a warning and continues normally.
+**A missing or stale `music_kernels.metallib` stops the run** (exit code 1):
+no metallib found, or one without a kernel this `libmusic` needs (a stale
+build, or a metallib of another version), for example
+
+```
+[MUSIC-GPU] Kernel 'gpu_make_delta_qi_sym' not found in library.
+[MUSIC-GPU] The Metal shader library /path/music_kernels.metallib does not match this libmusic (...)
+```
+
+Rebuild, point `MUSIC_METALLIB` at the matching metallib, or set
+`MUSIC_FORCE_CPU=1`.  Until 2026-11-17 the code fell back to the CPU with one
+warning, and a job then ran 10–15× slower without failing.  Other Metal
+failures (no Metal device, a failed buffer allocation) still fall back to the
+CPU path with a warning; a metallib without the optional active-region kernels
+evolves the whole grid with a warning.
 
 **Force the CPU path at runtime:** set `MUSIC_FORCE_CPU=1` to disable the GPU
 substep without rebuilding, so the same Metal-enabled binary runs pure-CPU

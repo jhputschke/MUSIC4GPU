@@ -8,6 +8,7 @@
 //   mp.wait();   // block until GPU finishes
 
 #pragma once
+#include <string>
 #include "GPUGrid.h"
 #include "gpu_types.h"
 
@@ -20,6 +21,13 @@ public:
     bool initialize(const char* metallib_path = nullptr);
 
     bool ready() const { return ready_; }
+
+    // initialize() failed because of the shader library: no metallib found, or
+    // one without a kernel this libmusic needs (a stale build or a metallib
+    // from another version).  Advance stops the run then instead of falling
+    // back to the CPU (MUSIC_FORCE_CPU=1 runs on the CPU on purpose).
+    bool library_error() const { return library_error_; }
+    const std::string& library_path() const { return library_path_; }
 
     // Dispatch gpu_make_w_source over the full grid.
     // Reads from gpu.snap_curr and gpu.snap_prev.
@@ -160,6 +168,9 @@ private:
     void*  device_        = nullptr;  // id<MTLDevice>
     void*  cmd_queue_     = nullptr;  // id<MTLCommandQueue>
     void*  library_       = nullptr;  // id<MTLLibrary>
+    bool   library_error_ = false;
+    std::string library_path_;      // the metallib that was loaded
+    bool library_failed() { library_error_ = true; return false; }
     void*  pso_w_source_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_delta_qi_  = nullptr;  // id<MTLComputePipelineState>
     void*  pso_delta_qi_sym_ = nullptr;  // the same, symmetric_flux_fallback

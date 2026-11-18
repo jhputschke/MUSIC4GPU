@@ -155,6 +155,27 @@ void Advance::init_metal_if_needed(int Nx, int Ny, int Neta) {
 
     auto& mp = GPUPipelines::instance();
     if (!mp.initialize()) {
+#ifdef USE_METAL
+        // A missing or stale shader library is an installation error, not a
+        // reason to run 10-15x slower on the CPU unnoticed: stop.  Running on
+        // the CPU on purpose is MUSIC_FORCE_CPU=1 (checked before we get here).
+        if (mp.library_error()) {
+            if (mp.library_path().empty())
+                music_message << "[MUSIC-GPU] No Metal shader library "
+                                 "(music_kernels.metallib) was found. ";
+            else
+                music_message << "[MUSIC-GPU] The Metal shader library "
+                              << mp.library_path()
+                              << " does not match this libmusic (a kernel is "
+                                 "missing: a stale build or another version's "
+                                 "metallib). ";
+            music_message << "Rebuild MUSIC4GPU, point MUSIC_METALLIB at the "
+                             "matching music_kernels.metallib, or set "
+                             "MUSIC_FORCE_CPU=1 to run on the CPU.";
+            music_message.flush("error");
+            exit(1);
+        }
+#endif
         music_message << "[MUSIC-GPU] Metal init failed, falling back to CPU.";
         music_message.flush("warning");
         gpu_ready_ = false;

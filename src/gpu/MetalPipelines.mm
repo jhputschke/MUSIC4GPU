@@ -98,6 +98,7 @@ bool MetalPipelines::initialize(const char* metallib_path) {
             lib = l;
             fprintf(stderr, "[MUSIC-GPU] Loaded kernels from %s\n",
                     [path UTF8String]);
+            library_path_ = [path UTF8String];
         } else {
             err = e;
         }
@@ -124,7 +125,7 @@ bool MetalPipelines::initialize(const char* metallib_path) {
                 err ? [[err localizedDescription] UTF8String] : "not found");
         fprintf(stderr, "[MUSIC-GPU] Place it next to libmusic.dylib, or set "
                         "MUSIC_METALLIB=/path/to/music_kernels.metallib\n");
-        return false;
+        return library_failed();
     }
     library_ = (__bridge_retained void*)lib;
 
@@ -132,14 +133,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn = [lib newFunctionWithName:@"gpu_make_w_source"];
     if (!fn) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_w_source' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso =
         [dev newComputePipelineStateWithFunction:fn error:&err];
     if (!pso) {
         fprintf(stderr, "[MUSIC-GPU] PSO creation failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_w_source_ = (__bridge_retained void*)pso;
 
@@ -150,14 +151,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_dqi = [lib newFunctionWithName:@"gpu_make_delta_qi"];
     if (!fn_dqi) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_delta_qi' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_dqi =
         [dev newComputePipelineStateWithFunction:fn_dqi error:&err];
     if (!pso_dqi) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_delta_qi failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_delta_qi_ = (__bridge_retained void*)pso_dqi;
 
@@ -165,14 +166,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_dqis = [lib newFunctionWithName:@"gpu_make_delta_qi_sym"];
     if (!fn_dqis) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_delta_qi_sym' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_dqis =
         [dev newComputePipelineStateWithFunction:fn_dqis error:&err];
     if (!pso_dqis) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_delta_qi_sym failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_delta_qi_sym_ = (__bridge_retained void*)pso_dqis;
 
@@ -180,14 +181,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_fin = [lib newFunctionWithName:@"gpu_finalize_ideal"];
     if (!fn_fin) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_finalize_ideal' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_fin =
         [dev newComputePipelineStateWithFunction:fn_fin error:&err];
     if (!pso_fin) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_finalize_ideal failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_finalize_ = (__bridge_retained void*)pso_fin;
 
@@ -195,14 +196,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_uw = [lib newFunctionWithName:@"gpu_make_uwrhs"];
     if (!fn_uw) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_uwrhs' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_uw =
         [dev newComputePipelineStateWithFunction:fn_uw error:&err];
     if (!pso_uw) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_uwrhs failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_uwrhs_ = (__bridge_retained void*)pso_uw;
 
@@ -210,14 +211,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_du = [lib newFunctionWithName:@"gpu_make_du"];
     if (!fn_du) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_du' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_du =
         [dev newComputePipelineStateWithFunction:fn_du error:&err];
     if (!pso_du) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_du failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_make_du_ = (__bridge_retained void*)pso_du;
 
@@ -225,14 +226,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_wf = [lib newFunctionWithName:@"gpu_first_rk_step_w_full"];
     if (!fn_wf) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_first_rk_step_w_full' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_wf =
         [dev newComputePipelineStateWithFunction:fn_wf error:&err];
     if (!pso_wf) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_first_rk_step_w_full failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_w_full_ = (__bridge_retained void*)pso_wf;
 
@@ -240,14 +241,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_wfc = [lib newFunctionWithName:@"gpu_first_rk_step_w_full_cpu"];
     if (!fn_wfc) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_first_rk_step_w_full_cpu' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_wfc =
         [dev newComputePipelineStateWithFunction:fn_wfc error:&err];
     if (!pso_wfc) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_first_rk_step_w_full_cpu failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_w_full_cpu_ = (__bridge_retained void*)pso_wfc;
 
@@ -255,14 +256,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_up = [lib newFunctionWithName:@"gpu_make_uprhs"];
     if (!fn_up) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_make_uprhs' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_up =
         [dev newComputePipelineStateWithFunction:fn_up error:&err];
     if (!pso_up) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_make_uprhs failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_uprhs_ = (__bridge_retained void*)pso_up;
 
@@ -270,14 +271,14 @@ bool MetalPipelines::initialize(const char* metallib_path) {
     id<MTLFunction> fn_pk = [lib newFunctionWithName:@"gpu_pack_evolution_ideal"];
     if (!fn_pk) {
         fprintf(stderr, "[MUSIC-GPU] Kernel 'gpu_pack_evolution_ideal' not found in library.\n");
-        return false;
+        return library_failed();
     }
     id<MTLComputePipelineState> pso_pk =
         [dev newComputePipelineStateWithFunction:fn_pk error:&err];
     if (!pso_pk) {
         fprintf(stderr, "[MUSIC-GPU] PSO for gpu_pack_evolution_ideal failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "unknown error");
-        return false;
+        return library_failed();
     }
     pso_pack_evo_ = (__bridge_retained void*)pso_pk;
 
