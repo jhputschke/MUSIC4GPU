@@ -700,8 +700,8 @@ largest single-cell |Δe|/e above e_fo 8e-4 at τ ≈ 3–5 fm/c (~50 of 23,000
 cells beyond 1e-4, none at late times), the total energy within 2e-6, the
 freeze-out surfaces equal to ±2 elements per leg; O+O the same.  That is
 ~1000× below the GPU-vs-CPU difference (`docs/MUSIC_CPU_vs_GPU.md`).  The
-Metal kernel has the same two conditions; it is not yet compiled or run on a
-Mac.
+Metal kernel has the same two conditions; on an M3 Max (2026-10-12) the
+backgrounds agree to the same ~7e-7 (energy-weighted |Δe|/e).
 
 **On the same branch: a larger late time step** (`late_delta_tau` /
 `late_tau_switch`, README.md), so that one physics validation covers both.
@@ -759,7 +759,7 @@ flag is 0 returns before it reads or writes anything; its cells are *frozen*.
   `MUSIC_ACTIVE_REGION_LOG=1` logs every rebuild.  Every run logs its mean
   active share.  The CPU path evolves the whole grid.
 
-**Metal** (port added 2026-11-12, **not yet run on a Mac**): the Metal step
+**Metal** (port added 2026-11-12, validated on an M3 Max 2026-11-17, below): the Metal step
 kernels already run on 8 × 8 × 4 threadgroups, so the threadgroup is the
 block; each of the seven gets the flags and an `active_on` word (two more
 buffer bindings; with the region off a dummy buffer and 0) and returns at
@@ -768,9 +768,12 @@ are ported one to one (`GPUActiveParams` in `gpu_types.h`); the flags are
 shared `MTLBuffer`s of the `GPUGrid` (`active_mtl`), and the fills, the
 rebuild and the copy of the flags for the count are encoded on the queue
 like the step kernels.  A metallib without the two kernels makes the reset
-fail: a warning, and the whole grid as before.  To validate on a Mac:
-`MUSIC_ACTIVE_REGION_ALL=1` must give output identical to
-`active_region_eps` 0, and 1e-5 should agree with 0 as on CUDA above.
+fail: a warning, and the whole grid as before.  On the M3 Max
+`MUSIC_ACTIVE_REGION_ALL=1` gives output identical to `active_region_eps` 0
+(IP-Glasma 2D event to τ = 15 fm/c, 25 of 25 files, both fix settings of
+Phase 9; an 8-event Au+Au pair file except `source/flux`), and 1e-5 keeps
+54–58 % of the Au+Au blocks active (45 % in the IP-Glasma event); the
+32-event comparison is in Phase 9.
 
 **Not bit-identical**, through the vacuum: the whole grid evolves vacuum cells
 with fluxes at the 1e-12 level and the vacuum-at-rest reset, the active region
@@ -856,8 +859,34 @@ grid: ~10 % of E and B were lost with 0; staged SMASH-IC 19.6 GeV, grid energy �
 The fixes change the wake itself by 0.9 % per event (median; 90 %: 2.9 %), as large as what
 the active region still changes with them. Of the active region's difference, the part in
 cells with e_bg = 1e-3–0.24 GeV/fm³ halves with the fixes (summed |ΔW| 8.2 → 4.0 GeV over the
-32 events); the part below 1e-3 GeV/fm³ stays (13.9 → 16.0 GeV). The Metal kernels are not
-yet built or run on a Mac.
+32 events); the part below 1e-3 GeV/fm³ stays (13.9 → 16.0 GeV).
+
+**Metal** (M3 Max, 2026-11-17, MUSIC4GPU `a84e8a5`, X-SCAPE contrib `7717ecc3`). Standalone
+IP-Glasma 2D test event (τ = 0.4 and 15 fm/c): with both switches 0 the output is byte-identical
+to `1c99bee` (25 of 25 files, on the GPU and with `MUSIC_FORCE_CPU=1`).
+`symmetric_flux_fallback` 1 changes 14 of 25 files, `quest_revert_as_cpu` 1 five (only to
+τ = 15), as on CUDA; energy through the surface −1.1e-5 and +6e-7. The same 0–10 % Au+Au study
+(seeds 21–24 × 8 events, `--native --reuse 4`; Mac and GB10 backgrounds differ for the same seed):
+
+| Metal | fixes 0 | fixes 1 |
+|---|---|---|
+| background energy lost by τ = 8 fm/c / at the last frame | 1.07–2.47 % / 1.48–2.79 % | 0.75–2.12 % / 1.06–2.35 % |
+| the same per background, fixes 0 − fixes 1 | | 0.33–0.43 % / 0.42–0.52 % |
+| wake / deposited energy (whole grid, active region) | 1.012, 1.009 (± 0.009) | 1.021, 1.014 (± 0.004) |
+| active region − whole grid, per event: median / 90 % / max | 1.25 % / 3.9 % / 16.6 % (24 events) | 0.59 % / 2.8 % / 6.2 % (32 events) |
+| active-region bias (mean) | −0.011 ± 0.008 | −0.006 ± 0.003 |
+| job alone (whole grid / active region) | 59 / 55 s | 60 / 55 s |
+
+- On the same 24 events the active region's difference is smaller with the fixes in 15, median
+  ratio 0.55 (GB10 19 of 32, 0.65); the part in e_bg = 1e-3–0.24 GeV/fm³ 5.1 → 2.8 GeV. The
+  16.6 % is an event with 4.9 GeV deposited (~0.8 GeV in the dilute shell). The bias has the
+  opposite sign of the GB10's: together, no bias.
+- **Showers:** the variants have the same showers in structure (parton ids, status, links), but
+  momenta differ by ~1e-4 GeV: LBT reads the medium, which differs at this level. With fixes 0
+  and the whole grid, seed 23 deposits one more parton at the fireball's edge (r ≈ 13 fm,
+  t = 10.3 fm/c; +20 GeV) and its random numbers then diverge for the job's 8 events; a rerun
+  is bit-identical, so it is a threshold, not nondeterminism. Those 8 events are left out of the
+  pairs with fixes 0 / whole grid.
 
 ## Summary across phases (64×64×32, GB10 vs 20-thread CPU)
 
